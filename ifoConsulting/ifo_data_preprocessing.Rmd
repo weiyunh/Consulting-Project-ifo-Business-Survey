@@ -47,7 +47,6 @@ source("ifo_data_processing.R")
 
 DATA_PATH <- file.path("Data")
 
-# Load and process data (suppress console output)
 results <- suppressMessages(main(DATA_PATH))
 
 data_long <- results$data_long
@@ -81,7 +80,7 @@ data_long %>%
 
 # 2. Add Combined Variable Names
 
-##`industrycode_questioncode`
+## `industrycode_questioncode`
 
 **Examples:**
 - `C1000000_KLD` = Business climate for Food industry
