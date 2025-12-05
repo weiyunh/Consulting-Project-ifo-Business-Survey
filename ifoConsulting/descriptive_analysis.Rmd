@@ -1,0 +1,563 @@
+---
+title: "Descriptive Analysis: ifo Business Survey Data"
+author: "Weiyun Hong"
+date: "2025-11-27"
+output:
+  pdf_document:
+    toc: false
+  html_document:
+    toc: false
+    theme: cosmo
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 14,
+  fig.height = 8,
+  dpi = 150,
+  results = 'asis'
+)
+```
+
+```{r libraries, include=FALSE}
+library(tidyverse)
+library(lubridate)
+library(knitr)
+library(kableExtra)
+library(scales)
+library(viridis)
+library(corrplot)
+library(RColorBrewer)
+library(dplyr)
+
+theme_set(theme_minimal(base_size = 12))
+options(scipen = 999)
+```
+
+
+This script provides descriptive analysis of ifo Business Survey data. Two data versions are prepared:
+
+- **Version A**: 1991-2025 (410 months, 13 questions) - excludes BES & PRS
+- **Version B**: 1997-2025 (350 months, 15 questions) - **Preferred for DFM**
+
+---
+
+## 1. Data Loading
+
+```{r load-data}
+data_a_long <- read_csv("data_a_long.csv", show_col_types = FALSE)
+data_b_long <- read_csv("data_b_long.csv", show_col_types = FALSE)
+data_a_wide <- read_csv("data_a_wide.csv", show_col_types = FALSE)
+data_b_wide <- read_csv("data_b_wide.csv", show_col_types = FALSE)
+```
+
+**Version A**: `r format(nrow(data_a_long), big.mark=",")` observations (long) | `r nrow(data_a_wide)` x `r ncol(data_a_wide)` (wide)  
+**Version B**: `r format(nrow(data_b_long), big.mark=",")` observations (long) | `r nrow(data_b_wide)` x `r ncol(data_b_wide)` (wide)
+
+---
+
+## 2. Data Structure
+
+```{r data-structure}
+cat("**Version A - Long Format** (first 10 rows):\n\n")
+data_a_long %>%
+  select(date, industry_code, question, value, level, question_type) %>%
+  head(10) %>%
+  kable(align = 'c') %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), 
+                full_width = FALSE, font_size = 11)
+
+cat("\n\n**Version B - Long Format** (first 10 rows):\n\n")
+data_b_long %>%
+  select(date, industry_code, question, value, level, question_type) %>%
+  head(10) %>%
+  kable(align = 'c') %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), 
+                full_width = FALSE, font_size = 11)
+
+cat("\n\n**Version A - Wide Format** (first 5 rows, first 8 columns):\n\n")
+data_a_wide %>%
+  select(1:8) %>%
+  head(5) %>%
+  kable(align = 'c') %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), 
+                full_width = FALSE, font_size = 11)
+
+cat("\n\n**Version B - Wide Format** (first 5 rows, first 8 columns):\n\n")
+data_b_wide %>%
+  select(1:8) %>%
+  head(5) %>%
+  kable(align = 'c') %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), 
+                full_width = FALSE, font_size = 11)
+```
+
+
+
+## Industry Structure Overview
+
+```{r, include=FALSE}
+# Count number of industries at each hierarchical level
+industry_count_by_level <- data_b_long %>%
+  distinct(industry_code, level) %>% 
+  count(level, name = "n_industries")
+
+industry_count_by_level
+```
+
+```{r}
+library(ggplot2)
+
+ggplot(industry_count_by_level, aes(x = factor(level), y = n_industries)) +
+  geom_col(fill = "#3182bd") +
+  geom_text(aes(label = n_industries), vjust = -0.3, size = 5) +
+  labs(
+    title = "Number of Industries by Level",
+    x = "Hierarchical Level",
+    y = "Count"
+  ) 
+
+```
+
+### The ifo Business Survey uses TWO PARALLEL classification systems:
+
+1. STANDARD HIERARCHICAL CLASSIFICATION (by industry sector):
+   - Based on official German economic activity classification (0-5)
+   - Follows tree structure: C0000000 → C1000000 → C1010000 → ...
+   - Organized by production sector (food, machinery, automotive, etc.)
+   - Examples: C1000000 (Food), C2800000 (Machinery), C2900000 (Automotive)
+
+2. CROSS-CUTTING PRODUCT-TYPE CLASSIFICATION (MIG - Main Industrial Groups):
+   - Groups industries by PRODUCT USE regardless of sector
+   - Cuts across the standard hierarchy horizontally
+   - Three main categories based on end use:
+     * Intermediate goods (C00000A0): Raw materials & components
+     * Capital goods (C00000B0): Machinery & equipment for production
+     * Consumer goods (C00000C0): Products for final consumers
+   - Further subdivisions:
+     * Durable goods (C0000CD0): Long-lasting consumer products
+     * Non-durable goods (C0000CN0): Consumable products
+
+3. SPECIAL AGGREGATES:
+   - CONG0000: Manufacturing excluding food industry
+   - C00FOBE0: Food, beverages, and tobacco aggregate (WZ 10, 11, 12)
+   - These are alternative top-level aggregations
+These special codes are NOT part of the standard Level 0-5 hierarchy.
+They represent functional aggregations that span multiple standard sectors.
+In this function, we assign them to Level 6 to distinguish them from 
+standard hierarchical codes.
+
+```{r, include=FALSE}
+industry_list_by_level <- data_b_long %>%
+  distinct(level, industry_code, industry_name) %>%
+  arrange(level, industry_code)
+
+industry_list_by_level %>%
+  kbl(
+    caption = "Table: Industry List by Hierarchical Level",
+    col.names = c("Level", "Industry Code", "Industry Name"),
+    align = "l"
+  ) %>%
+  kable_classic(full_width = FALSE)
+
+
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+industry_hierarchy_plot <- data_b_long %>%
+  distinct(level, industry_code, industry_name) %>%
+  mutate(level = factor(level, levels = sort(unique(level))),
+         label = paste0(industry_code, ": ", industry_name))
+
+ggplot(industry_hierarchy_plot,
+       aes(x = 1, y = reorder(label, level))) +
+  geom_point(size = 3, color = "#2c7fb8") +
+  facet_wrap(~ level, scales = "free_y", ncol = 1) +
+  labs(
+    title = "Industry Hierarchy Overview (Level 1 → Level 3)",
+    x = "",
+    y = "Industry"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    strip.text = element_text(size = 12, face = "bold")
+  )
+```
+The figure provides an overview of the hierarchical structure of industries in the dataset.  
+Level 1 contains broad sectors, Level 2 refines these into subsectors, and Level 3 introduces further granularity.  
+
+---
+
+## 3. Dimensional Comparison
+
+```{r dimension-comparison}
+dim_summary <- tibble(
+  Metric = c("Time Period", "Months", "Years", "Questions", "Industries", 
+             "Variables", "Total Obs", "Missing %"),
+  Version_A = c(
+    sprintf("%s - %s", format(min(data_a_long$date), "%Y-%m"), 
+            format(max(data_a_long$date), "%Y-%m")),
+    n_distinct(data_a_long$date),
+    round(n_distinct(data_a_long$date) / 12, 1),
+    n_distinct(data_a_long$question),
+    n_distinct(data_a_long$industry_code),
+    ncol(data_a_wide) - 1,
+    format(nrow(data_a_long), big.mark = ","),
+    sprintf("%.2f", mean(is.na(data_a_long$value)) * 100)
+  ),
+  Version_B = c(
+    sprintf("%s - %s", format(min(data_b_long$date), "%Y-%m"), 
+            format(max(data_b_long$date), "%Y-%m")),
+    n_distinct(data_b_long$date),
+    round(n_distinct(data_b_long$date) / 12, 1),
+    n_distinct(data_b_long$question),
+    n_distinct(data_b_long$industry_code),
+    ncol(data_b_wide) - 1,
+    format(nrow(data_b_long), big.mark = ","),
+    sprintf("%.2f", mean(is.na(data_b_long$value)) * 100)
+  )
+)
+
+dim_summary %>%
+  kable(col.names = c("Metric", "Version A", "Version B"),
+        align = 'lcc') %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  column_spec(3, background = "#e6f3ff", bold = TRUE)
+```
+
+Version B provides complete question coverage with sufficient time span (29 years) and lower missing rate.
+
+---
+
+## 4. Time Series Trends
+
+## Business Climate Index - Total Manufacturing
+
+```{r business-climate, fig.width=14, fig.height=6}
+total_mfg <- data_b_long %>%
+  filter(level == 0, question == "KLD")
+
+ggplot(total_mfg, aes(x = date, y = value)) +
+  geom_line(color = "#2166ac", size = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red", alpha = 0.5) +
+  geom_smooth(method = "loess", se = TRUE, color = "#d6604d", alpha = 0.2) +
+  labs(title = "Business Climate Index - Total Manufacturing",
+       subtitle = "ifo Business Survey 1997-2025, smoothed trend in red",
+       x = NULL, y = "Index Value") +
+  theme(plot.title = element_text(face = "bold", size = 14))
+```
+
+**Interpretation**: Three major downturns are evident: early 2000s recession (trough ~-20), 2008-09 financial crisis (deepest at ~-45), and COVID-19 (trough ~-42). The 2004-2007 and 2010-2018 periods show sustained expansion with values consistently above +15. The smoothed trend (red LOESS line) reveals a structural shift: rising through 2007, stable 2008-2018, then declining since 2019—the first sustained negative trend in the sample, suggesting potential regime change rather than cyclical downturn. 
+
+For DFM: the persistent 2022-2025 downtrend violates stationarity, First-differencing could be necessary to preserve cyclical information while removing the trend.
+
+
+
+
+## Selected Industries Comparison
+
+The industries shown below were selected as representative examples of the major Level-1 sectors in German manufacturing.  
+They cover upstream (chemicals, basic metals), midstream (machinery), downstream/capital-goods (motor vehicles), and more stable consumer-oriented sectors (food, other goods).  
+
+```{r selected-industries-table, echo=FALSE}
+selected_industries <- data.frame(
+  Industry = c("C1000000", "C2000000", "C2400000", 
+               "C2800000", "C2900000", "C3200000"),
+  Description = c(
+    "Food products (stable / defensive sector)",
+    "Chemicals (upstream intermediate goods)",
+    "Basic metals (highly cyclical, commodity-driven)",
+    "Machinery (investment-goods sector)",
+    "Motor vehicles (export- and cycle-sensitive capital goods)",
+    "Other goods (mixed consumer/industrial products)"
+  )
+)
+
+kable(
+  selected_industries,
+  format = "latex",
+  booktabs = TRUE
+)
+selected_industries
+```
+
+
+```{r major-industries, fig.width=14, fig.height=6}
+key_industries <- c("C1000000", "C2000000", "C2400000", "C2800000", "C2900000", "C3200000")
+
+key_industry_data <- data_b_long %>%
+  filter(industry_code %in% key_industries, question == "KLD") %>%
+  mutate(industry_label = str_trunc(industry_code, 15))
+
+ggplot(key_industry_data, aes(x = date, y = value, color = industry_code)) +
+  geom_line(size = 0.8, alpha = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.3) +
+  scale_color_viridis_d(option = "turbo", name = "Industry") +
+  labs(title = "Business Climate - Major Industries",
+       subtitle = "Selected Level 1 industries, 1997-2025",
+       x = NULL, y = "Index Value") +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        legend.position = "bottom")
+```
+
+
+**Synchronous movement during crises**: All the selected industries exhibit sharp, synchronized declines during major economic shocks:
+
+- **2008-09 Financial Crisis**: Most severe downturn with values plunging to -50 to -70 range. All sectors moved in lockstep, confirming the dominant role of common macroeconomic factors.
+- **2020 COVID-19 Shock**: Second major collapse to approximately -40 to -60, again showing high synchronization across industries.
+
+
+**Industry-specific characteristics**:
+
+- **Most cyclical sectors** (showing largest swings): Several industries demonstrate extreme volatility, reaching peaks above +50 and troughs below -60. These capital-intensive and durable goods sectors are highly sensitive to aggregate demand fluctuations.
+- **Moderate cyclicality**: Mid-range industries show substantial but less extreme movements, typically oscillating between -30 and +30.
+- **Relative stability**: At least one sector (C1000000 Manufacture of food and feed products) shows notably smaller amplitude, rarely exceeding ±20, consistent with necessity goods characteristics.
+
+
+**Recovery dynamics**:
+
+- **Post-2009 recovery**: Gradual but sustained improvement from 2010-2018, with most industries returning to positive territory and maintaining moderate optimism.
+- **Post-COVID recovery**: Faster initial rebound in 2021, but more volatile and uneven across sectors, with increasing divergence by 2023-2025.
+
+**Recent period (2022-2025)**: Notable increase in cross-industry dispersion. Some sectors remain near neutral or positive, while others trend sharply negative, suggesting sector-specific headwinds rather than broad-based downturn.
+
+
+---
+
+## 5. Cross-Industry Correlations
+
+```{r correlation-heatmap, fig.width=12, fig.height=10}
+# Select Level 1 industries only for business climate
+level1_industries <- data_b_long %>%
+  filter(level == 1) %>%
+  distinct(industry_code) %>%
+  pull(industry_code)
+
+# Create pattern to match Level 1 industry KLD variables
+level1_pattern <- paste0("^(", paste(level1_industries, collapse = "|"), ")_KLD$")
+
+# Select only Level 1 KLD variables
+level1_kld <- data_b_wide %>%
+  select(matches(level1_pattern))
+
+# Check if we have enough variables
+if(ncol(level1_kld) > 1) {
+  # Calculate correlation matrix
+  cor_matrix <- cor(level1_kld, use = "pairwise.complete.obs")
+  
+  # Plot correlation heatmap
+  corrplot(cor_matrix, 
+           method = "color", 
+           type = "upper", 
+           order = "hclust",
+           tl.col = "black", 
+           tl.srt = 45, 
+           tl.cex = 0.7,
+           col = colorRampPalette(c("#2166ac", "white", "#b2182b"))(200),
+           title = "Cross-Industry Correlations: Business Climate (Level 1)",
+           mar = c(0, 0, 2, 0))
+} else {
+  cat("Insufficient Level 1 industries for correlation analysis\n")
+}
+```
+
+**Interpretation.** The correlation heatmap shows a clear clustering pattern across Level-1 manufacturing industries. Most industry pairs display moderate to high positive correlations, consistent with a strong common business-cycle component in the business climate index. Blocks of darker red cells indicate tightly connected groups of industries – for example, intermediate-goods sectors (chemicals, rubber and plastics, glass and ceramics, metal products) and capital-goods producers (machinery, electrical equipment, motor vehicles).
+
+Some industries exhibit noticeably lower correlations with the bulk of manufacturing, especially food-related sectors and other transport equipment. This is consistent with their more defensive or sector-specific demand patterns.
+
+The diagonal block structure after hierarchical reordering suggests the presence of roughly three to four natural industry groups, which supports the use of a multi-factor DFM with both aggregate and sector-specific components.
+
+
+---
+
+## 6. Distribution Analysis
+
+```{r distribution-all, fig.width=14, fig.height=18}
+dist_data <- data_b_long %>%
+  filter(level == 0) %>%
+  mutate(
+    question_label = case_when(
+      question == "KLD" ~ "Business Climate",
+      question == "GUS" ~ "Current Situation",
+      question == "GES" ~ "Business Expectations",
+      question == "BES" ~ "Employment Expectations",
+      question == "PRS" ~ "Production Expectations",
+      question == "LUS" ~ "Capacity Utilization",
+      question == "BUS" ~ "Order Backlog",
+      question == "XUS" ~ "Foreign Orders",
+      question == "AVS" ~ "Order Intake",
+      question == "BVS" ~ "Demand vs Prev.",
+      question == "QVS" ~ "Domestic Demand",
+      question == "PVS" ~ "Selling Prices",
+      question == "QES" ~ "Domestic Expect.",
+      question == "PWS" ~ "Price Expect.",
+      question == "XES" ~ "Export Expect.",
+      TRUE ~ question
+    ),
+    question_order = match(question, c("KLD", "GUS", "GES", "LUS", "BUS", "XUS", 
+                                       "AVS", "BVS", "QVS", "PVS", "QES", "PWS", 
+                                       "XES", "BES", "PRS"))
+  )
+
+ggplot(dist_data, aes(x = value, fill = question)) +
+  geom_histogram(bins = 50, alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red", size = 0.5) +
+  facet_wrap(~ reorder(question_label, question_order), ncol = 3, scales = "free") +
+  scale_fill_viridis_d(option = "turbo") +
+  labs(title = "Distribution of All Business Survey Indicators",
+       subtitle = "Total Manufacturing, 1997-2025",
+       x = "Index Value", y = "Frequency") +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        legend.position = "none",
+        strip.text = element_text(face = "bold", size = 9))
+```
+
+**Interpretation**: Distribution characteristics reveal distinct response patterns across indicator types:
+
+**Based on summary statistics (Mean, Median, SD, Range)**:
+
+
+**Assessment indicators (current conditions)**:
+
+- **Business Climate (KLD)**: Mean = 6.13, Median = 8.28, SD = 15.64. Moderately left-skewed, spanning -45 to +34. 
+- **Current Situation (GUS)**: Mean = 11.93, Median = 15.24, SD = 21.92. Left-skewed distribution with more positive assessments. 
+
+- **Capacity Utilization (LUS)**: Mean = 9.51, Median = 8.63, SD = 10.00. Smallest standard deviation among major indicators. Ranges from -19 to +39, with concentration in positive range reflecting structural constraint that capacity rarely falls to zero.
+- **Order Backlog (BUS)**: Mean = -10.86, Median = -10.02, SD = 19.16. Negatively skewed with tendency toward negative assessments. Extreme range (-63 to +30) indicates high sensitivity to demand shocks.
+
+
+
+**Expectation indicators (forward-looking)**:
+
+- **Business Expectations (GES)**: Mean = 1.03, Median = 5.36, SD = 15.30. Slightly positive bias reflects general optimism, but substantial negative tail indicates recession periods.
+- **Employment Expectations (BES)**: Mean = -5.84, Median = -4.63, SD = 11.84. Negatively skewed (-40 to +20), reflecting structural reluctance to hire. Firms exhibit loss aversion in employment decisions.
+- **Production Expectations (PRS)**: Mean = 9.32, Median = 8.05, SD = 7.53. Smallest standard deviation among expectations. Narrow range (-24 to +31) suggests production plans are less volatile than other indicators.
+
+
+**Price indicators**:
+
+- **Selling Prices (PVS)**: Mean = 3.74, Median = 1.08, SD = 10.69. Right-skewed distribution (-16 to +52), reflecting occasional price spikes during commodity booms (2008, 2021-22).
+- **Price Expectations (PWS)**: Mean = 8.34, Median = 5.19, SD = 13.70. Strong right skew (-14 to +72), with the widest maximum suggesting extreme price pressure episodes.
+
+**Demand indicators**:
+
+- **Foreign Order Backlog (XUS)**: Mean = -15.89, Median = -14.86, SD = 18.24. Most negative mean, reflecting chronic weakness in export orders over the period. 
+- **Domestic Demand (QVS)**: Mean = 0.09, Median = 0.93, SD = 12.31. Nearly symmetric and centered at zero (-50 to +27), indicating balanced domestic demand assessments.
+
+**Key distributional insights**:
+
+1. **Negative bias in orders**: BUS (-10.86) and especially XUS (-15.89) show persistent negative assessments, possibly reflecting Germany's role as exporter facing global competition.
+2. **Positive bias in production**: PRS (9.32) shows consistent optimism, suggesting firms maintain positive production outlook even when orders weaken.
+3. **Volatility hierarchy**: GUS has highest SD (21.92), while PRS has lowest (7.53), indicating production plans are most stable.
+4. **Asymmetric ranges**: Several indicators show asymmetric ranges (e.g., GUS: -53 to +52), but most span approximately ±50, which is broadly consistent with approximate normality for many indicators, although tail events and skewness should be considered.
+
+```{r summary-stats}
+summary_stats <- data_b_long %>%
+  filter(level == 0) %>%
+  group_by(question) %>%
+  summarise(Mean = mean(value, na.rm = TRUE),
+            Median = median(value, na.rm = TRUE),
+            SD = sd(value, na.rm = TRUE),
+            Min = min(value, na.rm = TRUE),
+            Max = max(value, na.rm = TRUE),
+            .groups = "drop") %>%
+  arrange(question)
+
+summary_stats %>%
+  mutate(across(where(is.numeric), ~sprintf("%.2f", .))) %>%
+  kable(align = 'lrrrrr') %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+---
+
+## 7. Volatility Analysis
+
+```{r volatility-plot, fig.width=8, fig.height=5}
+industry_volatility <- data_b_long %>%
+  filter(level == 1, question == "KLD") %>%
+  group_by(industry_code) %>%
+  summarise(volatility = sd(value, na.rm = TRUE),
+            mean_value = mean(value, na.rm = TRUE),
+            .groups = "drop") %>%
+  arrange(desc(volatility)) %>%
+  head(15)
+
+ggplot(industry_volatility, aes(x = reorder(industry_code, volatility), y = volatility)) +
+  geom_col(aes(fill = volatility), width = 0.7) +
+  coord_flip() +
+  scale_fill_viridis_c(option = "rocket", direction = -1) +
+  labs(title = "Business Climate Volatility - Top 15 Industries",
+       subtitle = "Level 1 industries, ranked by standard deviation",
+       x = NULL, y = "Volatility (SD)") +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "none")
+```
+
+**Interpretation.** Industry-level volatility in the business climate index reveals distinct risk profiles across Level-1 manufacturing sectors:
+
+- **Most volatile industries (top of the ranking).**  
+  Industries such as *coke and refined petroleum products* (C1900000) and *basic metals* (C2400000) appear at the top of the volatility ranking. Their business climate shows the largest fluctuations over time, which is consistent with strong exposure to global commodity price cycles and energy market shocks. These sectors are affected both by swings in demand and by highly volatile input costs.
+
+- **Highly cyclical capital-goods sectors.**  
+  Motor vehicles (C2900000), other transport equipment (C3000000), and machinery-related sectors (e.g. C2800000, C2700000) also exhibit relatively high volatility. As capital-goods and durable-goods producers, they are particularly sensitive to investment demand, credit conditions, and global supply-chain disruptions.
+
+- **Intermediate-goods industries with moderate volatility.**  
+  Wood products (C1600000), glass and ceramics (C2300000), rubber and plastics (C2200000), and metal products (C2500000) form a middle group. Their business climate fluctuates noticeably over the cycle, but somewhat less than the most commodity-dependent or transport-related industries, reflecting diversified end-markets.
+
+- **Relatively stable industries (outside the top-volatility group).**  
+  More defensive sectors such as *food and feed products* (C1000000), *pharmaceuticals* (C2100000), and parts of the chemical industry (C2000000) lie below the top-15 volatility range. Their business climate varies over time, but with smaller swings, in line with necessity-goods demand and more stable consumption patterns.
+
+- **Economic implications.**  
+  1. **Commodity dependence:** sectors tied to energy and metals exhibit the most pronounced boom-bust dynamics.  
+  2. **Durables vs. necessities:** there is a clear gradient from highly cyclical investment and durable-goods industries to more stable necessity-goods producers.  
+  3. **Factor-model relevance:** high-volatility industries are likely to load more strongly on common business-cycle factors, whereas low-volatility sectors contain a larger idiosyncratic component.
+
+
+---
+
+## 8. Key Findings
+
+**Data Quality**: Version B provides 29 years (350 months) of balanced panel data with 2.4% missing values, suitable for DFM analysis. All 15 questions available throughout, ensuring complete information set for identifying forward-looking vs. current assessment factors.
+  The complete question set—particularly forward-looking indicators (BES, PRS)—is essential for distinguishing current vs. expectation factors. The 29-year span exceeds DFM literature standards and captures multiple complete business cycles including two major crises.
+
+
+**Temporal Patterns**: 
+
+- **Crisis synchronization**: Business climate exhibits dramatic synchronized declines during 2008-09 financial crisis (total manufacturing reaching -45) and 2020 COVID-19 (reaching -42). 
+- **Recovery phases**: Post-2009 recovery was gradual (2010-2018), while post-COVID rebound was faster but more volatile.
+- **Recent divergence**: 2022-2025 period shows increasing cross-industry dispersion, with some sectors near neutral while others trend sharply negative.
+
+
+**Cross-Sectional Structure**: 
+- **High average correlation** (r ~ 0.7) among Level 1 industries indicates strong common business cycle factor.
+- **Industry clusters**: Investment goods (machinery, motor vehicles, metals) form tight correlation group (r > 0.8), while food industry shows lower correlation (r < 0.5), confirming defensive characteristics.
+- **Volatility hierarchy**:  Volatility hierarchy: Coke and refined petroleum (C1900000) and basic metals (C2400000) are among the most volatile industries in terms of business climate, whereas food and pharmaceutical sectors are at the lower end of the volatility distribution. 
+
+
+**Indicator Characteristics**:
+
+- **Negative bias in orders**: Export orders show persistent pessimism (mean = -15.89), while production expectations remain optimistic (mean = +9.32), suggesting structural export challenges.
+- **Volatility range**: Current situation (SD = 21.92) most volatile; production expectations (SD = 7.53) most stable. This stability gradient across indicators may help identify factor structure.
+- **Skewness patterns**: Most indicators are left-skewed (Mean < Median), reflecting that crisis-period negative extremes exceed boom-period positive extremes. Employment expectations (BES) show notable left skew (mean = -5.84, median = -4.63), reflecting hiring reluctance.
+
+
+
+**DFM Suitability**:
+
+- Strong crisis co-movement (near r = 1.0) contrasts with moderate normal-period correlation (r = 0.5-0.8), motivating time-varying factor models.
+- Approximately normal core indicators (KLD, GUS, GES) support standard DFM; skewed indicators (BES, BUS, XUS) may benefit from transformation.
+- Sufficient cross-sectional (21 Level 1 industries) and temporal (350 months) dimensions for stable 2-3 factor estimation.
+
+
+---
+

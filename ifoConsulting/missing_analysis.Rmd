@@ -1,0 +1,907 @@
+---
+title: "Missing Value Analysis - ifo Business Survey Data"
+author: "Weiyun Hong"
+date: "2025-11-25"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    keep_tex: false
+  html_document:
+    toc: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 14,
+  fig.height = 10,
+  dpi = 150
+)
+```
+
+
+This script provides a comprehensive analysis of missing values in the ifo Business Survey data.
+
+```{r libraries}
+library(tidyverse)
+library(naniar)
+library(viridis)
+library(scales)
+library(knitr)
+library(kableExtra)
+```
+
+
+
+```{r load-data}
+# Make sure you've already run the data processing
+source("ifo_data_processing.R")
+DATA_PATH <- file.path("Data")
+results <- main(DATA_PATH)
+
+# Assuming 'results' object is already in your environment
+
+data_long <- results$data_long
+```
+
+# 1. Summary Statistics
+
+## Calculate Missing Value Statistics
+
+```{r calc-stats, include=FALSE}
+# By industry-question combination
+missing_by_combo <- data_long %>%
+  group_by(industry_code, industry_name, level, question, question_name) %>%
+  summarise(
+    total_obs = n(),
+    missing_count = sum(is.na(value)),
+    missing_pct = mean(is.na(value)) * 100,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(missing_pct))
+
+# By industry
+missing_by_industry <- data_long %>%
+  group_by(industry_code, industry_name, level) %>%
+  summarise(
+    total_obs = n(),
+    missing_count = sum(is.na(value)),
+    missing_pct = mean(is.na(value)) * 100,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(missing_pct))
+
+# By question
+missing_by_question <- data_long %>%
+  group_by(question, question_name, question_type) %>%
+  summarise(
+    total_obs = n(),
+    missing_count = sum(is.na(value)),
+    missing_pct = mean(is.na(value)) * 100,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(missing_pct))
+
+# By level
+missing_by_level <- data_long %>%
+  group_by(level) %>%
+  summarise(
+    n_industries = n_distinct(industry_code),
+    total_obs = n(),
+    missing_count = sum(is.na(value)),
+    missing_pct = mean(is.na(value)) * 100,
+    .groups = "drop"
+  ) %>%
+  arrange(level)
+
+# By time
+missing_by_time <- data_long %>%
+  group_by(date) %>%
+  summarise(
+    total_obs = n(),
+    missing_count = sum(is.na(value)),
+    missing_pct = mean(is.na(value)) * 100,
+    .groups = "drop"
+  ) %>%
+  arrange(date)
+```
+
+## Overall Missing Rate
+
+```{r overall-stats}
+overall_missing <- mean(is.na(data_long$value)) * 100
+
+cat("📊 Overall Statistics:\n\n")
+cat("Total observations:", nrow(data_long), "\n\n")
+cat("Missing observations:", sum(is.na(data_long$value)), "\n\n")
+cat("Overall missing rate:", sprintf("%.2f%%", overall_missing), "\n\n")
+cat("\n\n")
+cat("Industries:", n_distinct(data_long$industry_code), "\n\n")
+cat("Questions:", n_distinct(data_long$question), "\n\n")
+cat("Time points:", n_distinct(data_long$date), "\n\n")
+```
+
+## Missing by Level
+
+```{r table-level}
+missing_by_level %>%
+  mutate(missing_pct = sprintf("%.2f%%", missing_pct)) %>%
+  kable(
+    caption = "Missing Rate by Hierarchy Level",
+    col.names = c("Level", "# Industries", "Total Obs", "Missing", "Missing %")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+## Top 10 Missing Questions
+
+```{r table-questions}
+missing_by_question %>%
+  head(10) %>%
+  mutate(missing_pct = sprintf("%.2f%%", missing_pct)) %>%
+  select(question, question_name, question_type, missing_pct) %>%
+  kable(
+    caption = "Top 10 Questions with Highest Missing Rate",
+    col.names = c("Code", "Question Name", "Type", "Missing %")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+# 2. Heatmap: Industry × Question Matrix
+
+**Purpose**: Visualize missing patterns across industry-question combinations
+
+```{r heatmap, fig.width=14, fig.height=12}
+# Select top N industries with highest missing rates
+top_n_industries <- 50
+
+top_industries <- missing_by_industry %>%
+  arrange(desc(missing_pct)) %>%
+  head(top_n_industries) %>%
+  pull(industry_code)
+
+# Calculate missing rate matrix
+missing_matrix <- data_long %>%
+  filter(industry_code %in% top_industries) %>%
+  group_by(industry_name, question_name) %>%
+  summarise(missing_pct = mean(is.na(value)) * 100, .groups = "drop")
+
+# Create heatmap
+ggplot(missing_matrix, aes(x = question_name, y = industry_name, fill = missing_pct)) +
+  geom_tile(color = "white", size = 0.5) +
+  scale_fill_viridis_c(
+    option = "rocket",
+    direction = -1,
+    name = "Missing %",
+    breaks = c(0, 25, 50, 75, 100)
+  ) +
+  labs(
+    title = sprintf("Missing Value Heatmap: Top %d Industries with Highest Missing Rates", top_n_industries),
+    subtitle = "Darker colors indicate higher missing rates",
+    x = "Question",
+    y = "Industry"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+    axis.text.y = element_text(size = 7),
+    legend.position = "right",
+    plot.title = element_text(face = "bold", size = 14),
+    panel.grid = element_blank()
+  )
+```
+
+**Interpretation**:
+
+- Darker = High missing rate (close to 100%)
+- Lighter = Low missing rate (close to 0%)
+- If a row is entirely dark → Poor data quality for that industry
+- If a column has large dark areas → That question is missing across many industries
+
+---
+
+# 3. Missing Rate by Hierarchy Level
+
+**Purpose**: Compare data quality across different hierarchy levels
+
+```{r by-level, fig.width=10, fig.height=6}
+ggplot(missing_by_level, aes(x = factor(level), y = missing_pct)) +
+  geom_col(aes(fill = missing_pct), width = 0.7) +
+  geom_text(
+    aes(label = sprintf("%.1f%%\n(n=%d)", missing_pct, n_industries)),
+    vjust = -0.5, 
+    size = 3.5
+  ) +
+  scale_fill_viridis_c(
+    option = "mako",
+    direction = -1,
+    name = "Missing %"
+  ) +
+  labs(
+    title = "Missing Rate by Hierarchy Level",
+    subtitle = "Label shows: Missing % (# of industries)",
+    x = "Level",
+    y = "Missing Rate (%)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "none"
+  )
+```
+
+**Interpretation**:
+- Level 0-1: Usually have lower missing rates (< 5%)
+- Level 4-5: May have higher missing rates (15-30%)
+- Level 6: Special aggregates, need separate evaluation
+
+**Recommendation**: Prioritize using Level 0-2 for DFM analysis
+
+---
+
+# 4. Top 30 Industries with Highest Missing Rates
+
+**Purpose**: Identify "problematic industries" that may need to be excluded
+
+```{r top-industries, fig.width=12, fig.height=14}
+top_n <- 30
+
+top_data <- missing_by_industry %>%
+  head(top_n) %>%
+  mutate(
+    industry_label = paste0(industry_code, "\n", 
+                            str_trunc(industry_name, 40, "right"))
+  )
+
+ggplot(top_data, aes(x = reorder(industry_label, missing_pct), y = missing_pct)) +
+  geom_col(aes(fill = level), width = 0.7) +
+  geom_text(
+    aes(label = sprintf("%.1f%%", missing_pct)), 
+    hjust = -0.2, 
+    size = 3
+  ) +
+  scale_fill_viridis_c(
+    option = "turbo",
+    name = "Level"
+  ) +
+  coord_flip() +
+  labs(
+    title = sprintf("Top %d Industries with Highest Missing Rates", top_n),
+    x = "Industry",
+    y = "Missing Rate (%)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.text.y = element_text(size = 8),
+    legend.position = "right"
+  ) +
+  ylim(0, max(top_data$missing_pct) * 1.1)
+```
+
+**Decision Support**:
+```{r decision-industries}
+# Industries with > 50% missing rate
+high_missing_industries <- missing_by_industry %>%
+  filter(missing_pct > 50)
+
+cat("Industries with > 50% missing rate:", nrow(high_missing_industries), "\n")
+cat("Consider excluding these from analysis\n")
+```
+
+---
+
+# 5. Missing Rate Over Time
+
+**Purpose**: Discover temporal patterns in missing values
+
+```{r time-overall, fig.width=12, fig.height=6}
+ggplot(missing_by_time, aes(x = date, y = missing_pct)) +
+  geom_line(color = "#440154", size = 1) +
+  geom_smooth(method = "loess", color = "#FDE725", se = TRUE, alpha = 0.2) +
+  labs(
+    title = "Missing Rate Over Time",
+    subtitle = "Yellow line shows smoothed trend",
+    x = "Date",
+    y = "Missing Rate (%)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+**Typical Pattern**:
+- 1991-1997: High missing rate (30-40%) → Early data, incomplete
+- 1997-2025: Low missing rate (< 5%) → Mature data period
+
+**Recommendation**: Consider using data from 1997 onwards
+
+---
+
+# 6. Missing Rate by Question Type Over Time
+
+**Purpose**: Identify which question types have more missing values
+
+```{r time-by-type, fig.width=12, fig.height=6}
+missing_by_time_question <- data_long %>%
+  group_by(date, question_type) %>%
+  summarise(missing_pct = mean(is.na(value)) * 100, .groups = "drop")
+
+ggplot(missing_by_time_question, aes(x = date, y = missing_pct, color = question_type)) +
+  geom_line(size = 1) +
+  scale_color_viridis_d(option = "plasma", name = "Question Type") +
+  labs(
+    title = "Missing Rate Over Time by Question Type",
+    x = "Date",
+    y = "Missing Rate (%)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "bottom"
+  )
+```
+
+**Interpretation**: Some question types (e.g., expectations) may have higher missing rates in early periods
+
+---
+
+# 7. Bubble Chart: Top 50 Missing Combinations
+
+**Purpose**: Precisely locate industry×question combinations with high missing rates
+
+```{r bubble, fig.width=14, fig.height=12}
+top_n_combos <- 50
+
+top_combos <- missing_by_combo %>%
+  filter(missing_pct > 0) %>%
+  arrange(desc(missing_pct)) %>%
+  head(top_n_combos)
+
+ggplot(top_combos, aes(x = question_name, y = industry_name)) +
+  geom_point(aes(size = missing_pct, color = missing_pct), alpha = 0.7) +
+  scale_size_continuous(
+    range = c(2, 15),
+    name = "Missing %"
+  ) +
+  scale_color_viridis_c(
+    option = "inferno",
+    direction = -1,
+    name = "Missing %"
+  ) +
+  labs(
+    title = sprintf("Top %d Missing Combinations (Industry × Question)", top_n_combos),
+    subtitle = "Bubble size and color indicate missing rate",
+    x = "Question",
+    y = "Industry"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+    axis.text.y = element_text(size = 7),
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "right"
+  )
+```
+
+**Use Case**: Exclude specific industry-question combinations with extremely high missing rates
+
+---
+
+# 8. Level 1 Industries: Detailed Heatmap
+
+**Purpose**: Focus on the 21 main industry sectors (most commonly used)
+
+```{r level1-heatmap, fig.width=14, fig.height=10}
+level1_data <- data_long %>%
+  filter(level == 1) %>%
+  group_by(industry_name, question_name) %>%
+  summarise(missing_pct = mean(is.na(value)) * 100, .groups = "drop")
+
+ggplot(level1_data, aes(x = question_name, y = industry_name, fill = missing_pct)) +
+  geom_tile(color = "white", size = 0.8) +
+  geom_text(
+    aes(label = sprintf("%.0f%%", missing_pct)), 
+    size = 2.5, 
+    color = "white"
+  ) +
+  scale_fill_gradient2(
+    low = "#2166ac",
+    mid = "#f7f7f7",
+    high = "#b2182b",
+    midpoint = 50,
+    name = "Missing %",
+    limits = c(0, 100)
+  ) +
+  labs(
+    title = "Level 1 Main Industry Sectors: Missing Value Details",
+    subtitle = "Numbers show exact missing rate percentages",
+    x = "Question",
+    y = "Industry Sector"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(face = "bold", size = 14),
+    panel.grid = element_blank()
+  )
+```
+
+**Why Important**: Level 1 represents the 21 main economic sectors, most frequently used in analysis
+
+---
+
+# 9. Data Quality Categories by Level
+
+**Purpose**: Quick assessment of overall data quality across levels
+
+```{r categories, fig.width=12, fig.height=7}
+missing_categories <- data_long %>%
+  group_by(industry_code, industry_name, level) %>%
+  summarise(missing_pct = mean(is.na(value)) * 100, .groups = "drop") %>%
+  mutate(
+    category = case_when(
+      missing_pct == 0 ~ "Complete (0%)",
+      missing_pct < 5 ~ "Excellent (<5%)",
+      missing_pct < 15 ~ "Good (5-15%)",
+      missing_pct < 30 ~ "Fair (15-30%)",
+      TRUE ~ "Poor (≥30%)"
+    ),
+    category = factor(
+      category, 
+      levels = c("Complete (0%)", "Excellent (<5%)", "Good (5-15%)", 
+                 "Fair (15-30%)", "Poor (≥30%)")
+    )
+  )
+
+category_by_level <- missing_categories %>%
+  group_by(level, category) %>%
+  summarise(count = n(), .groups = "drop")
+
+ggplot(category_by_level, aes(x = factor(level), y = count, fill = category)) +
+  geom_col(position = "stack", width = 0.7) +
+  geom_text(
+    aes(label = count),
+    position = position_stack(vjust = 0.5),
+    size = 3.5,
+    color = "white",
+    fontface = "bold"
+  ) +
+  scale_fill_manual(
+    values = c("#2166ac", "#4393c3", "#92c5de", "#fddbc7", "#d6604d"),
+    name = "Data Quality"
+  ) +
+  labs(
+    title = "Data Quality Distribution by Hierarchy Level",
+    subtitle = "Numbers show count of industries",
+    x = "Level",
+    y = "Number of Industries"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "right"
+  )
+```
+
+**Interpretation**:
+- Blue shades = Good quality (Complete, Excellent, Good)
+- Red shades = Poor quality (Fair, Poor)
+- Level 0-1: Should be mostly blue
+- If Level 2-3 has much red, consider using only Level 0-1
+
+---
+
+# 10. Summary
+
+
+```{r summary-findings}
+cat("📊 Key Findings:\n\n")
+
+cat("1. Overall Missing Rate:", sprintf("%.2f%%\n", overall_missing))
+
+cat("\n2. Level Analysis:\n")
+missing_by_level %>%
+  mutate(quality = ifelse(missing_pct < 5, "✓ Good", 
+                         ifelse(missing_pct < 15, "⚠ Fair", "✗ Poor"))) %>%
+  select(level, n_industries, missing_pct, quality) %>%
+  print()
+
+cat("\n3. Temporal Pattern:\n")
+early_missing <- missing_by_time %>%
+  filter(date < as.Date("1997-07-01")) %>%
+  summarise(avg_missing = mean(missing_pct)) %>%
+  pull(avg_missing)
+
+recent_missing <- missing_by_time %>%
+  filter(date >= as.Date("1997-07-01")) %>%
+  summarise(avg_missing = mean(missing_pct)) %>%
+  pull(avg_missing)
+
+cat("Before 1997:", sprintf("%.2f%%\n", early_missing))
+cat("1997 onwards:", sprintf("%.2f%%\n", recent_missing))
+
+cat("\n4. Problem Industries (>30% missing):\n")
+cat("Count:", nrow(filter(missing_by_industry, missing_pct > 30)), "\n")
+```
+
+## Recommendations for DFM Analysis
+
+```{r recommendations}
+cat("1. TIME RANGE:\n")
+cat("   → Use data from 1997 onwards\n")
+cat("   → Missing rate drops significantly after this point\n\n")
+
+cat("2. HIERARCHY LEVEL:\n")
+cat("   → Prioritize Level 0-2 for analysis\n")
+cat("   → Level 3+ may have higher missing rates\n\n")
+
+cat("3. INDUSTRY EXCLUSION:\n")
+problem_industries <- missing_by_industry %>%
+  filter(missing_pct > 30)
+cat("   → Consider excluding", nrow(problem_industries), "industries with >30% missing\n")
+cat("   → These represent", 
+    sprintf("%.1f%%", nrow(problem_industries)/n_distinct(data_long$industry_code)*100),
+    "of all industries\n\n")
+
+cat("4. QUESTION SELECTION:\n")
+problem_questions <- missing_by_question %>%
+  filter(missing_pct > 20)
+if (nrow(problem_questions) > 0) {
+  cat("   → Review these questions with >20% missing:\n")
+  print(problem_questions %>% select(question, question_name, missing_pct))
+} else {
+  cat("   → All questions have acceptable missing rates (<20%)\n")
+}
+```
+
+
+```{r example-cleaning, include=FALSE}
+# Example: Apply recommended filters
+clean_data <- data_long %>%
+  filter(
+    level <= 2,                          # Use Level 0-2
+    date >= as.Date("1997-07-01")       # Use 1997 onwards
+  )
+
+# Exclude high-missing industries
+high_missing <- missing_by_industry %>%
+  filter(missing_pct > 30) %>%
+  pull(industry_code)
+
+clean_data <- clean_data %>%
+  filter(!industry_code %in% high_missing)
+
+# Verify
+final_missing <- mean(is.na(clean_data$value)) * 100
+
+cat("\n Cleaned Data Summary:\n")
+cat("Original observations:", nrow(data_long), "\n")
+cat("Cleaned observations:", nrow(clean_data), "\n")
+cat("Reduction:", sprintf("%.1f%%\n", (1 - nrow(clean_data)/nrow(data_long)) * 100))
+cat("\nOriginal missing rate:", sprintf("%.2f%%\n", overall_missing))
+cat("Cleaned missing rate:", sprintf("%.2f%%\n", final_missing))
+cat("Improvement:", sprintf("%.2f percentage points\n", overall_missing - final_missing))
+```
+
+---
+
+
+
+
+```{r}
+# ===============================================================================
+# BES and PRS Missing Value Analysis
+# Investigate missing patterns for employment and production expectations
+# ===============================================================================
+
+library(tidyverse)
+library(lubridate)
+
+# Assuming you have 'results' loaded
+# source("complete_data_processing.R")
+# results <- main(DATA_PATH)
+
+analyze_bes_prs_missing <- function(data_long) {
+  
+  cat("\n", rep("=", 80), "\n", sep = "")
+  cat("  BES & PRS Missing Value Analysis\n")
+  cat(rep("=", 80), "\n\n", sep = "")
+  
+  # Focus on BES and PRS
+  bes_prs_data <- data_long %>%
+    filter(question %in% c("BES", "PRS"))
+  
+  # Overall missing rate
+  cat("📊 Overall Statistics:\n\n")
+  
+  overall_stats <- bes_prs_data %>%
+    group_by(question, question_name) %>%
+    summarise(
+      total_obs = n(),
+      missing_count = sum(is.na(value)),
+      non_missing_count = sum(!is.na(value)),
+      missing_pct = mean(is.na(value)) * 100,
+      .groups = "drop"
+    )
+  
+  print(overall_stats)
+  
+  # Missing by year
+  cat("\n📅 Missing Rate by Year:\n\n")
+  
+  yearly_missing <- bes_prs_data %>%
+    mutate(year = year(date)) %>%
+    group_by(question, year) %>%
+    summarise(
+      n_obs = n(),
+      missing_pct = mean(is.na(value)) * 100,
+      .groups = "drop"
+    ) %>%
+    arrange(question, year)
+  
+  # Find the first year with data
+  first_data <- yearly_missing %>%
+    filter(missing_pct < 100) %>%
+    group_by(question) %>%
+    summarise(first_year = min(year), .groups = "drop")
+  
+  print(first_data)
+  
+  # Check missing pattern by level
+  cat("\n🏗️ Missing Rate by Level:\n\n")
+  
+  level_missing <- bes_prs_data %>%
+    group_by(question, level) %>%
+    summarise(
+      n_industries = n_distinct(industry_code),
+      missing_pct = mean(is.na(value)) * 100,
+      .groups = "drop"
+    ) %>%
+    arrange(question, level)
+  
+  print(level_missing)
+  
+  # Time series plot
+  cat("\n📈 Creating visualizations...\n")
+  
+  # Plot 1: Missing rate over time
+  p1 <- bes_prs_data %>%
+    group_by(date, question) %>%
+    summarise(missing_pct = mean(is.na(value)) * 100, .groups = "drop") %>%
+    ggplot(aes(x = date, y = missing_pct, color = question)) +
+    geom_line(size = 1.2) +
+    geom_vline(xintercept = as.Date("1997-07-01"), 
+               linetype = "dashed", color = "red", size = 1) +
+    annotate("text", x = as.Date("1997-07-01"), y = 50, 
+             label = "1997", color = "red", hjust = -0.2) +
+    scale_color_viridis_d(option = "plasma", end = 0.8) +
+    labs(
+      title = "BES & PRS: Missing Rate Over Time",
+      subtitle = "Red line marks 1997",
+      x = "Date",
+      y = "Missing Rate (%)",
+      color = "Question"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      legend.position = "bottom"
+    )
+  
+  print(p1)
+  
+  # Plot 2: Distribution of industries by first data year
+  cat("\n📊 When did each industry start reporting BES/PRS?\n\n")
+  
+  industry_start <- bes_prs_data %>%
+    filter(!is.na(value)) %>%
+    mutate(year = year(date)) %>%
+    group_by(question, industry_code, industry_name, level) %>%
+    summarise(first_year = min(year), .groups = "drop")
+  
+  p2 <- industry_start %>%
+    ggplot(aes(x = first_year, fill = question)) +
+    geom_histogram(binwidth = 1, position = "dodge", alpha = 0.7) +
+    scale_fill_viridis_d(option = "plasma", end = 0.8) +
+    labs(
+      title = "Distribution of Industry Start Years for BES & PRS",
+      subtitle = "When did industries start reporting these questions?",
+      x = "First Year with Data",
+      y = "Number of Industries",
+      fill = "Question"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      legend.position = "bottom"
+    )
+  
+  print(p2)
+  
+  # Summary statistics
+  cat("\n📋 Summary of Industry Start Years:\n\n")
+  
+  start_summary <- industry_start %>%
+    group_by(question) %>%
+    summarise(
+      n_industries = n(),
+      min_year = min(first_year),
+      median_year = median(first_year),
+      max_year = max(first_year),
+      n_before_1997 = sum(first_year < 1997),
+      n_1997_or_after = sum(first_year >= 1997),
+      .groups = "drop"
+    )
+  
+  print(start_summary)
+  
+  # Compare all questions
+  cat("\n\n", rep("=", 80), "\n", sep = "")
+  cat("  Comparison with Other Questions\n")
+  cat(rep("=", 80), "\n\n", sep = "")
+  
+  all_questions_start <- data_long %>%
+    filter(!is.na(value)) %>%
+    mutate(year = year(date)) %>%
+    group_by(question, question_name) %>%
+    summarise(
+      first_year = min(year),
+      n_industries = n_distinct(industry_code),
+      .groups = "drop"
+    ) %>%
+    arrange(first_year)
+  
+  cat("First year with data for each question:\n\n")
+  print(all_questions_start)
+  
+  # Return results
+  return(list(
+    overall_stats = overall_stats,
+    first_data_year = first_data,
+    level_missing = level_missing,
+    yearly_missing = yearly_missing,
+    industry_start = industry_start,
+    start_summary = start_summary,
+    all_questions_start = all_questions_start,
+    plots = list(
+      time_series = p1,
+      distribution = p2
+    )
+  ))
+}
+
+# ===============================================================================
+# Strategy Comparison Function
+# ===============================================================================
+
+compare_strategies <- function(data_long) {
+  
+  cat("\n", rep("=", 80), "\n", sep = "")
+  cat("  Strategy Comparison for DFM Analysis\n")
+  cat(rep("=", 80), "\n\n", sep = "")
+  
+  # Strategy 1: Drop BES and PRS entirely
+  strategy1 <- data_long %>%
+    filter(!question %in% c("BES", "PRS"))
+  
+  # Strategy 2: Use all questions from 1997 onwards
+  strategy2 <- data_long %>%
+    filter(date >= as.Date("1997-01-01"))
+  
+  # Strategy 3: Use all questions but only 1991-1996 for available ones
+  # This is not recommended for DFM, but let's see the stats
+  
+  cat("Strategy Comparison:\n\n")
+  
+  # Strategy 1 stats
+  cat("STRATEGY 1: Drop BES & PRS, Use All Years\n")
+  cat(rep("-", 50), "\n")
+  cat("Time period: 1991-01 to", format(max(strategy1$date), "%Y-%m"), "\n")
+  cat("Questions:", n_distinct(strategy1$question), "\n")
+  cat("Industries:", n_distinct(strategy1$industry_code), "\n")
+  cat("Total observations:", nrow(strategy1), "\n")
+  cat("Missing rate:", sprintf("%.2f%%", mean(is.na(strategy1$value)) * 100), "\n")
+  cat("Time points:", n_distinct(strategy1$date), "\n")
+  cat("\n")
+  
+  # Strategy 2 stats
+  cat("STRATEGY 2: Keep All Questions, Start from 1997\n")
+  cat(rep("-", 50), "\n")
+  cat("Time period: 1997-07 to", format(max(strategy2$date), "%Y-%m"), "\n")
+  cat("Questions:", n_distinct(strategy2$question), "\n")
+  cat("Industries:", n_distinct(strategy2$industry_code), "\n")
+  cat("Total observations:", nrow(strategy2), "\n")
+  cat("Missing rate:", sprintf("%.2f%%", mean(is.na(strategy2$value)) * 100), "\n")
+  cat("Time points:", n_distinct(strategy2$date), "\n")
+  cat("\n")
+  
+  # Create comparison table
+  comparison <- tibble(
+    Strategy = c("Drop BES & PRS", "Start from 1997"),
+    Time_Period = c(
+      sprintf("%s to %s", format(min(strategy1$date), "%Y-%m"), 
+              format(max(strategy1$date), "%Y-%m")),
+      sprintf("%s to %s", format(min(strategy2$date), "%Y-%m"), 
+              format(max(strategy2$date), "%Y-%m"))
+    ),
+    N_Questions = c(n_distinct(strategy1$question), n_distinct(strategy2$question)),
+    N_Industries = c(n_distinct(strategy1$industry_code), 
+                     n_distinct(strategy2$industry_code)),
+    N_Timepoints = c(n_distinct(strategy1$date), n_distinct(strategy2$date)),
+    Total_Obs = c(nrow(strategy1), nrow(strategy2)),
+    Missing_Pct = c(
+      sprintf("%.2f%%", mean(is.na(strategy1$value)) * 100),
+      sprintf("%.2f%%", mean(is.na(strategy2$value)) * 100)
+    )
+  )
+  
+  cat("\n📋 Side-by-Side Comparison:\n\n")
+  print(comparison, n = Inf)
+  
+  # Visualize comparison
+  cat("\n📈 Creating comparison visualization...\n")
+  
+  p <- comparison %>%
+    pivot_longer(cols = c(N_Questions, N_Timepoints), 
+                 names_to = "Metric", values_to = "Value") %>%
+    mutate(
+      Metric = case_when(
+        Metric == "N_Questions" ~ "Number of Questions",
+        Metric == "N_Timepoints" ~ "Number of Time Points"
+      )
+    ) %>%
+    ggplot(aes(x = Strategy, y = Value, fill = Strategy)) +
+    geom_col(width = 0.6) +
+    geom_text(aes(label = Value), vjust = -0.5, size = 4) +
+    facet_wrap(~Metric, scales = "free_y", ncol = 2) +
+    scale_fill_viridis_d(option = "mako", begin = 0.3, end = 0.7) +
+    labs(
+      title = "Strategy Comparison: Key Metrics",
+      y = "Count"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      legend.position = "none",
+      axis.text.x = element_text(angle = 15, hjust = 1)
+    )
+  
+  print(p)
+  
+  return(list(
+    strategy1_data = strategy1,
+    strategy2_data = strategy2,
+    comparison_table = comparison,
+    comparison_plot = p
+  ))
+}
+
+
+```
+
+```{r}
+# ===============================================================================
+# Usage Example
+# ===============================================================================
+
+# # Run the analysis
+bes_prs_analysis <- analyze_bes_prs_missing(results$data_long)
+# 
+# # Compare strategies
+strategy_comparison <- compare_strategies(results$data_long)
+# 
+# # View results
+print(bes_prs_analysis$start_summary)
+print(strategy_comparison$comparison_table)
+```
+
+
+
+
+
+
+
+
