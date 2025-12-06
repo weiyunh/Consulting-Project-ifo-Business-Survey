@@ -42,7 +42,7 @@ options(scipen = 999)
 This script provides descriptive analysis of ifo Business Survey data. Two data versions are prepared:
 
 - **Version A**: 1991-2025 (410 months, 13 questions) - excludes BES & PRS
-- **Version B**: 1997-2025 (350 months, 15 questions) - **Preferred for DFM**
+- **Version B**: 1997-2025 (332 months, 15 questions)
 
 ---
 
@@ -503,7 +503,9 @@ ggplot(industry_volatility, aes(x = reorder(industry_code, volatility), y = vola
         legend.position = "none")
 ```
 
-**Interpretation.** Industry-level volatility in the business climate index reveals distinct risk profiles across Level-1 manufacturing sectors:
+**Interpretation.** 
+
+Industry-level volatility in the business climate index reveals distinct risk profiles across Level-1 manufacturing sectors:
 
 - **Most volatile industries (top of the ranking).**  
   Industries such as *coke and refined petroleum products* (C1900000) and *basic metals* (C2400000) appear at the top of the volatility ranking. Their business climate shows the largest fluctuations over time, which is consistent with strong exposure to global commodity price cycles and energy market shocks. These sectors are affected both by swings in demand and by highly volatile input costs.
@@ -518,8 +520,9 @@ ggplot(industry_volatility, aes(x = reorder(industry_code, volatility), y = vola
   More defensive sectors such as *food and feed products* (C1000000), *pharmaceuticals* (C2100000), and parts of the chemical industry (C2000000) lie below the top-15 volatility range. Their business climate varies over time, but with smaller swings, in line with necessity-goods demand and more stable consumption patterns.
 
 - **Economic implications.**  
+
   1. **Commodity dependence:** sectors tied to energy and metals exhibit the most pronounced boom-bust dynamics.  
-  2. **Durables vs. necessities:** there is a clear gradient from highly cyclical investment and durable-goods industries to more stable necessity-goods producers.  
+  2. **Durables vs. necessities:** there is a clear gradient from highly cyclical investment and durable-goods industries to more stable necessity-goods producers. 
   3. **Factor-model relevance:** high-volatility industries are likely to load more strongly on common business-cycle factors, whereas low-volatility sectors contain a larger idiosyncratic component.
 
 
@@ -539,6 +542,7 @@ ggplot(industry_volatility, aes(x = reorder(industry_code, volatility), y = vola
 
 
 **Cross-Sectional Structure**: 
+
 - **High average correlation** (r ~ 0.7) among Level 1 industries indicates strong common business cycle factor.
 - **Industry clusters**: Investment goods (machinery, motor vehicles, metals) form tight correlation group (r > 0.8), while food industry shows lower correlation (r < 0.5), confirming defensive characteristics.
 - **Volatility hierarchy**:  Volatility hierarchy: Coke and refined petroleum (C1900000) and basic metals (C2400000) are among the most volatile industries in terms of business climate, whereas food and pharmaceutical sectors are at the lower end of the volatility distribution. 
@@ -549,14 +553,6 @@ ggplot(industry_volatility, aes(x = reorder(industry_code, volatility), y = vola
 - **Negative bias in orders**: Export orders show persistent pessimism (mean = -15.89), while production expectations remain optimistic (mean = +9.32), suggesting structural export challenges.
 - **Volatility range**: Current situation (SD = 21.92) most volatile; production expectations (SD = 7.53) most stable. This stability gradient across indicators may help identify factor structure.
 - **Skewness patterns**: Most indicators are left-skewed (Mean < Median), reflecting that crisis-period negative extremes exceed boom-period positive extremes. Employment expectations (BES) show notable left skew (mean = -5.84, median = -4.63), reflecting hiring reluctance.
-
-
-
-**DFM Suitability**:
-
-- Strong crisis co-movement (near r = 1.0) contrasts with moderate normal-period correlation (r = 0.5-0.8), motivating time-varying factor models.
-- Approximately normal core indicators (KLD, GUS, GES) support standard DFM; skewed indicators (BES, BUS, XUS) may benefit from transformation.
-- Sufficient cross-sectional (21 Level 1 industries) and temporal (350 months) dimensions for stable 2-3 factor estimation.
 
 
 ---

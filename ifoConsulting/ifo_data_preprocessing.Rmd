@@ -4,8 +4,9 @@ author: "Weiyun Hong"
 date: "2025-11-24"
 output:
   pdf_document:
-    toc: false
-    toc_depth: 3
+    latex_engine: xelatex
+    keep_tex: true
+    df_print: kable
 subtitle: "ifo Business Survey Data - Two Version Comparison"
 ---
 
@@ -80,7 +81,7 @@ data_long %>%
 
 # 2. Add Combined Variable Names
 
-## `industrycode_questioncode`
+##`industrycode_questioncode`
 
 **Examples:**
 - `C1000000_KLD` = Business climate for Food industry
