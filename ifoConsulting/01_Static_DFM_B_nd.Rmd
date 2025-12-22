@@ -1,0 +1,512 @@
+---
+title: 'Static DFM: ifo Business Survey (Levels - No Differencing)'
+author: "Weiyun Hong"
+date: "2025-12-8"
+header-includes:
+  - \usepackage{parskip}
+  - \setlength{\parskip}{0.5em}
+output:
+  pdf_document:
+    toc: false
+    latex_engine: xelatex
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: cosmo
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 6)
+```
+
+After reviewing the Handbook of ifo Surveys, we maintain the use of non-differenced data in our Dynamic Factor Model. The ifo survey indicators are constructed as balance statistics bounded between −100 and +100, which inherently rules out a genuine random walk process.
+
+The previous stationarity analysis shows that in the full sample, more than 70% of variables reject the unit root hypothesis in levels, and visual inspection suggests persistent cyclical movements rather than deterministic trends. The remaining non-rejections are likely driven by high persistence and the limited power of unit root tests in finite samples. 
+
+DFM results comparison: using first-differenced data resulted in a much lower explained variance (cumulative variance for first 5 factors of only 23.4% vs. 64.6% in original data) and a markedly weaker model fit (median R² of 0.217 vs. 0.710 in original data). 
+
+Differencing the data would remove economically meaningful information about the level of business sentiment, and retain only short-term changes. Since our focus is on identifying common business cycle movements across industries, we therefore consider the use of levels to be more appropriate in this setting.
+
+
+
+
+```{r packages}
+library(tidyverse)
+library(tseries)
+library(ggplot2)
+library(reshape2)
+library(patchwork)
+library(dfms)
+library(missMDA)
+library(zoo)
+library(knitr)
+library(kableExtra)
+
+source("ifo_data_processing.R")
+
+theme_set(theme_minimal())
+```
+
+
+```{r load_data}
+data_wide <- read_csv("data_b_wide.csv")
+data_b_long <- read_csv("data_b_long.csv", show_col_types = FALSE)
+
+dates <- data_wide$date
+var_names <- colnames(data_wide)[-1]
+
+cat("Raw Data dimensions:", nrow(data_wide), " x ", ncol(data_wide)-1, "\n")
+```
+
+
+```{r level_classification}
+# Extract industry and question code from variable name
+extract_industry_code <- function(var_name) {
+  strsplit(var_name, "_")[[1]][1]
+}
+
+extract_question_code <- function(var_name) {
+  strsplit(var_name, "_")[[1]][2]
+}
+
+# Create metadata
+var_metadata <- data.frame(
+  var_name = var_names,
+  industry_code = sapply(var_names, extract_industry_code),
+  stringsAsFactors = FALSE
+)
+
+var_metadata$level <- sapply(var_metadata$industry_code, get_level)
+```
+
+
+## Filter Levels
+
+The dataset is restriced to Level 1 industries to build a stable and interpretable baseline factor model in a cross-section. This avoids mixing multiple hierarchical levels, which can cause the factor structure to be dominated by the most numerous sub-level series. And this allows us to validate economic interpretation before extending the analysis to finer industry levels.
+
+```{r filter, comment=''}
+# Keep only levels 1-5
+# keep_vars <- var_metadata$level >= 1 & var_metadata$level <= 5
+
+# Keep only level 1
+keep_vars <- var_metadata$level == 1
+
+cat("Original:", sum(!is.na(var_metadata$level)), "variables\n")
+cat("Level 1 (keep):", sum(keep_vars, na.rm = TRUE), "variables\n")
+
+# Filter data
+X_raw <- as.matrix(data_wide[, c(FALSE, keep_vars)])
+var_names_filtered <- var_names[keep_vars]
+var_metadata_filtered <- var_metadata[keep_vars, ]
+
+cat("\nFiltered data:", nrow(X_raw), " x ", ncol(X_raw), "\n")
+```
+The filtered dataset consists of 332 monthly observations (1997-07 to 2025-02) and 330 variables (N, 22 Level-1 industries × 15 survey questions).
+
+
+## Exclude KLD (aggregate Index)
+
+```{r exclude_kld, comment=''}
+# The ifo Business Climate Index (KLD) is calculated through a geometric mean of the 
+# "Business Situation" (GUS) and "Business Expectations" (GES) sub-indices.
+# Therefore we exclude composite indices and retain only primitive survey responses.
+
+kld_vars <- grepl("_KLD$", var_names_filtered)
+
+X_raw <- X_raw[, !kld_vars]
+var_names_filtered <- var_names_filtered[!kld_vars]
+var_metadata_filtered <- var_metadata_filtered[!kld_vars, ]
+```
+
+We exclude the ifo Business Climate Index (KLD) to prevent multicollinearity and information redundancy. Because KLD is not a raw survey response, rather, it is a composite indicator derived geometrically from the "Current Business Situation" (GUS) and "Business Expectations" (GES):
+
+$$
+KLD = \sqrt{(GUS + 200)(GES + 200)} - 200
+$$
+
+Since KLD contains no independent information beyond GUS and GES, including it in a Factor Model would inflate the importance of these two components and distort the extracted factors. 
+
+  
+
+## Check Missing Values by Industry (Level 1)
+
+```{r}
+current_ind_codes <- sapply(var_names_filtered, extract_industry_code)
+
+col_miss_rates <- apply(X_raw, 2, function(x) mean(is.na(x)))
+
+miss_summary <- data.frame(
+  Industry_Code = current_ind_codes,
+  Var_Name = var_names_filtered,
+  Miss_Rate = col_miss_rates
+) %>%
+  group_by(Industry_Code) %>%
+  summarise(
+    # Average of all missing rates for variables in this industry
+    Avg_Miss_Rate_Pct = mean(Miss_Rate) * 100, 
+    # The number of variables included in this industry
+    Num_Vars = n()
+  ) %>%
+  mutate(Industry_Name = sapply(Industry_Code, get_industry_name_en)) %>%
+  select(Industry_Code, Industry_Name, everything()) %>%
+  arrange(desc(Avg_Miss_Rate_Pct))
+
+print(as.data.frame(miss_summary), row.names = FALSE)
+
+```
+
+The data for pharmaceutical industry (C2100000) is not available before 2003, since our initial goal is to obtain a stable and reliable baseline factor structure from a balanced panel, we temporarily exclude the pharmaceutical industry from the static analysis.
+
+## EXCLUDE PHARMACEUTICALS (C2100000)
+
+```{r, comment=''}
+# C2100000: Structural missing data 1997-2003 (22.3% missing rate)
+# Pharmaceuticals were added to ifo survey in 2003
+# Rather than impute 6 years of block missing data, we exclude this industry
+
+pharma_vars <- grepl("^C2100000_", var_names_filtered)
+
+if (sum(pharma_vars) > 0) {
+  pharma_missing <- apply(X_raw[, pharma_vars], 2, function(x) {
+    sum(is.na(x)) / length(x) * 100
+  })
+  cat("Pharma avg missing rate:", round(mean(pharma_missing), 2), "%\n")
+}
+
+# Remove pharmaceuticals
+X_raw <- X_raw[, !pharma_vars]
+var_names_filtered <- var_names_filtered[!pharma_vars]
+var_metadata_filtered <- var_metadata_filtered[!pharma_vars, ]
+
+cat("Variables after removing Pharma:", ncol(X_raw), "\n")
+cat("Final: 21 industries × 14 questions = 294 variables\n")
+
+# Verify clean data
+remaining_missing <- sum(is.na(X_raw)) / (nrow(X_raw) * ncol(X_raw)) * 100
+cat("Remaining overall missing rate:", round(remaining_missing, 2), "%\n")
+```
+
+
+## Data Cleaning
+
+```{r clean, comment=''}
+cols_all_na <- apply(X_raw, 2, function(x) all(is.na(x)))
+if (any(cols_all_na)) {
+  X_raw <- X_raw[, !cols_all_na]
+  var_names_filtered <- var_names_filtered[!cols_all_na]
+}
+
+# Linear Interpolation
+X_filled <- apply(X_raw, 2, function(x) {
+  if (all(is.na(x))) return(x) 
+  zoo::na.approx(x, rule = 2) 
+})
+
+X_std <- scale(X_filled, center = TRUE, scale = TRUE)
+
+# Final check
+valid <- apply(X_std, 2, function(x) all(is.finite(x)) && sd(x) > 1e-10)
+X_std <- X_std[, valid]
+
+N <- ncol(X_std)
+T_obs <- nrow(X_std)
+
+cat("\n=== Final Data ===\n")
+cat("N =", N, "variables\n")
+cat("T =", T_obs, "months\n")
+```
+
+```{r}
+# Sigma_X <- cov(X_std)
+# eig <- eigen(Sigma_X)
+# eigenvals <- pmax(eig$values, 0)
+# 
+# var_exp <- eigenvals / sum(eigenvals)
+# cum_var <- cumsum(var_exp)
+```
+
+# Factor Number Selection
+
+```{r scree}
+pca_fit <- prcomp(X_std, center = FALSE, scale. = FALSE)
+eigenvals <- pca_fit$sdev^2
+
+var_exp <- eigenvals / sum(eigenvals)
+cum_var <- cumsum(var_exp)
+
+scree_df <- data.frame(
+  Factor = 1:20,
+  Eigenvalue = eigenvals[1:20],
+  VarExp = var_exp[1:20] * 100,
+  CumVar = cum_var[1:20] * 100
+)
+
+p1 <- ggplot(scree_df, aes(x = Factor, y = Eigenvalue)) +
+  geom_line(color = "steelblue", size = 1) +
+  geom_point(size = 3) +
+  geom_vline(xintercept = 5, linetype = "dashed", color = "red") +
+  labs(title = "Scree Plot")
+
+p2 <- ggplot(scree_df, aes(x = Factor, y = CumVar)) +
+  geom_line(color = "darkgreen", size = 1) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = 80, linetype = "dashed", color = "red") +
+  labs(title = "Cumulative Variance", y = "Cum Var (%)")
+
+p1 + p2
+```
+The scree plot shows a clear “elbow”  at Factor 5: after the 5th factor, eigenvalues drop sharply and then level off. This suggests that the first 5 factors capture the most meaningful variance, while additional factors contribute relatively little. The marginal gain from additional factors is low relative to increased complexity.
+
+Although these 5 factors explain only about 65% of the total variance, this is reasonable and common in high-dimensional survey data. Increasing the explained variance above 80% would require more than 15 factors, which would drastically reduce interpretability and risk overfitting without delivering clearer economic insight.
+
+
+# PCA Estimation and Analysis
+
+```{r pca}
+r <- 5
+pca_result <- prcomp(X_std, rank. = r)
+
+F_hat <- pca_result$x
+colnames(F_hat) <- paste0("F", 1:r)
+
+Lambda_hat <- pca_result$rotation
+
+cat("Factors:", nrow(F_hat), " x ", ncol(F_hat), "\n")
+cat("Loadings:", nrow(Lambda_hat), " x ", ncol(Lambda_hat), "\n")
+```
+
+
+```{r sign_normalization, include = FALSE}
+# SIGN NORMALIZATION
+# Economic intuition: positive factors should correspond to economic expansions
+# Normalize signs so that factors are positive during known expansion periods
+
+# Define expansion period: 2010-2018 (European economic recovery after debt crisis)
+ expansion_period <- dates >= as.Date("2005-01-01") & 
+                    dates <= as.Date("2008-12-31")
+
+# Normalize each factor
+ for (j in 1:r) {
+  # Calculate mean during expansion period
+  mean_expansion <- mean(F_hat[expansion_period, j], na.rm = TRUE)
+  
+  # If negative during expansion, flip the factor and its loadings
+  # Rationale: PCA factor signs are arbitrary, choose the economically intuitive direction
+  # where positive values indicate business cycle expansion
+  if (mean_expansion < 0) {
+    F_hat[, j] <- -F_hat[, j]
+    Lambda_hat[, j] <- -Lambda_hat[, j]
+    cat("Factor", j, "flipped to align with economic expansion\n")
+  } else {
+    cat("Factor", j, "already aligned with economic expansion\n")
+  }
+}
+```
+
+
+```{r, include=FALSE}
+# Print top loadings 
+for (j in 1:r) {
+  load_j <- Lambda_hat[, j]
+  top_idx <- order(abs(load_j), decreasing = TRUE)[1:10]
+  top_vars <- rownames(Lambda_hat)[top_idx]
+  
+  # Extract codes
+  industry_codes <- sapply(top_vars, extract_industry_code)
+  question_codes <- sapply(top_vars, extract_question_code)
+  
+  # Get names and groups
+  industry_names <- sapply(industry_codes, get_industry_name_en)
+  question_names <- sapply(question_codes, get_question_name_en)
+  question_groups <- sapply(question_codes, get_question_group)
+  
+  cat("\n=== Factor", j, ": Top 10 Loadings ===\n")
+  print(data.frame(
+    Variable = top_vars,
+    Industry = industry_names,
+    Question = question_names,
+    Group = question_groups,
+    Loading = round(load_j[top_idx], 4),
+    row.names = NULL
+  ))
+}
+```
+```{r}
+factor_texts <- list(
+  # Factor 1
+  "**Factor 1: Capital Goods manufacturing cycle**\n\n
+  - Factor 1 captures a synchronized expansion in machinery, electrical equipment, and fabricated metals, which are essential for business investment and industrial expansion. It aggregates signals from forward-looking plans (e.g., production expectations), concurrent momentum (e.g., month-on-month changes in orders and production), and current assessments of business situations. Therefore, Factor 1 represents the core business cycle of investment-driven manufacturing. Even the inclusion of rubber and plastics largely aligns with capital goods, as they provide intermediate products for the machinery and automotive industries, and its demand is closely tied to investment-driven cycles.",
+  
+  # Factor 2
+  "**Factor 2: Supply-side conditions and productivity cycle**\n\n
+  - Factor 2 captures a supply-side driven cycle. Its positive loadings on business and productivity expectations in intermediate goods sectors (e.g., chemicals, metals) signal improving upstream supply conditions and efficiency. Consequently, this anticipated increase in supply and productivity eases cost-pass-through pressure, which is reflected in the negative loadings on price expectations for downstream consumer goods (e.g., apparel, motor vehicles). Thus, a rise in this factor represents a benign expansion phase characterized by positive industrial prospects coupled with contained inflation pressures.",
+  
+  # Factor 3
+  "**Factor 3: Consumer Demand & Price Dynamics**\n\n
+  - Factor 3 reflects consumer sector strength coupled with contained inflation. This factor rises when current conditions in consumer-oriented industries (apparel, food, beverages) improve, signaling strong household demand. Concurrently, it associates with lower price expectations in several manufacturing sectors and weaker productivity expectations in motor vehicles. \n
+  - This pattern indicates that despite consumption growth, sufficient industrial capacity and competitive pressures prevent firms from raising prices. Hence, Factor 3 likely identifies phases where consumption drives growth without straining production capacity or triggering widespread price hikes.",
+  
+  # Factor 4
+  "**Factor 4: Global Industrial Demand**\n\n
+  - Factor 4 binds Basic Metals (upstream, raw material) with Wearing Apparel (downstream, consumer), both sectors are highly sensitive to global trade flows and inventory cycles. So this factor rises when export-oriented industries (especially basic metals and textiles) show strength in current orders and future export expectations, signaling robust global demand for industrial inputs and consumer goods. Conversely, it simultaneously associates with weakness in domestically-focused sectors like food and wood products. \n
+  - Therefore, Factor 4 captures the structural divergence between international and domestic demand cycles: its upward movement reflects a phase where global industrial activity outpaces domestic consumption, while its decline indicates a collapse in external demand that often coincides with (or slightly precedes) a downturn in broader economic sentiment.",
+  
+  # Factor 5
+  "**Factor 5: Specialized Manufacturing**\n\n
+  - Factor 5 is predominantly driven by other transport equipment, which explicitly excludes cars and instead covers long-cycle capital goods like trains, ships, and aircraft. It also includes medical devices, medical instruments and supplies. This factor reflects the dynamics of specialized project-based exports (infrastructure and med-tech) rather than mass-market consumer vehicles, driven by independent production plans and export orders that do not necessarily synchronize with the broader industrial business cycle.\n
+  - Furthermore, the loading value for paper products is negative. This indicates that when economic growth is primarily driven by \"infrastructure investment and high-end manufacturing\" it often means that traditional \"retail goods flow\" (the demand side for paper) is relatively weak"
+)
+```
+
+
+```{r, results='asis', echo=FALSE}
+for (j in 1:r) {
+  
+  load_j <- Lambda_hat[, j]
+  top_idx <- order(abs(load_j), decreasing = TRUE)[1:10]
+  top_vars <- rownames(Lambda_hat)[top_idx]
+  industry_names <- sapply(sapply(top_vars, extract_industry_code), get_industry_name_en)
+  question_names <- sapply(sapply(top_vars, extract_question_code), get_question_name_en)
+  question_groups <- sapply(sapply(top_vars, extract_question_code), get_question_group)
+  
+  df_top <- data.frame(
+    Industry = industry_names,
+    Question = question_names,
+    Group = question_groups,
+    Loading = round(load_j[top_idx], 4)
+  )
+
+  print(
+    kbl(df_top, booktabs = TRUE, caption = paste("Top 10 Loadings for Factor", j)) %>%
+    kable_styling(latex_options = c("striped", "hold_position"), font_size = 8, full_width = FALSE)
+  )
+  cat("\n\n")
+
+  if (j <= length(factor_texts)) {
+    cat(factor_texts[[j]])
+  }
+  cat("\n\n")
+}
+```
+
+
+
+# Factor Time Series
+
+```{r ts_plot, fig.height=8}
+factor_df <- data.frame(Date = dates, F_hat) %>%
+  pivot_longer(cols = starts_with("F"), names_to = "Factor", values_to = "Value")
+
+events <- data.frame(
+  Date = as.Date(c("2008-09-15", "2011-08-01", "2020-03-01")),
+  Event = c("Global Financial Crisis", "Euro Crisis", "COVID-19")) %>%
+  mutate(Year = format(Date, "%Y"))
+
+ggplot(factor_df, aes(x = Date, y = Value)) +
+  geom_line(color = "steelblue", size = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(data = events, aes(xintercept = Date),
+             linetype = "dashed", color = "red", alpha = 0.4) +
+  
+  geom_text(
+    data = events,
+    aes(x = Date, label = Year),
+    y = Inf,
+    vjust = 1.2,
+    color = "red",
+    size = 2.5,
+    inherit.aes = FALSE
+  ) +
+  
+  facet_wrap(~ Factor, ncol = 1, scales = "free_y") +
+  labs(title = "Extracted Factors") +
+  theme_minimal()
+```
+
+**Key events marked by red dashed lines:**
+
+- **2008 (Global Financial Crisis):** Major financial shock leading to a sharp contraction in credit and real activity.
+- **2011 (Euro Sovereign Debt Crisis):** Renewed stress in the euro area, tightening financial conditions and weighing on sentiment.
+- **2020 (COVID-19 shock):** Abrupt disruption from lockdowns and supply-chain interruptions.
+
+**Factor 1 (Capital Goods manufacturing Cycle)** closely tracks the overall business climate in manufacturing and exhibits a strong comovement with the aggregate KLD index. It shows pronounced downturns during the 2008 Global Financial Crisis and the COVID-19 shock, followed by strong recoveries, particularly in the post-2010 and post-2020 periods. Its sustained positive phase from 2005-2018 aligns with the European economic recovery. Overall, the factor captures expansions and contractions in investment-related manufacturing activity.
+
+**Factor 2 (Supply-side Conditions & Productivity Cycle)** tracks business and productivity expectations in intermediate goods industries (e.g., chemicals, metals). Its movements often lead the broader capital goods cycle (F1), as improving supply-side confidence and efficiency outlooks signal the pre-conditions for sustained investment. An increase in F2 indicates a benign expansion phase with strong industrial optimism. Conversely, when supply chain expectations deteriorate and cost pressures surge (F2 declines), plans for investment in capital goods (F1) will inevitably contract accordingly.
+
+**Factor 3 (Consumer Demand & Price Dynamics)** shows muted volatility during 2008 Global Financial Crisis, reflecting the "defensive" nature of consumer goods demand. But it also declines during the high-inflation period of 2021-2023 (primarily driven by the energy crisis triggered by the Russia-Ukraine conflict), corresponding to the cost-of-living crisis hitting household purchasing power. 
+
+
+**Factor 4 (Global Industrial Demand)** rose persistently during Germany's 2005-2008 export boom, driven by robust global demand for industrial inputs (e.g., basic metals) and consumer goods (e.g., apparel). Conversely, the factor contracts sharply during global downturns, often contemporaneously with or slightly ahead of declines in broader sentiment. 
+
+
+**Factor 5 (Specialized Manufacturing)** follows a stable path and characterized by low intrinsic volatility, but exhibits sharp, short-lived movements during major disruptions. The rapid rebound after downturns suggests that these industries are less sensitive to continuous demand fluctuations and more influenced by discrete investment decisions and large export contracts. The negative association with paper products further indicates that phases dominated by infrastructure investment and high-end manufacturing often coincide with weaker traditional retail flows.
+
+**Note**: The differing Y-axis scales across the factor plots are a direct and intentional result of the PCA estimation. Each extracted factor is standardized to have a mean of zero, but its variance corresponds to the eigenvalue associated with that factor.
+
+Y-axis value of a factor at any point in time does not represent an absolute, cross-factor magnitude. Instead, the shape, turning points, and sign of each factor's time series are meaningful for identifying cyclical phases. The differing scales do not hinder economic interpretation, as each factor is analyzed within its own context to track the expansion and contraction of the specific economic driver it represents.
+
+## Diagnostics
+
+```{r diagnostics, fig.height=5}
+X_fitted <- F_hat %*% t(Lambda_hat)
+e_hat <- X_std - X_fitted
+
+R2 <- sapply(1:N, function(i) {
+  1 - sum(e_hat[, i]^2) / sum((X_std[, i] - mean(X_std[, i]))^2)
+})
+
+cat("R² summary:\n")
+print(summary(R2))
+
+ggplot(data.frame(R2 = R2), aes(x = R2)) +
+  geom_histogram(bins = 30, fill = "steelblue", alpha = 0.8) +
+  geom_vline(xintercept = median(R2), linetype = "dashed", color = "red") +
+  labs(title = "R² Distribution")
+```
+The median R² of 0.71 indicates that for over half of the 294 variables, the five common factors explain more than 71% of their variance. This left-skewed tendency confirms that the factor model largely captures the dominant, shared fluctuations across the manufacturing sector.
+
+\newpage
+
+```{r error_corr, fig.height=5}
+cor_e <- cor(e_hat)
+upper_cor <- cor_e[upper.tri(cor_e)]
+mean_abs_cor <- mean(abs(upper_cor))
+
+cat("Mean |correlation| of errors:", round(mean_abs_cor, 4), "\n")
+
+ggplot(data.frame(Cor = upper_cor), aes(x = Cor)) +
+  geom_histogram(bins = 50, fill = "coral", alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "blue") +
+  labs(title = "Error Correlations")
+```
+The mean absolute error correlation of 0.1093 indicates that the residuals (the portion of each series not explained by the common factors) contain very little shared or systematic co-movement. This confirms that the 5 extracted factors have largely captured the dominant common fluctuations across the dataset, leaving behind mostly idiosyncratic, variable-specific noise.
+
+# Summary
+
+**Data**:
+
+- Filtered to 21 Level-1 industries (excluded Pharmaceuticals)
+- Excluded KLD composite index
+- Used original data in levels (no differencing)
+- Final: N = `r N`, T = `r T_obs`
+
+**Factor Extraction**:
+
+- r = 5 factors (empirical selection based on scree plot)
+- Variance explained: `r round(scree_df$CumVar[5], 1)`%
+- Median R²: `r round(median(R2), 3)`
+- Error correlation: `r round(mean_abs_cor, 4)`
+- Sign-normalized for economic interpretation
+
+
+**Next steps**:
+
+- Dynamic DFM: allow the factors to follow autoregressive processes
+- Introduce time-varying factor loadings or regime-dependent dynamics
+- TV-FAVAR analysis
+
+
+

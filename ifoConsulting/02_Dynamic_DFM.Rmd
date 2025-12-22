@@ -1,0 +1,699 @@
+---
+title: 'Dynamic Factor Model: Two-Step Kalman Smoother Approach'
+author: "Weiyun Hong"
+date: "2025-12-15"
+header-includes:
+  - \usepackage{parskip}
+  - \setlength{\parskip}{0.5em}
+output:
+  pdf_document:
+    toc: false
+    latex_engine: xelatex
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: cosmo
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 6)
+```
+
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+library(tseries)
+library(ggplot2)
+library(reshape2)
+library(patchwork)
+library(dfms)
+library(vars)
+library(missMDA)
+library(zoo)
+library(knitr)
+library(kableExtra)
+library(KFAS)
+library(tidyverse)
+
+source("ifo_data_processing.R")
+
+theme_set(theme_minimal())
+```
+
+## Methodology: Dynamic Factor Model with Kalman Smoothing
+
+This script implements a Dynamic Factor Model using the two-step estimator proposed by Doz, Giannone, and Reichlin (2011).  
+The dynamic specification extends the static PCA-based factor model by explicitly introducing time-series dynamics and a state-space representation.
+
+### Step 1: Static Factor Extraction (PCA)
+
+In the first step, common factors and factor loadings are estimated using static PCA:
+\[
+X_t = \Lambda F_t + \xi_t,
+\]
+
+where \(X_t\) is the \(N \times 1\) vector of observed variables, \(F_t\) is the \(r \times 1\) vector of latent common factors, \(\Lambda\) is the matrix of factor loadings, and \(\xi_t\) denotes idiosyncratic components.
+
+This static approach treats each time period independently and does not impose any temporal structure on the factors.
+
+### Step 2: Dynamic Specification and Kalman Smoothing
+
+The dynamic extension introduces a VAR(\(p\)) process for the factors. In this analysis, a second-order specification is used:
+\[
+F_t = A_1 F_{t-1} + A_2 F_{t-2} + u_t,
+\]
+
+where \(u_t\) is a vector of factor innovations with covariance matrix \(Q\).
+
+Together with the measurement equation, this yields a linear Gaussian state-space model:
+
+\[
+\begin{aligned}
+X_t &= \Lambda F_t + \xi_t \quad &\text{(Measurement equation)}, \\
+F_t &= A_1 F_{t-1} + A_2 F_{t-2} + u_t \quad &\text{(State transition)}.
+\end{aligned}
+\]
+
+Given the estimated parameters \((\Lambda, A_1, A_2, Q)\), the factors are re-estimated using a Kalman smoother.
+
+Importantly, the reported dynamic factors correspond to the \emph{smoothed} state estimates,
+\[
+\hat F_{t|T} = \mathbb{E}\left(F_t \mid X_1, \ldots, X_T\right),
+\]
+which exploits information from the entire sample to reduce measurement noise, while the factor dynamics themselves remain strictly backward-looking and determined by the imposed VAR structure.
+
+Moreover, the framework also accounts for heterogeneous measurement noise across variables, assigning less weight to noisier series through the estimated idiosyncratic covariance structure.
+
+
+```{r, include=FALSE}
+data_wide   <- read_csv("data_b_wide.csv")
+
+dates <- as.Date(data_wide$date)
+var_names <- colnames(data_wide)[-1]
+```
+
+
+
+```{r, include=FALSE}
+# Extract industry and question code from variable name
+extract_industry_code <- function(var_name) {
+  strsplit(var_name, "_")[[1]][1]
+}
+
+extract_question_code <- function(var_name) {
+  strsplit(var_name, "_")[[1]][2]
+}
+
+# Create metadata
+var_metadata <- data.frame(
+  var_name = var_names,
+  industry_code = sapply(var_names, extract_industry_code),
+  stringsAsFactors = FALSE
+)
+
+var_metadata$level <- sapply(var_metadata$industry_code, get_level)
+
+# Keep only Level 1
+keep_vars <- var_metadata$level == 1
+
+X_raw <- as.matrix(data_wide[, c(FALSE, keep_vars)]) # drop date col
+var_names_filtered <- var_names[keep_vars]
+var_metadata_filtered <- var_metadata[keep_vars, ]
+```
+
+
+```{r, include=FALSE}
+# Exclude KLD (aggregate index)
+kld_vars <- grepl("_KLD$", var_names_filtered)
+
+X_raw <- X_raw[, !kld_vars, drop = FALSE]
+var_names_filtered <- var_names_filtered[!kld_vars]
+var_metadata_filtered <- var_metadata_filtered[!kld_vars, ]
+
+pharma_vars <- grepl("^C2100000_", var_names_filtered)
+
+# Exclude pharmaceuticals
+ if (sum(pharma_vars) > 0) {
+   pharma_missing <- apply(X_raw[, pharma_vars, drop=FALSE], 2, function(x) {
+   sum(is.na(x)) / length(x) * 100
+   })
+ }
+
+ X_raw <- X_raw[, !pharma_vars, drop = FALSE]
+ var_names_filtered <- var_names_filtered[!pharma_vars]
+ var_metadata_filtered <- var_metadata_filtered[!pharma_vars, ]
+```
+
+
+```{r, include=FALSE}
+# Linear Interpolation
+X_filled <- apply(X_raw, 2, function(x) {
+  if (all(is.na(x))) return(x) 
+  zoo::na.approx(x, rule = 2) 
+})
+
+# Standardize using interpolated mean/sd (stable)
+mu <- colMeans(X_filled, na.rm = TRUE)
+sdv <- apply(X_filled, 2, sd, na.rm = TRUE)
+sdv[sdv < 1e-10 | is.na(sdv)] <- 1
+
+X_std <- sweep(X_filled, 2, mu, "-")
+X_std <- sweep(X_std, 2, sdv, "/")
+
+# Final finite check
+
+valid <- apply(X_std, 2, function(x) all(is.finite(x)) && sd(x) > 1e-10)
+X_std <- X_std[, valid, drop = FALSE]
+X_raw <- X_raw[, valid, drop = FALSE]
+X_filled <- X_filled[, valid, drop = FALSE]
+var_names_filtered <- var_names_filtered[valid]
+var_metadata_filtered <- var_metadata_filtered[valid, ]
+
+N <- ncol(X_std)
+T_obs <- nrow(X_std)
+
+cat("=== Final Data ===\n")
+cat("T =", T_obs, "months\n")
+cat("N =", N, "variables\n")
+
+# Standardized matrix with NA kept for Kalman
+Y_kalman <- sweep(X_raw, 2, mu[valid], "-")
+Y_kalman <- sweep(Y_kalman, 2, sdv[valid], "/")
+
+```
+
+The filtered dataset consists of 332 monthly observations (1997-07 to 2025-02) and 294 variables (21 Level-1 industries × 14 survey questions).
+
+```{r, include=FALSE}
+r <- 5  
+
+pca_result <- prcomp(X_std, rank. = r)
+F_hat <- pca_result$x
+Lambda_hat <- pca_result$rotation
+
+colnames(F_hat) <- paste0("F", 1:r)
+
+cat("Factors:", nrow(F_hat), " x ", ncol(F_hat), "\n")
+cat("Loadings:", nrow(Lambda_hat), " x ", ncol(Lambda_hat), "\n")
+
+```
+
+
+```{r, include=FALSE}
+# sign normalization
+expansion_period <- dates >= as.Date("2005-01-01") & dates <= as.Date("2008-12-31")
+
+for (j in 1:r) {
+mexp <- mean(F_hat[expansion_period, j], na.rm = TRUE)
+if (mexp < 0) {
+  F_hat[, j] <- -F_hat[, j]
+  Lambda_hat[, j] <- -Lambda_hat[, j]
+  cat("Factor", j, "flipped (aligned with expansion)\n")
+  }
+}
+```
+
+
+## VAR Lag Order Selection
+
+```{r}
+# fit VAR(p) on F_hat
+max_p <- 6
+ic_tbl <- purrr::map_dfr(1:max_p, function(p){
+  fit <- vars::VAR(as.data.frame(F_hat), p = p, type = "const")
+  tibble(p = p, AIC = AIC(fit), BIC = BIC(fit))
+})
+
+kbl(ic_tbl, digits = 3, caption = "VAR order selection (information criteria)") %>%
+kable_styling(full_width = FALSE)
+
+p_var <- ic_tbl$p[which.min(ic_tbl$BIC)]
+cat("Selected VAR order: p =", p_var, "\n")
+```
+
+Based on the minimization of the Bayesian Information Criterion (BIC), a lag order of p=2 is selected for the VAR process. This ensures a stable balance between model fit and complexity.
+
+
+## Parameter Estimation
+
+```{r}
+# 1. Fit the Vector Autoregression (VAR) on extracted factors
+# F_t = c + A_1*F_{t-1} + A_2*F_{t-2} + ... + A_p*F_{t-p} + u_t
+var_fit <- VAR(as.data.frame(F_hat), p = p_var, type = "const")
+
+# 2. Robust extraction of VAR coefficient blocks using Bcoef()
+# B = [c, A_1, A_2, ..., A_p] \in R^{r \times (1 + r*p)}
+# Bcoef returns a concatenated matrix containing the intercept and all lag coefficient matrices
+B <- Bcoef(var_fit)      # r x (1 + r*p)
+
+# 3. Remove the intercept (constant) term
+B_noC <- B[, colnames(B) != "const", drop = FALSE]
+
+# 4. Reshape coefficients into a 3D array, separated by lag order
+# Decomposition of B_{noC} into p distinct r x r matrices {A_1, A_2, ..., A_p}
+A_array <- array(0, dim = c(r, r, p_var))
+  for (lag in 1:p_var) {
+  cols <- ((lag - 1) * r + 1):(lag * r)
+  A_array[, , lag] <- B_noC[, cols, drop=FALSE]
+}
+
+# 5. Estimate the Factor Shock Covariance Matrix (Q) from residuals
+# Q = E[u_t u_t'] \approx \frac{1}{T} \sum_{t=1}^T \hat{u}_t \hat{u}_t'
+# Where \hat{u}_t represents the residuals from the VAR model
+U <- resid(var_fit)
+Q <- crossprod(as.matrix(U)) / nrow(U)
+
+cat("VAR(p) fitted: r =", r, ", p =", p_var, "\n")
+```
+
+### Check VAR stability (all roots outside unit circle)
+```{r}
+# Check VAR stability (all roots outside unit circle)
+roots <- roots(var_fit)
+max(Mod(roots))
+
+```
+The VAR dynamics are stable, with the largest root less than one, indicating highly persistent but stationary factor processes,
+
+
+```{r, include=FALSE}
+library(ggplot2)
+library(reshape2)
+
+plot_A <- function(A, lag) {
+  df <- melt(A)
+  colnames(df) <- c("i", "j", "value")
+  ggplot(df, aes(j, i, fill = value)) +
+    geom_tile() +
+    scale_fill_gradient2() +
+    labs(
+      title = paste("VAR Coefficients A", lag),
+      x = expression(F[t - lag]),
+      y = expression(F[t])
+    ) +
+    theme_minimal()
+}
+
+plot_A(A_array[,,1], 1)
+plot_A(A_array[,,2], 2)
+
+
+# Short-run factor dynamics are dominated by own-lag effects (A₁), while second-order lags (A₂) 
+# mainly contribute to smoothing and minorcross-factor adjustments.
+# This structure is well suited for Kalman smoothing and yields economically plausible, smoothly evolving dynamic factors.
+
+```
+
+### Calculate idiosyncratic residuals
+```{r}
+# Calculate the idiosyncratic residuals (error terms)
+Xhat_pca <- F_hat %*% t(Lambda_hat)  # \hat{X}_t = \hat{\Lambda} \hat{F}_t; Dimensions: T x N
+# Subtract the part explained by common factors from the standardized original data
+E_hat <- X_std - Xhat_pca # \hat{\xi}_t = X_t - \hat{X}_t
+psi_diag <- apply(E_hat, 2, var, na.rm = TRUE) #\hat{\Psi} = diag(Var(\hat{\xi}_{i,t}))
+
+# Robustness Check: Handle missing values and near-zero variances
+# If variance is zero or missing, set to a small floor (1e-8) to avoid division by zero in Kalman Filter
+psi_diag[is.na(psi_diag) | psi_diag < 1e-8] <- 1e-8
+summary(psi_diag) %>% print()
+
+# Estimate the heteroskedastic idiosyncratic variance matrix Ψ by calculating the variance of the residuals 
+# after removing the common components reconstructed via PCA. $\xi_t$ identifies the "noise" or variable-specific 
+# movement that the common factors cannot explain.
+
+```
+
+The median idiosyncratic variance is 0.28, indicating that the five common factors explain approximately 72% of the variance in a typical survey variable, which confirms a high signal-to-noise ratio across the manufacturing sector. The wide range of variances (from 0.05 to 0.94) demonstrates significant heterogeneity, where some industries are almost entirely driven by the common business cycle while others remain dominated by variable-specific noise.
+
+## Kalman smoother: build state-space model and smooth factors
+
+### Measurement Equation
+The relationship between the observed variables ($N=294$) and the latent factors ($r=5$) is defined as:
+$$
+X_t = Z \alpha_t + \xi_t, \quad \xi_t \sim \mathcal{N}(0, H)
+$$
+
+Where:
+
+* **$X_t$** is the $294 \times 1$ vector of observed data.
+* **$\alpha_t$** is the $10 \times 1$ augmented state vector containing current and lagged factors:
+    $$
+    \alpha_t = \begin{bmatrix} F_t \\ F_{t-1} \end{bmatrix}
+    $$
+* **$Z$** is the $294 \times 10$ measurement matrix constructed from the estimated factor loadings (`Lambda_hat`):
+    $$
+    Z = \begin{bmatrix} \hat{\Lambda} & \mathbf{0}_{294 \times 5} \end{bmatrix}
+    $$
+* **$H$** is the $294 \times 294$ diagonal covariance matrix of idiosyncratic residuals (`psi_diag`):
+    $$
+    H = \text{diag}(\psi_1, \psi_2, \dots, \psi_{294})
+    $$
+    
+### Transition Equation
+The factors evolve according to a VAR(2) process ($p=2, r=5$), represented in companion form:
+$$
+\alpha_{t+1} = T \alpha_t + R \eta_{t+1}, \quad \eta_{t+1} \sim \mathcal{N}(0, Q)
+$$
+Where:
+
+* **$T$** is the $10 \times 10$ transition matrix constructed from the VAR coefficients (`A_array`):
+    $$
+    T = \begin{bmatrix}
+    \hat{A}_1 & \hat{A}_2 \\
+    I_5 & \mathbf{0}_{5 \times 5}
+    \end{bmatrix}
+    $$
+* **$R$** is the $10 \times 5$ selection matrix that maps structural shocks to the current factors:
+    $$
+    R = \begin{bmatrix} I_5 \\ \mathbf{0}_{5 \times 5} \end{bmatrix}
+    $$
+* **$Q$** is the $5 \times 5$ covariance matrix of the common factor shocks (`Q` from VAR residuals).
+
+
+$$
+\alpha_{t+1}= \begin{pmatrix} F_{t+1} \\
+F_t \end{pmatrix} =
+\begin{pmatrix}
+\hat A_1 & \hat A_2 \\
+I_5      & \mathbf{0}_{5\times 5}
+\end{pmatrix}
+\begin{pmatrix}
+F_t \\
+F_{t-1}
+\end{pmatrix}
++
+\begin{pmatrix}
+I_5 \\
+\mathbf{0}_{5\times 5}
+\end{pmatrix}
+\eta_{t+1}
+$$
+This representation makes explicit the link between the companion-form state vector and the original VAR(2) factor dynamics.
+
+Note: For the purpose of Kalman smoothing, the VAR(2) process is rewritten in companion form as a first-order state-space system. Importantly, this reparameterization does not alter the underlying temporal structure of the model and does not introduce contemporaneous or forward-looking dependence.
+It allows the VAR(2) factor dynamics to be expressed as a first-order Markov process without altering their economic interpretation.
+
+
+```{r}
+# Define augmented state dimension: m = r * p_var
+m <- r * p_var
+
+# Companion transition matrix Tmat (m x m)
+Tmat <- matrix(0, m, m)
+
+# Top block row: [A1 A2 ... Ap]
+for (lag in 1:p_var) {
+  Tmat[1:r, ((lag - 1) * r + 1):(lag * r)] <- A_array[, , lag]
+}
+
+# Sub-diagonal identity blocks
+if (p_var > 1) {
+  Tmat[(r + 1):m, 1:(m - r)] <- diag(m - r)
+}
+
+# Measurement matrix Z: N x m, only depends on current F_t (first r states)
+Zmat <- matrix(0, N, m)
+Zmat[, 1:r] <- Lambda_hat
+
+# R maps factor shocks into the first r elements of the state
+Rmat <- matrix(0, m, r)
+Rmat[1:r, 1:r] <- diag(r)
+
+# Observation noise H (Ψ) : N x N diagonal
+Hmat <- diag(psi_diag, N, N)
+
+a1 <- rep(0, m)
+P1 <- diag(1e6, m)
+
+# Kalman input: standardized data with NA kept
+Y_kfas <- Y_kalman
+colnames(Y_kfas) <- var_names_filtered
+```
+
+
+
+```{r}
+kalman_smoother_missing <- function(Y, Z, Tmat, Rmat, Q, Hdiag, a1, P1) {
+  # X: T x N (NA allowed)
+  # Z: N x m
+  # Tmat: m x m
+  # Rmat: m x k
+  # Q: k x k
+  # Hdiag: length N (diagonal of H)
+  # a1: length m
+  # P1: m x m
+  
+  Y <- as.matrix(Y)
+  storage.mode(Y) <- "double"
+  
+  T_obs <- nrow(Y)
+  N <- ncol(Y)
+  m <- ncol(Z)
+  
+  stopifnot(nrow(Z) == N, ncol(Tmat) == m, nrow(Tmat) == m)
+  stopifnot(length(Hdiag) == N, length(a1) == m, all(dim(P1) == c(m, m)))
+  
+  # storage
+  a_pred <- matrix(NA_real_, T_obs, m)
+  a_filt <- matrix(NA_real_, T_obs, m)
+  a_smooth <- matrix(NA_real_, T_obs, m)
+  
+  P_pred <- array(NA_real_, dim = c(m, m, T_obs))
+  P_filt <- array(NA_real_, dim = c(m, m, T_obs))
+  P_smooth <- array(NA_real_, dim = c(m, m, T_obs))
+  
+  # init
+  a_prev <- as.numeric(a1)
+  P_prev <- P1
+  
+  # filtering
+  for (t in 1:T_obs) {
+    # predict
+    # a_t_pred = T * a_{t-1} 
+    a_t_pred <- as.numeric(Tmat %*% a_prev) 
+    # Var(a_t) P_t_pred = T * P_{t-1} * T' + R * Q * R' 
+    P_t_pred <- Tmat %*% P_prev %*% t(Tmat) + Rmat %*% Q %*% t(Rmat) 
+    
+    a_pred[t, ] <- a_t_pred
+    P_pred[, , t] <- P_t_pred
+    
+    obs <- which(!is.na(Y[t, ]))
+    if (length(obs) == 0) {
+      # no update
+      a_t_filt <- a_t_pred
+      P_t_filt <- P_t_pred
+    } else {
+      Zt <- Z[obs, , drop = FALSE]                  # n_t x m
+      yt <- as.numeric(Y[t, obs])                   # n_t
+      Ht <- diag(Hdiag[obs], nrow = length(obs))    # n_t x n_t
+      
+      v  <- yt - as.numeric(Zt %*% a_t_pred)        # innovation
+      Fm <- Zt %*% P_t_pred %*% t(Zt) + Ht          # innovation cov
+      
+      # Numerical stabilization
+      Fm <- (Fm + t(Fm)) / 2
+      # Solve Fm * x = b
+      K  <- P_t_pred %*% t(Zt) %*% solve(Fm)        # m x n_t
+      
+      a_t_filt <- as.numeric(a_t_pred + K %*% v)
+      P_t_filt <- P_t_pred - K %*% Zt %*% P_t_pred
+      P_t_filt <- (P_t_filt + t(P_t_filt)) / 2
+    }
+    
+    a_filt[t, ] <- a_t_filt
+    P_filt[, , t] <- P_t_filt
+    
+    a_prev <- a_t_filt
+    P_prev <- P_t_filt
+  }
+  
+  # Rauch–Tung–Striebel (RTS) smoother
+  a_smooth[T_obs, ] <- a_filt[T_obs, ]
+  P_smooth[, , T_obs] <- P_filt[, , T_obs]
+  
+  for (t in (T_obs - 1):1) {
+    P_t_filt <- P_filt[, , t]
+    P_tp1_pred <- P_pred[, , t + 1]
+    
+    # J = P_filt_t T' (P_pred_{t+1})^{-1}
+    J <- P_t_filt %*% t(Tmat) %*% solve(P_tp1_pred)
+    
+    a_smooth[t, ] <- as.numeric(a_filt[t, ] + J %*% (a_smooth[t + 1, ] - a_pred[t + 1, ]))
+    P_smooth[, , t] <- P_t_filt + J %*% (P_smooth[, , t + 1] - P_tp1_pred) %*% t(J)
+    P_smooth[, , t] <- (P_smooth[, , t] + t(P_smooth[, , t])) / 2
+  }
+  
+  list(
+    a_pred = a_pred, a_filt = a_filt, a_smooth = a_smooth,
+    P_pred = P_pred, P_filt = P_filt, P_smooth = P_smooth
+  )
+}
+
+```
+
+```{r}
+# Ensure numeric matrix
+Y_kfas <- as.matrix(Y_kalman)
+storage.mode(Y_kfas) <- "double"
+colnames(Y_kfas) <- var_names_filtered
+
+Hdiag <- as.numeric(diag(Hmat))
+Hdiag[!is.finite(Hdiag) | Hdiag < 1e-8] <- 1e-8
+
+Q <- (Q + t(Q)) / 2
+ev <- eigen(Q, symmetric = TRUE)
+ev$values[ev$values < 1e-8] <- 1e-8
+Q <- ev$vectors %*% diag(ev$values) %*% t(ev$vectors)
+
+# Run smoother
+ks <- kalman_smoother_missing(
+  Y = Y_kfas,
+  Z = Zmat,
+  Tmat = Tmat,
+  Rmat = Rmat,
+  Q = Q,
+  Hdiag = Hdiag,
+  a1 = a1,
+  P1 = P1
+)
+
+alpha_smooth <- ks$a_smooth   # T x m
+F_smooth <- alpha_smooth[, 1:r, drop = FALSE]
+colnames(F_smooth) <- paste0("F_smooth", 1:r)
+
+```
+
+
+```{r}
+# Common component (standardized scale): X_common = Lambda * F_t
+Lambda_hat <- Zmat[, 1:r, drop = FALSE]
+
+X_common <- F_smooth %*% t(Lambda_hat)   # T x N
+colnames(X_common) <- var_names_filtered
+
+X_idio <- Y_kfas - X_common
+colnames(X_idio) <- var_names_filtered
+```
+
+## Static PCA vs VAR Dynamics and Kalman Smoothing
+
+The static PCA factors are obtained period by period. Because they focus solely on cross-sectional correlations at a single point in time, without imposing any intertemporal structure. As a result, they tend to exhibit noisy high-frequency fluctuations as shown in the figure below. These fluctuations often reflect measurement noise or temporary shocks rather than true economic trends.
+
+In contrast, the dynamic factors are estimated under VAR(2) process within a state-space framework. While they remain anchored to the same cross-sectional information through the estimated loadings, their time paths are refined by the Kalman smoother to ensure temporal consistency. This implies that deviations from the underlying dynamic structure are systematically penalized unless they are supported by persistent evidence in the data. As a result, the factors are no longer interpreted as isolated period-specific sentiment, but as realizations of a continuously evolving latent economic state.
+
+
+```{r, fig.width=10, fig.height=9.5, echo = FALSE}
+# plot: Static PCA vs Dynamic (AR-smoothed via KF/RTS)
+
+factor_titles <- c(
+  "Factor 1: Capital Goods Manufacturing Cycle",
+  "Factor 2: Supply-side Conditions & Productivity Cycle",
+  "Factor 3: Consumer Demand & Price Dynamics",
+  "Factor 4: Global Industrial Demand",
+  "Factor 5: Specialized Manufacturing"
+)
+stopifnot(length(factor_titles) == r)
+
+
+event_years  <- c(2008, 2011, 2020)
+event_dates  <- as.Date(paste0(event_years, "-01-01"))
+event_labels <- as.character(event_years)
+
+# Keep only those inside sample
+keep_evt <- event_dates >= min(dates) & event_dates <= max(dates)
+event_dates  <- event_dates[keep_evt]
+event_labels <- event_labels[keep_evt]
+
+# High contrast
+col_static  <- adjustcolor("gray20", alpha.f = 0.45)     # Static PCA
+col_dynamic <- adjustcolor("dodgerblue3", alpha.f = 0.9) # Dynamic AR-smoothed
+lwd_static  <- 1.8
+lwd_dynamic <- 1.2
+lty_static  <- 1            # solid
+lty_dynamic <- 1            # dashed
+evt_col     <- "red3"
+evt_lty     <- 2            # dashed
+evt_lwd     <- 1.2
+
+# Layout
+op <- par(no.readonly = TRUE)
+on.exit(par(op), add = TRUE)
+
+par(mfrow = c(r, 1),
+    mar  = c(3.2, 4.2, 2.4, 1.2),
+    oma  = c(3.0, 0.0, 3.0, 0.0))
+
+for (j in 1:r) {
+  y_rng <- range(F_hat[, j], F_smooth[, j], na.rm = TRUE)
+  pad   <- 0.10 * diff(y_rng)
+  if (!is.finite(pad) || pad == 0) pad <- 1
+  y_lim <- c(y_rng[1] - pad, y_rng[2] + pad)
+
+  plot(dates, F_hat[, j],
+       type = "l",
+       col  = col_static, lwd = lwd_static, lty = lty_static,
+       ylim = y_lim,
+       xlab = "", ylab = paste0("F", j),
+       main = factor_titles[j])
+
+  # Dynamic AR-smoothed
+  lines(dates, F_smooth[, j],
+        col = col_dynamic, lwd = lwd_dynamic, lty = lty_dynamic)
+
+  abline(h = 0, col = "gray60", lty = 3)
+
+  if (length(event_dates) > 0) {
+    abline(v = event_dates, col = evt_col, lty = evt_lty, lwd = evt_lwd)
+  }
+
+  # label event years only on the first panel
+  if (j == 1 && length(event_dates) > 0) {
+    usr <- par("usr")   # x1 x2 y1 y2
+    y_top <- usr[4]
+    for (k in seq_along(event_dates)) {
+      text(event_dates[k],
+           y_top - 0.05 * diff(usr[3:4]),
+           labels = event_labels[k],
+           col = evt_col, cex = 0.85, pos = 4, xpd = NA)
+    }
+  }
+}
+
+# Outer title
+mtext("Static PCA vs Dynamic DFM Factors", outer = TRUE, font = 2, cex = 1.2, line = 1.0)
+mtext(
+  "",
+  outer = TRUE, cex = 0.95, line = -0.2
+)
+
+
+# Legend (bottom outer margin) 
+par(fig = c(0, 1, 0, 1), new = TRUE)
+plot.new()
+legend("bottom",
+       inset = 0.02,
+       legend = c("Static (PCA)", "Dynamic (AR-smoothed)"),
+       col    = c(col_static, col_dynamic),
+       lty    = c(lty_static, lty_dynamic),
+       lwd    = c(lwd_static, lwd_dynamic),
+       bty    = "n", horiz = TRUE, cex = 0.95)
+
+```
+
+\vspace{-2em}
+
+The alignment between the static and dynamic estimates confirms that the cross-sectional factor structure extracted in the static step is well identified. The main medium-term movements are largely preserved when time-series dynamics are imposed, indicating that the static PCA already captures the dominant common variation in the data.
+
+The difference between static and dynamic estimates is reflected in factors with differing signal-to-noise properties. For Factor 1 (Capital Goods Manufacturing Cycle), the static and dynamic estimates are very close, reflecting a strong and persistent cross-sectional signal that leaves little scope for dynamic adjustment. 
+
+However, the distinction becomes clearer in Factors 3 and 4. These factors are more sensitive to short-lived survey movements or sector-specific noise, which the static PCA mistakenly absorbs. By reallocating weight away from these isolated deviations, the dynamic model reveals the true underlying cycles with fewer transitory reversals.
+
+
+
+**Next steps**:
+
+- Introduce time-varying factor loadings or regime-dependent dynamics
+- Analyze impulse responses of the dynamic factors
+- Extend the analysis to deeper industry hierarchy
+
