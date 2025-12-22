@@ -22,7 +22,7 @@ knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
                       fig.width = 10, fig.height = 6)
 ```
 
-After reviewing the Handbook of ifo Surveys, we maintain the use of non-differenced data in our Dynamic Factor Model. The ifo survey indicators are constructed as balance statistics bounded between −100 and +100, which inherently rules out a genuine random walk process.
+After reviewing the Handbook of ifo Surveys, we maintain the use of non-differenced data in our Dynamic Factor Model. The ifo survey indicators are constructed as balance statistics bounded between −100 and +100, which mathematically precluded from following a true random walk process.
 
 The previous stationarity analysis shows that in the full sample, more than 70% of variables reject the unit root hypothesis in levels, and visual inspection suggests persistent cyclical movements rather than deterministic trends. The remaining non-rejections are likely driven by high persistence and the limited power of unit root tests in finite samples. 
 
@@ -351,8 +351,8 @@ factor_texts <- list(
   
   # Factor 4
   "**Factor 4: Global Industrial Demand**\n\n
-  - Factor 4 binds Basic Metals (upstream, raw material) with Wearing Apparel (downstream, consumer), both sectors are highly sensitive to global trade flows and inventory cycles. So this factor rises when export-oriented industries (especially basic metals and textiles) show strength in current orders and future export expectations, signaling robust global demand for industrial inputs and consumer goods. Conversely, it simultaneously associates with weakness in domestically-focused sectors like food and wood products. \n
-  - Therefore, Factor 4 captures the structural divergence between international and domestic demand cycles: its upward movement reflects a phase where global industrial activity outpaces domestic consumption, while its decline indicates a collapse in external demand that often coincides with (or slightly precedes) a downturn in broader economic sentiment.",
+  - Factor 4 binds Basic Metals (upstream, raw material) with Wearing Apparel (downstream, consumer), both sectors are highly sensitive to global trade flows and inventory cycles. So this factor rises when export-oriented industries (especially basic metals and textiles) show strength in current orders and future export expectations, signaling strong global demand for industrial inputs and consumer goods. Conversely, it simultaneously associates with weakness in domestically-focused sectors like food and wood products. \n
+  - Therefore, Factor 4 captures the structural divergence between international and domestic demand cycles: its upward movement reflects a phase where global industrial activity outpaces domestic consumption, while its decline indicates a collapse in external demand that often coincides with a downturn in broader economic sentiment.",
   
   # Factor 5
   "**Factor 5: Specialized Manufacturing**\n\n

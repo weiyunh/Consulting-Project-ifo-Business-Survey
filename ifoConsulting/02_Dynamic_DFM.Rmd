@@ -18,7 +18,7 @@ output:
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
                       fig.width = 10, fig.height = 6)
 ```
 
@@ -274,7 +274,7 @@ roots <- roots(var_fit)
 max(Mod(roots))
 
 ```
-The VAR dynamics are stable, with the largest root less than one, indicating highly persistent but stationary factor processes,
+The VAR dynamics are stable, with the largest root less than one, indicating highly persistent but stationary factor processes.
 
 
 ```{r, include=FALSE}
@@ -324,7 +324,9 @@ summary(psi_diag) %>% print()
 
 ```
 
-The median idiosyncratic variance is 0.28, indicating that the five common factors explain approximately 72% of the variance in a typical survey variable, which confirms a high signal-to-noise ratio across the manufacturing sector. The wide range of variances (from 0.05 to 0.94) demonstrates significant heterogeneity, where some industries are almost entirely driven by the common business cycle while others remain dominated by variable-specific noise.
+The estimated idiosyncratic variances summarize the extent to which individual survey variables are not explained by the common factor structure extracted via PCA. 
+
+The wide range of idiosyncratic variances (from 0.05 to 0.94) demonstrates significant heterogeneity, where some industries are almost entirely driven by the common business cycle while others remain dominated by variable-specific noise.
 
 ## Kalman smoother: build state-space model and smooth factors
 
@@ -372,21 +374,10 @@ Where:
 
 
 $$
-\alpha_{t+1}= \begin{pmatrix} F_{t+1} \\
-F_t \end{pmatrix} =
-\begin{pmatrix}
-\hat A_1 & \hat A_2 \\
-I_5      & \mathbf{0}_{5\times 5}
-\end{pmatrix}
-\begin{pmatrix}
-F_t \\
-F_{t-1}
-\end{pmatrix}
-+
-\begin{pmatrix}
-I_5 \\
-\mathbf{0}_{5\times 5}
-\end{pmatrix}
+\alpha_{t+1}= \begin{pmatrix} F_{t+1} \\ F_t \end{pmatrix} = 
+\begin{pmatrix} \hat A_1 & \hat A_2 \\ I_5      & \mathbf{0}_{5\times 5} \end{pmatrix}
+\begin{pmatrix} F_t \\ F_{t-1} \end{pmatrix} +
+  \begin{pmatrix} I_5 \\ \mathbf{0}_{5\times 5} \end{pmatrix}
 \eta_{t+1}
 $$
 This representation makes explicit the link between the companion-form state vector and the original VAR(2) factor dynamics.
@@ -668,7 +659,6 @@ mtext(
 )
 
 
-# Legend (bottom outer margin) 
 par(fig = c(0, 1, 0, 1), new = TRUE)
 plot.new()
 legend("bottom",
