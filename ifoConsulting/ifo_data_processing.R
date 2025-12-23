@@ -109,6 +109,38 @@ get_level <- function(code) {
   return(max(1L, len - 1L))
 }
 
+# English Name mapping functions for level1
+get_industry_name_en <- function(code) {
+  industry_names <- c(
+    "C0000000" = "Manufacturing Total",
+    "C1000000" = "Food Products",
+    "C1100000" = "Beverages",
+    "C1300000" = "Textiles",
+    "C1400000" = "Wearing Apparel",
+    "C1500000" = "Leather Products",
+    "C1600000" = "Wood Products",
+    "C1700000" = "Paper Products",
+    "C1800000" = "Printing",
+    "C1900000" = "Coke and petroleum refining",
+    "C2000000" = "Chemicals",
+    "C2100000" = "Pharmaceuticals",
+    "C2200000" = "Rubber and Plastics",
+    "C2300000" = "Glass, ceramics, and stone processing",
+    "C2400000" = "Basic Metals",
+    "C2500000" = "Fabricated Metal Products",
+    "C2600000" = "Computer and Electronics",
+    "C2700000" = "Electrical Equipment",
+    "C2800000" = "Machinery",
+    "C2900000" = "Motor Vehicles",
+    "C3000000" = "Other Transport Equipment",
+    "C3100000" = "Furniture",
+    "C3200000" = "Other Manufacturing"
+  )
+  name <- industry_names[code]
+  if (is.na(name)) return(code)
+  return(as.character(name))
+}
+
 get_industry_name <- function(code) {
   industry_names <- c(
     "C0000000" = "Verarbeitendes Gewerbe",
@@ -288,27 +320,50 @@ get_industry_name <- function(code) {
 
 get_question_name <- function(code) {
   question_names <- c(
-    "KLD" = "Geschäftsklima",
-    "GUS" = "Geschäftslage",
-    "GES" = "Geschäftserwartungen",
-    "LUS" = "Kapazitätsauslastung",
-    "BUS" = "Bestellungsbestand",
-    "XUS" = "Auslandsauftragsbestand",
-    "AVS" = "Auftragseingang",
-    "BVS" = "Nachfrage gegen Vormonat",
-    "QVS" = "Inlandsnachfrage gegen Vormonat",
-    "PVS" = "Verkaufspreise",
-    "QES" = "Inlandsnachfrage Erwartung",
-    "PWS" = "Verkaufspreise Erwartung",
-    "XES" = "Exporterwartungen",
-    "BES" = "Beschäftigungserwartung",
-    "PRS" = "Produktionserwartung"
+    "KLD" = "Business Climate",
+    "GUS" = "Current Situation Assessment",
+    "GES" = "Business Expectations",
+    "LUS" = "Finished Goods Inventory",
+    "BUS" = "Order Book Assessment",
+    "XUS" = "Export Order Assessment",
+    "AVS" = "Demand vs Previous Month",
+    "BVS" = "Order Book vs Previous Month",
+    "QVS" = "Production vs Previous Month",
+    "PVS" = "Prices vs Previous Month",
+    "QES" = "Production Plans/Expectations",
+    "PWS" = "Price Expectations",
+    "XES" = "Export Expectations",
+    "BES" = "Employment Expectations",
+    "PRS" = "Productivity Expectations"
   )
-  
   name <- question_names[code]
   if (is.na(name)) return(code)
   return(as.character(name))
 }
+
+get_question_name_en <- function(code) {
+  question_names <- c(
+    "KLD" = "Business Climate",
+    "GUS" = "Current Situation Assessment",
+    "GES" = "Business Expectations",
+    "LUS" = "Finished Goods Inventory",
+    "BUS" = "Order Book Assessment",
+    "XUS" = "Export Order Assessment",
+    "AVS" = "Demand vs Previous Month",
+    "BVS" = "Order Book vs Previous Month",
+    "QVS" = "Production vs Previous Month",
+    "PVS" = "Prices vs Previous Month",
+    "QES" = "Production Plans",
+    "PWS" = "Price Expectations",
+    "XES" = "Export Expectations",
+    "BES" = "Employment Expectations",
+    "PRS" = "Productivity Expectations"
+  )
+  name <- question_names[code]
+  if (is.na(name)) return(code)
+  return(as.character(name))
+}
+
 
 get_question_type <- function(code) {
   question_types <- c(
@@ -323,6 +378,34 @@ get_question_type <- function(code) {
   type <- question_types[code]
   if (is.na(type)) return("Other")
   return(as.character(type))
+}
+
+get_question_group <- function(code) {
+  question_groups <- c(
+    # Group A: Current business situation (contemporaneous)
+    "GUS" = "A: Current",
+    "LUS" = "A: Current",
+    "BUS" = "A: Current",
+    "XUS" = "A: Current",
+    # Group B: Business expectations (forward-looking)
+    "GES" = "B: Expectations",
+    "QES" = "B: Expectations",
+    "XES" = "B: Expectations",
+    "BES" = "B: Expectations",
+    "PRS" = "B: Expectations",
+    # Group C: Price-related (inflation signals)
+    "PVS" = "C: Prices",
+    "PWS" = "C: Prices",
+    # Group D: Month-over-month changes (short-term dynamics)
+    "AVS" = "D: MoM Changes",
+    "BVS" = "D: MoM Changes",
+    "QVS" = "D: MoM Changes",
+    # Composite
+    "KLD" = "Composite"
+  )
+  group <- question_groups[code]
+  if (is.na(group)) return("Other")
+  return(as.character(group))
 }
 
 # ===============================================================================
