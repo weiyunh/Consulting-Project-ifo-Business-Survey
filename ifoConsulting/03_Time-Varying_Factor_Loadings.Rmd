@@ -1,0 +1,251 @@
+---
+title: "03 Time-Varying Factor Loadings"
+author: "Weiyun Hong"
+date: "2025-12-28"
+header-includes:
+  - \usepackage{parskip}
+  - \setlength{\parskip}{0.5em}
+output:
+  pdf_document:
+    toc: false
+    latex_engine: xelatex
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: cosmo
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 6)
+```
+
+
+## Time-Varying Factor Loadings (Two-step TVP Regression)
+
+While the dynamic factor model allows the latent factors to evolve over time, it assumes that the mapping between the observed variables and the latent factors is stable. However, the relevance of individual questions for the underlying business cycle may evolve gradually over time due to structural change, institutional reforms, or shifts in economic expectations.
+
+To allow for **gradual structural change** in the measurement relationship, we extend the measurement equation by letting factor loadings vary over time. We impose a parsimonious restriction that all survey variables within the same Level-1 industry group share the same (possibly time-varying) factor loading vector.
+
+Let \(g(i)\in\{1,\dots,G\}\) denote the Level-1 group membership (here: `industry_code`) of variable \(i\).
+The measurement equation becomes
+
+\[
+X_{i,t} = \lambda_{g(i),t}^\top F_t + \xi_{i,t},
+\qquad \xi_{i,t}\sim \mathcal N(0, H_i),
+\]
+
+where \(F_t\in\mathbb R^r\) is the dynamic factor (smoothed estimate from Section 02), and \(\lambda_{g,t}\in\mathbb R^r\) is the **group-level loading** shared by all variables in group \(g\).
+
+We model gradual structural change via a random-walk evolution:
+
+\[
+\lambda_{g,t} = \lambda_{g,t-1} + u_{g,t},
+\qquad u_{g,t}\sim \mathcal N(0, q_g I_r).
+\]
+
+Stacking the \(n_g\) observed series in group \(g\) yields a multivariate observation equation:
+
+\[
+X_{g,t} = \mathbf 1_{n_g}\lambda_{g,t}^\top F_t + \xi_{g,t},
+\quad \xi_{g,t}\sim \mathcal N(0, H_g),
+\]
+
+where \(H_g=\mathrm{diag}(H_i: i\in g)\).
+
+```{r}
+# --- Preconditions: objects created in 02_Dynamic_DFM.Rmd ---
+stopifnot(
+  exists("Y_kfas"), exists("F_smooth"), exists("Hdiag"),
+  exists("var_names_filtered"), exists("var_metadata_filtered"),
+  exists("dates"), exists("r")
+)
+
+library(KFAS)
+library(tidyverse)
+
+# Factors used as observed regressors (from Section 02)
+F_use <- as.matrix(F_smooth)  # T x r
+T_obs <- nrow(F_use)
+N_obs <- ncol(Y_kfas)
+
+stopifnot(ncol(F_use) == r, nrow(Y_kfas) == T_obs, length(Hdiag) == N_obs)
+```
+
+
+
+
+```{r}
+# --- Define groups at Level 1 ---
+
+# In 02 already kept only Level 1: keep_vars <- var_metadata$level == 1
+
+# So we group by industry_code (Level-1 sector code)
+
+stopifnot("industry_code" %in% colnames(var_metadata_filtered))
+stopifnot("level" %in% colnames(var_metadata_filtered))
+
+group_id <- as.character(var_metadata_filtered$industry_code)
+groups <- sort(unique(group_id))
+G <- length(groups)
+
+cat("Number of Level-1 groups (industry_code):", G, "\n")
+
+```
+
+```{r}
+# --- Helper: fit ONE group-level TV loading path ---
+
+# For group g with indices idx (n_g variables):
+
+# y_t (n_g x 1) = Z_t (n_g x r) * beta_t (r x 1) + eps_t
+
+# Z_t = 1_{n_g} %*% t(F_t)  -> each row is F_t'
+
+# beta_t = beta_{t-1} + u_t,  u_t ~ N(0, q * I_r)
+
+#
+
+# We estimate scalar q_g via MLE (fitSSM), keep H_g fixed as diag(Hdiag[idx]).
+
+fit_tvp_group <- function(Y_group, Fmat, H_vec, q_init = 1e-4) {
+
+# Y_group: T x n_g (NA allowed)
+
+# Fmat:    T x r
+
+# H_vec:   n_g vector (fixed obs variances)
+
+T_obs <- nrow(Fmat)
+r <- ncol(Fmat)
+n_g <- ncol(Y_group)
+
+# Build time-varying Z: array dim (n_g, r, T)
+
+Z_arr <- array(NA_real_, dim = c(n_g, r, T_obs))
+for (t in 1:T_obs) {
+Z_arr[,,t] <- matrix(rep(Fmat[t, ], each = n_g), nrow = n_g, byrow = FALSE)
+# each row = F_t'
+}
+
+# Custom state-space:
+
+# alpha_t = beta_t (dimension r)
+
+# y_t = Z_t alpha_t + eps_t
+
+# alpha_{t+1} = alpha_t + eta_t  (RW)
+
+model0 <- SSModel(
+Y_group ~ -1 +
+SSMcustom(
+Z = Z_arr,
+T = diag(r),
+R = diag(r),
+Q = diag(NA_real_, r),   # q * I_r to be set in updatefn
+a1 = rep(0, r),
+P1 = diag(10, r)
+),
+H = diag(H_vec, n_g)        # fixed diagonal obs noise per series
+)
+
+updatefn <- function(pars, model) {
+q <- exp(pars[1])           # enforce positivity
+model$Q[,,1] <- diag(q, r)  # q * I_r
+model
+}
+
+fit <- fitSSM(model0, inits = log(q_init), updatefn = updatefn, method = "BFGS")
+model <- fit$model
+q_hat <- exp(fit$optim.out$par[1])
+
+kfs <- KFS(model, smoothing = c("state"))
+beta_t <- kfs$alphahat        # T x r
+
+colnames(beta_t) <- paste0("lambda_", 1:r)
+list(beta_t = beta_t, q_hat = q_hat)
+}
+
+```
+
+
+```{r}
+# --- Estimate group-level TV loadings for all groups ---
+
+Lambda_g_tv <- vector("list", G)
+q_hat_g <- rep(NA_real_, G)
+names(Lambda_g_tv) <- groups
+names(q_hat_g) <- groups
+
+for (gg in seq_along(groups)) {
+g <- groups[gg]
+idx <- which(group_id == g)
+n_g <- length(idx)
+
+Y_group <- as.matrix(Y_kfas[, idx, drop = FALSE])   # T x n_g
+H_vec <- Hdiag[idx]
+
+res <- fit_tvp_group(Y_group = Y_group, Fmat = F_use, H_vec = H_vec, q_init = 1e-4)
+
+Lambda_g_tv[[g]] <- res$beta_t   # T x r
+q_hat_g[g] <- res$q_hat
+
+if (gg %% 10 == 0) cat("Done group", gg, "/", G, "\n")
+}
+
+summary(q_hat_g)
+
+```
+
+
+
+```{r}
+# --- Expand to variable-level loadings (each variable inherits its group's path) ---
+
+Lambda_tv_list <- vector("list", N_obs)
+names(Lambda_tv_list) <- var_names_filtered
+
+for (i in 1:N_obs) {
+g <- group_id[i]
+Lambda_tv_list[[i]] <- Lambda_g_tv[[g]]  # T x r, shared within group
+}
+
+```
+
+
+```{r}
+# --- Plot: one group's loading paths (pick a group with many vars, or specify) ---
+
+plot_group_loadings <- function(g) {
+beta_t <- Lambda_g_tv[[g]]
+df <- data.frame(date = dates, beta_t)
+df_long <- tidyr::pivot_longer(df, cols = starts_with("lambda_"),
+names_to = "factor", values_to = "loading")
+
+ggplot(df_long, aes(x = date, y = loading, group = factor)) +
+geom_line() +
+facet_wrap(~ factor, ncol = 1, scales = "free_y") +
+labs(title = paste("Group-level time-varying loadings (industry_code):", g),
+x = NULL, y = "Loading") +
+theme_minimal()
+}
+
+# choose a group example (largest group)
+
+group_sizes <- table(group_id)
+g_example <- names(which.max(group_sizes))
+print(plot_group_loadings(g_example))
+
+```
+
+
+
+
+
+
+
+
+
+

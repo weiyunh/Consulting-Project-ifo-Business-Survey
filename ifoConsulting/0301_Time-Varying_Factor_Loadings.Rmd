@@ -1,0 +1,719 @@
+---
+title: "03.1 Time-Varying Factor Loadings"
+author: "Weiyun Hong"
+date: "2025-12-28"
+header-includes:
+  - \usepackage{parskip}
+  - \setlength{\parskip}{0.5em}
+output:
+  pdf_document:
+    toc: false
+    latex_engine: xelatex
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: cosmo
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 6)
+```
+
+```{r}
+dfm02 <- readRDS("output/dfm_results_02.rds")
+source("ifo_data_processing.R")
+
+Y_kfas <- dfm02$Y_kfas
+F_smooth <- dfm02$F_smooth
+Hdiag <- dfm02$Hdiag
+r <- dfm02$r
+dates <- dfm02$dates
+var_names_filtered <- dfm02$var_names_filtered
+var_metadata_filtered <- dfm02$var_metadata_filtered
+
+```
+
+
+While the dynamic factor model allows the latent factors to evolve over time, it assumes that the mapping between the observed variables and the latent factors is stable. However, the relevance of individual questions for the underlying business cycle may evolve gradually over time due to structural change, institutional reforms, or shifts in economic expectations.
+
+To allow for **gradual structural change** in the measurement relationship, we extend the measurement equation by letting factor loadings vary over time. We impose a parsimonious restriction that all survey variables within the same Level-1 industry group share the same (possibly time-varying) factor loading vector.
+
+Let \(g(i)\in\{1,\dots,G\}\) denote the Level-1 group membership (here: `industry_code`) of variable \(i\).
+The measurement equation becomes
+
+\[
+X_{i,t} = \lambda_{g(i),t}^\top F_t + \xi_{i,t},
+\qquad \xi_{i,t}\sim \mathcal N(0, H_i),
+\]
+
+where \(F_t\in\mathbb R^r\) is the dynamic factor (smoothed estimate from Section 02), and \(\lambda_{g,t}\in\mathbb R^r\) is the **group-level loading** shared by all variables in group \(g\).
+
+We model gradual structural change via a random-walk evolution:
+
+\[
+\lambda_{g,t} = \lambda_{g,t-1} + u_{g,t},
+\qquad u_{g,t}\sim \mathcal N(0, q_g I_r).
+\]
+
+Stacking the \(n_g\) observed series in group \(g\) yields a multivariate observation equation:
+
+\[
+X_{g,t} = \mathbf 1_{n_g}\lambda_{g,t}^\top F_t + \xi_{g,t},
+\quad \xi_{g,t}\sim \mathcal N(0, H_g),
+\]
+
+where \(H_g=\mathrm{diag}(H_i: i\in g)\).
+
+```{r}
+library(KFAS)
+library(tidyverse)
+
+X_kfas <- Y_kfas
+F_use <- as.matrix(F_smooth) # T x r
+T_obs <- nrow(F_use)
+N_obs <- ncol(X_kfas)
+stopifnot(ncol(F_use) == r, nrow(X_kfas) == T_obs, length(Hdiag) == N_obs)
+```
+
+
+
+```{r, include=FALSE}
+# In 02 already kept only Level 1: keep_vars <- var_metadata$level == 1
+
+stopifnot("industry_code" %in% colnames(var_metadata_filtered))
+stopifnot("level" %in% colnames(var_metadata_filtered))
+
+group_id <- as.character(var_metadata_filtered$industry_code)
+groups <- sort(unique(group_id))
+G <- length(groups)
+
+cat("Number of Level-1 groups (industry_code):", G, "\n")
+
+# Group sizes
+group_sizes <- as.integer(table(group_id)[groups])
+group_table <- data.frame(industry_code = groups, n_g = group_sizes) |>
+arrange(desc(n_g))
+head(group_table, 10)
+```
+
+```{r}
+# Time-Varying Parameter (TVP) Factor Loading Estimation using KFAS
+## Model Specification:
+##   Measurement: X_{g,t} = Z_{g,t} * lambda_{g,t} + xi_{g,t}
+##   State:       lambda_{g,t} = lambda_{g,t-1} + eta_{g,t}
+##   Innovation:  eta_{g,t} ~ N(0, Q), where Q = q_g * I_r
+
+fit_tvp_group <- function(X_group, Fmat, H_vec, q_init = 1e-4) {
+  
+  T_obs <- nrow(Fmat) 
+  r     <- ncol(Fmat)     
+  n_g   <- ncol(X_group)   
+  
+  
+  #  Build time-varying measurement matrix Z_{g,t}
+  ## For each time t, the measurement equation is:
+  ##   X_{i,t} = F_{1,t} * lambda_{i,1,t} + ... + F_{r,t} * lambda_{i,r,t} + xi_{i,t}
+  ##
+  ## In matrix form for the entire group:
+  ##   X_{g,t} = Z_{g,t} * lambda_{g,t} + xi_{g,t}
+  ##
+  ## where Z_{g,t} is an (n_g x r) matrix with structure:
+  ##   Z_{g,t} = 1_{n_g} ⊗ F_t'  (each row is F_t')
+  ##
+  ##   Z_arr: (n_g, r, T) array
+  
+  Z_arr <- array(NA_real_, dim = c(n_g, r, T_obs))
+  
+  for (t in 1:T_obs) {
+    Z_arr[, , t] <- matrix(
+      rep(Fmat[t, ], each = n_g),  ## For each time t, create an (n_g x r) matrix
+      nrow  = n_g,                 ## where each row is F_t' (the factor values at time t)
+      byrow = FALSE
+    )
+  }
+  
+  # Specify State-Space Model using SSMcustom
+  ## State-Space representation:
+  ## MEASUREMENT EQUATION: y_t = Z_t * alpha_t + epsilon_t,  epsilon_t ~ N(0, H)
+  ## STATE EQUATION: alpha_t = T * alpha_{t-1} + R * eta_t,  eta_t ~ N(0, Q)
+  ##
+  ## In our TVP loading model:
+  ##   - y_t = X_{g,t}        (n_g x 1)
+  ##   - alpha_t = lambda_{g,t}  (r x 1, the time-varying loadings)
+  ##   - Z_t = Z_{g,t}        (n_g x r, time-varying)
+  ##   - T = I_r              (r x r identity, random walk)
+  ##   - R = I_r              (r x r identity, full-rank innovations)
+  ##   - Q = q_g * I_r        (r x r, scalar variance * identity)
+  ##   - H = diag(H_vec)      (n_g x n_g, fixed, diagonal)
+  
+  model0 <- SSModel(
+    X_group ~ -1 +  ## Left-hand side: observed data (no intercept)
+      
+      SSMcustom(
+        Z  = Z_arr,                    ## Time-varying measurement matrix (n_g, r, T)
+        T  = diag(r),                  ## State transition: I_r (random walk)
+        R  = diag(r),                  ## Selection matrix: I_r (full innovations)
+        Q  = diag(NA_real_, r),        ## Innovation variance: q * I_r (to be estimated)
+        a1 = rep(0, r),                ## Initial state mean: 0
+        P1 = diag(10, r)               ## Initial state variance: diffuse prior
+      ),
+    
+    H = diag(H_vec, n_g)               ## Observation error variance: fixed diagonal
+  )
+  
+  
+  # Define update function for Q matrix
+  ## The KFAS package requires us to provide an "update function" that
+  ## takes optimization parameters and updates the model accordingly.
+  ##
+  ## We estimate a SINGLE scalar parameter q_g > 0, and set:
+  ##   Q = q_g * I_r
+  ## To ensure q_g > 0, we optimize log(q_g) and then exponentiate.
+  
+  updatefn <- function(pars, model) {
+    q <- exp(pars[1])            ## Exponentiate to ensure positivity
+    model$Q[, , 1] <- diag(q, r) ## Update Q matrix: q * I_r
+    return(model)
+  }
+  
+  
+  # Optimize the log-likelihood to estimate q_g
+  fit <- fitSSM(
+    model  = model0,
+    inits  = log(q_init),      ## Starting value: log(q_init)
+    updatefn = updatefn,       ## Function to update Q given parameters
+    method = "BFGS"            ## Optimization algorithm
+  )
+  
+  model <- fit$model
+  q_hat <- exp(fit$optim.out$par[1])  ## Estimated innovation variance
+  
+  
+  # Kalman Smoothing - Smoothed states: alpha_{t|T} (uses full-sample information)
+  kfs <- KFS(
+    model = model,
+    smoothing = c("state")  ## Request smoothed state estimates
+  )
+  
+  ## Extract smoothed state estimates: lambda_{g,t|T}
+  lambda_t <- kfs$alphahat  ## T x r matrix
+  colnames(lambda_t) <- paste0("lambda_", 1:r)
+  
+  return(list(
+    lambda_t = lambda_t,  ## Smoothed time-varying loadings (T x r)
+    q_hat    = q_hat      ## Estimated innovation variance (scalar)
+  ))
+  
+}
+```
+
+```{r}
+## Estimation of Time-Varying Loadings for All Industry Groups
+
+## Storage for time-varying loadings
+## Each element will be a T x r matrix for one industry group
+Lambda_g_tv <- vector("list", G)
+names(Lambda_g_tv) <- groups
+
+## Storage for estimated innovation variances
+## One scalar q_g per group
+q_hat_g <- rep(NA_real_, G)
+names(q_hat_g) <- groups
+
+
+for (gg in seq_along(groups)) {
+  
+  g <- groups[gg]                ## Group name (e.g., "C2800000")
+  idx <- which(group_id == g)    ## Column indices for this group in X_kfas
+  n_g <- length(idx)             ## Number of series in this group
+  
+  # Extract observed data for this group: T x n_g matrix
+  X_group <- as.matrix(X_kfas[, idx, drop = FALSE])
+  
+  # Extract fixed observation error variances for this group
+  H_vec <- Hdiag[idx]
+
+  # Estimate time-varying loadings using KFAS
+  res <- fit_tvp_group(
+    X_group = X_group,     ## T x n_g observed data
+    Fmat    = F_use,       ## T x r static factors
+    H_vec   = H_vec,       ## n_g observation error variances
+    q_init  = 1e-4         ## Initial value for innovation variance
+  )
+
+  Lambda_g_tv[[g]] <- res$lambda_t
+  q_hat_g[g] <- res$q_hat
+}  
+
+```
+
+
+```{r}
+## Expand Group-Level TV Loadings to Variable Level - maps group-level loading 
+## paths to individual variables. Each variable inherits the loading path of its parent group.
+##
+##   - Input:  Lambda_g_tv (list of G elements, each T x r)
+##   - Output: Lambda_tv_list (list of N elements, each T x r)
+##
+## Mapping:  lambda_{i,t} = lambda_{g(i),t}
+##           where g(i) is the group that variable i belongs to
+
+N_obs <- length(var_names_filtered)
+
+Lambda_tv_list <- vector("list", N_obs)
+names(Lambda_tv_list) <- var_names_filtered
+
+# Map group-level loadings to individual variables
+for (i in 1:N_obs) {
+  g <- group_id[i]
+  Lambda_tv_list[[i]] <- Lambda_g_tv[[g]]  # T x r 
+}
+```
+
+
+```{r, include=FALSE}
+# Instability Measures for Each Group
+instability_by_group <- lapply(groups, function(g) {
+  
+  L <- Lambda_g_tv[[g]]  # T x r
+  
+  dL <- apply(L, 2, diff)
+  
+  data.frame(
+    industry_code       = g,
+    n_g                 = sum(group_id == g),
+    q_hat               = q_hat_g[g],
+    mean_abs_dlambda    = mean(abs(dL), na.rm = TRUE),
+    sd_dlambda          = sd(as.numeric(dL), na.rm = TRUE)
+  )
+  
+}) |>
+  bind_rows() |>
+  arrange(desc(mean_abs_dlambda))
+
+head(instability_by_group, 15)
+```
+
+
+```{r}
+plot_factor_all_industries <- function(
+  Lambda_g_tv,
+  dates,
+  factor_j = 1,
+  industries = NULL,
+  event_years = c(2008, 2011, 2020),
+  title_prefix = "Industry-only time-varying loadings",
+  show_legend = TRUE,
+  fade_highvol = TRUE,  
+  top_k = 5
+) {
+  gs <- names(Lambda_g_tv)
+  if (!is.null(industries)) gs <- intersect(gs, industries)
+  stopifnot(length(gs) > 0)
+
+  # compute volatility per industry (for this factor)
+  vol_df <- data.frame(
+    industry_code = gs,
+    vol = sapply(gs, function(g) {
+      L <- Lambda_g_tv[[g]][, factor_j]
+      stats::sd(diff(L), na.rm = TRUE)
+    }),
+    stringsAsFactors = FALSE
+  )
+
+  highvol_industries <- vol_df |>
+    dplyr::arrange(dplyr::desc(vol)) |>
+    dplyr::slice_head(n = top_k) |>
+    dplyr::pull(industry_code)
+
+  # build long data
+  df_long <- do.call(rbind, lapply(gs, function(g) {
+    L <- Lambda_g_tv[[g]]  # T x r
+    stopifnot(nrow(L) == length(dates))
+    data.frame(
+      date = dates,
+      industry_code = g,
+      industry_name = get_industry_name_en(g),
+      loading = as.numeric(L[, factor_j]),
+      is_highvol = g %in% highvol_industries,  
+      stringsAsFactors = FALSE
+    )
+  }))
+
+  # events
+  event_dates  <- as.Date(paste0(event_years, "-01-01"))
+  keep_evt <- event_dates >= min(dates) & event_dates <= max(dates)
+  event_dates  <- event_dates[keep_evt]
+  event_labels <- as.character(event_years[keep_evt])
+
+  # base plot: keep global color mapping so ALL are colored
+  p <- ggplot2::ggplot(df_long, ggplot2::aes(x = date, y = loading, color = industry_name)) +
+    ggplot2::geom_hline(yintercept = 0, linetype = 3, color = "gray60") +
+    ggplot2::scale_color_viridis_d(option = "turbo") +
+    ggplot2::labs(
+      title = paste0(title_prefix, " — Factor ", factor_j),
+      subtitle = if (fade_highvol)
+        paste0("High-volatility industries (top ", top_k, ") are faded")
+      else
+        "Each line corresponds to one Level-1 industry",
+      x = NULL,
+      y = paste0("Loading (lambda_", factor_j, ")"),
+      color = "Industry"
+    ) +
+    ggplot2::theme_minimal(base_size = 12) +
+    ggplot2::theme(
+      plot.title.position = "plot",
+      legend.position = if (show_legend) "bottom" else "none",
+      legend.key.height = grid::unit(0.45, "lines"),
+      legend.text = ggplot2::element_text(size = 9),
+      plot.margin = grid::unit(c(6, 6, 6, 6), "pt")
+    )
+
+  # draw lines in two layers to control emphasis
+  if (fade_highvol) {
+    # 1) draw HIGH-vol first (faded, but still colored)
+    p <- p + ggplot2::geom_line(
+      data = df_long[df_long$is_highvol, ],
+      linewidth = 0.7,
+      alpha = 0.25
+    )
+    # 2) draw LOW-vol on top (more visible)
+    p <- p + ggplot2::geom_line(
+      data = df_long[!df_long$is_highvol, ],
+      linewidth = 1.0,
+      alpha = 0.95
+    )
+  } else {
+    # no fading: all same style
+    p <- p + ggplot2::geom_line(linewidth = 0.9, alpha = 0.85)
+  }
+
+  if (show_legend) {
+    p <- p + ggplot2::guides(color = ggplot2::guide_legend(ncol = 3))
+  }
+
+  if (length(event_dates) > 0) {
+    evt_df <- data.frame(date = event_dates, label = event_labels)
+    p <- p +
+      ggplot2::geom_vline(xintercept = event_dates, linetype = 2, color = "red3", linewidth = 0.8) +
+      ggplot2::geom_text(
+        data = evt_df,
+        ggplot2::aes(x = date, y = Inf, label = label),
+        inherit.aes = FALSE,
+        vjust = 1.2, hjust = 0,
+        color = "red3",
+        size = 3
+      ) +
+      ggplot2::coord_cartesian(clip = "off")
+  }
+
+  p
+}
+```
+
+
+```{r fig.width=14, fig.height=6}
+#for (j in 1:r) {
+#  print(plot_factor_all_industries(Lambda_g_tv, dates, factor_j = j, show_legend = (j == 5)))
+#}
+
+for (j in 1:r) {
+  print(plot_factor_all_industries(Lambda_g_tv, dates, factor_j = j, fade_highvol = TRUE, top_k = 5))
+}
+```
+**Factor 1 — Capital goods Manufacturing cycle**
+
+Factor 1 captures the largest share of common variation in the data, reflecting the investment-driven core of German manufacturing activity. It summarizes the synchronized expansion and contraction of key capital goods industries and serves as a broad indicator of underlying macroeconomic conditions in the manufactuaring sector.
+  Core capital-goods industries: Machinery, Electrical Equipment, Fabricated Metal Products, these three industries exhibit persistently positive and relatively high loadings throughout the sample, confirming that Factor 1 remains tightly anchored in investment-related manufacturing.
+  Rubber and Plastics show a marked increase after 2011, likely reflecting their integration into machinery and automotive supply chains. 
+  The relatively higher volatility of Factor-1 loadings reflects the broad and heterogeneous nature of the investment cycle. As this factor aggregates multiple stages of the production chain, shifts in investment composition and crisis-driven disruptions tend to reallocate exposure across industries, resulting in visible cross-sectional and time-series variation in loadings.
+
+**Factor 2 — Supply-side & Productivity Cycle**
+
+Loadings on Factor 2 exhibit noticeably more heterogeneity than Factor 1. Leather Products show a clear increase in loadings after 2011, suggesting rising sensitivity to efficiency and expectation-driven dynamics in the post-crisis period.
+  Printing loads relatively strongly before 2005 and weakens thereafter.
+  Petroleum refining loads strongly on the supply-side factor in the mid-2000s, weakens for a long period after the financial crisis, and re-emerges again after 2023. This pattern suggests that energy-related supply conditions played an important role in shaping aggregate supply-side expectations prior to 2008, but gradually lost relevance after the Global Financial Crisis . 
+
+  
+**Factor 3: Consumer Demand & Price Dynamics**
+
+Factor 3 loadings are relatively more stable. This reflects the smoother and more persistent nature of consumer demand dynamics, which tend to adjust gradually and are less prone to abrupt reallocation across industries than investment-driven cycles. Beverages increase gradually over time, signaling growing integration with household demand cycles. 
+
+
+**Factor 4: Global Industrial Demand**
+
+Basic Metals maintain high loadings over the entire sample, underscoring their sustained exposure to external demand. Wood Products load weakly throughout, suggesting limited sensitivity to global trade cycles. Wearing Apparel shows a gradual increase during 2005–2008, consistent with the pre-crisis expansion in global trade. Coke and Petroleum Refining collapse after 2021, coinciding with energy crisis.
+
+
+**Factor 5: Specialized Manufacturing**
+
+Factor 5 exhibits the greatest dispersion in loadings across industries, demonstrating its highly specialized structure. Motor Vehicles and Beverages load most strongly, while Other Manufacturing and Other Transport Equipment also show relatively pronounced and persistent exposure. 
+  The strong cross-sectional heterogeneity and moderate time variation of Factor-5 loadings indicate that this factor captures a narrow, project-based or sector-specific dimension rather than a broad cyclical force. Consequently, differences across industries dominate over common temporal movements.
+
+
+
+
+
+
+```{r}
+plot_industry_loadings <- function(
+  g,
+  Lambda_g_tv,
+  dates,
+  event_years = c(2008, 2011, 2020),
+  show_event_labels = TRUE
+) {
+  stopifnot(g %in% names(Lambda_g_tv))
+  lambda_t <- Lambda_g_tv[[g]]  # T x r
+  stopifnot(nrow(lambda_t) == length(dates))
+
+  r <- ncol(lambda_t)
+
+  df <- data.frame(date = dates, lambda_t, check.names = FALSE)
+  df_long <- tidyr::pivot_longer(
+    df,
+    cols = starts_with("lambda_"),
+    names_to = "factor",
+    values_to = "loading"
+  )
+
+  # events
+  event_dates  <- as.Date(paste0(event_years, "-01-01"))
+  keep_evt <- event_dates >= min(dates) & event_dates <= max(dates)
+  event_dates  <- event_dates[keep_evt]
+  event_labels <- as.character(event_years[keep_evt])
+
+  ind_name <- get_industry_name_en(g)
+
+  # aesthetics (match your earlier "clean academic" style)
+  line_col <- adjustcolor("dodgerblue3", alpha.f = 0.95)
+  line_lwd <- 0.95
+  evt_col  <- "red3"
+  evt_lty  <- 2
+  evt_lwd  <- 0.8
+
+  p <- ggplot2::ggplot(df_long, ggplot2::aes(x = date, y = loading)) +
+    ggplot2::geom_line(color = line_col, linewidth = line_lwd) +
+    ggplot2::geom_hline(yintercept = 0, linetype = 3, color = "gray60") +
+    ggplot2::facet_wrap(~ factor, ncol = 1, scales = "free_y") +
+    ggplot2::labs(
+      title = paste0("Time-varying loadings (industry-only): ", ind_name),
+      subtitle = paste0("Industry code: ", g),
+      x = NULL,
+      y = "Loading"
+    ) +
+    ggplot2::theme_minimal(base_size = 12) +
+    ggplot2::theme(
+      plot.title.position = "plot",
+      strip.text = ggplot2::element_text(face = "bold"),
+      panel.grid.minor = ggplot2::element_blank(),
+      plot.margin = grid::unit(c(8, 8, 8, 8), "pt")
+    )
+
+  # event lines
+  if (length(event_dates) > 0) {
+    p <- p +
+      ggplot2::geom_vline(
+        xintercept = event_dates,
+        linetype = evt_lty,
+        color = evt_col,
+        linewidth = evt_lwd
+      )
+  }
+
+  if (show_event_labels && length(event_dates) > 0) {
+    first_factor <- sort(unique(df_long$factor))[1]
+
+    evt_df <- data.frame(
+      date = event_dates,
+      label = event_labels,
+      factor = first_factor
+    )
+
+    p <- p +
+      ggplot2::geom_text(
+        data = evt_df,
+        ggplot2::aes(x = date, y = Inf, label = label),
+        inherit.aes = FALSE,
+        vjust = 1.2,
+        hjust = 0,
+        color = evt_col,
+        size = 3
+      ) +
+      ggplot2::coord_cartesian(clip = "off")
+  }
+
+  p
+}
+
+```
+
+
+```{r fig.width=12, fig.height=8, include=FALSE}
+g_example <- names(Lambda_g_tv)[5]
+plot_industry_loadings(g_example, Lambda_g_tv, dates)
+```
+
+
+```{r}
+plot_many_industries_5facets <- function(
+  Lambda_g_tv,
+  dates,
+  industries = NULL,       
+  event_years = c(2008, 2011, 2020),
+  n_per_page = 6            
+) {
+  gs <- names(Lambda_g_tv)
+  if (!is.null(industries)) gs <- intersect(gs, industries)
+  stopifnot(length(gs) > 0)
+
+  event_dates  <- as.Date(paste0(event_years, "-01-01"))
+  keep_evt <- event_dates >= min(dates) & event_dates <= max(dates)
+  event_dates  <- event_dates[keep_evt]
+  event_labels <- as.character(event_years[keep_evt])
+
+  pages <- split(gs, ceiling(seq_along(gs) / n_per_page))
+
+  plot_one_page <- function(gs_page) {
+    df_long <- do.call(rbind, lapply(gs_page, function(g) {
+      L <- Lambda_g_tv[[g]]  # T x r
+      stopifnot(nrow(L) == length(dates))
+      df <- data.frame(date = dates, L, check.names = FALSE)
+      df <- tidyr::pivot_longer(df, cols = starts_with("lambda_"),
+                                names_to = "factor", values_to = "loading")
+      df$industry_code <- g
+      df$industry_name <- get_industry_name_en(g)
+      df
+    }))
+
+    evt_df <- data.frame(
+      date = event_dates,
+      label = event_labels,
+      industry_name = unique(df_long$industry_name)[1],
+      factor = sort(unique(df_long$factor))[1]
+    )
+
+    p <- ggplot2::ggplot(df_long, ggplot2::aes(x = date, y = loading)) +
+      ggplot2::geom_line(color = adjustcolor("dodgerblue3", 0.95), linewidth = 0.6) +
+      ggplot2::geom_hline(yintercept = 0, linetype = 3, color = "gray60", linewidth = 0.3) +
+      ggplot2::facet_grid(industry_name ~ factor, scales = "free_y") +
+      ggplot2::labs(
+        title = "Industry-only time-varying loadings (many industries on one page)",
+        subtitle = "Rows = industries, columns = loadings (lambda_1 ... lambda_r)",
+        x = NULL, y = "Loading"
+      ) +
+      ggplot2::theme_minimal(base_size = 11) +
+      ggplot2::theme(
+        panel.grid.minor = ggplot2::element_blank(),
+        strip.text.x = ggplot2::element_text(face = "bold"),
+        strip.text.y = ggplot2::element_text(face = "bold"),
+        plot.margin = grid::unit(c(8, 8, 8, 8), "pt")
+      )
+
+    if (length(event_dates) > 0) {
+      p <- p +
+        ggplot2::geom_vline(xintercept = event_dates, linetype = 2, color = "red3", linewidth = 0.4) +
+        ggplot2::geom_text(
+          data = evt_df,
+          ggplot2::aes(x = date, y = Inf, label = label),
+          inherit.aes = FALSE,
+          vjust = 1.2, hjust = 0,
+          color = "red3",
+          size = 2.8
+        ) +
+        ggplot2::coord_cartesian(clip = "off")
+    }
+
+    p
+  }
+
+  lapply(pages, plot_one_page)
+}
+
+```
+
+
+```{r fig.width=14, fig.height=10, include=FALSE}
+plots <- plot_many_industries_5facets(Lambda_g_tv, dates, n_per_page = 9)
+print(plots[[1]])  
+```
+
+
+
+
+
+
+### Instability in Factor Exposure
+
+```{r, include=FALSE}
+get_top5_industries_by_factor <- function(Lambda_g_tv, top_k = 5) {
+  gs <- names(Lambda_g_tv)
+  r  <- ncol(Lambda_g_tv[[1]])
+
+  res <- do.call(rbind, lapply(1:r, function(j) {
+
+    vol_df <- data.frame(
+      industry_code = gs,
+      industry_name = sapply(gs, get_industry_name_en),
+      volatility = sapply(gs, function(g) {
+        L <- Lambda_g_tv[[g]][, j]
+        sd(diff(L), na.rm = TRUE)
+      }),
+      stringsAsFactors = FALSE
+    )
+
+    vol_df |>
+      dplyr::arrange(dplyr::desc(volatility)) |>
+      dplyr::slice_head(n = top_k) |>
+      dplyr::mutate(
+        factor = paste0("Factor ", j),
+        rank = dplyr::row_number()
+      ) |>
+      dplyr::select(factor, rank, industry_code, industry_name, volatility)
+
+  }))
+  
+  rownames(res) <- NULL
+  res
+}
+```
+
+\[
+\text{volatility}_{g,j}
+=
+\operatorname{sd}\!\left(\Delta \lambda_{g,j,t}\right),
+\]
+where $\Delta \lambda_{g,j,t}$ denotes the first difference of the time-varying loading for industry $g$ and factor $j$.
+
+This measure captures temporal instability in factor exposure and captures industries whose relationship with a given factor is subject to pronounced structural adjustment.
+
+
+```{r}
+top5_by_factor <- get_top5_industries_by_factor(Lambda_g_tv, top_k = 5)
+
+print(top5_by_factor)
+```
+
+
+Leather Products exhibits the highest instability across multiple factors, it appear subject to erratic external shocks, likely driven by sudden supply chain disruptions and abrupt shifts in consumer preferences. Coke and Petroleum Refining also has consistently high volatility across all factors, aligning with the twin shocks of aggressive climate policy pivots and the Russia-Ukraine conflict-induced energy crisis.
+
+Printing, and Furniture experience slow but persistent shifts rather than abrupt breaks, consistent with a declining role of traditional manufacturing segments.
+
+
+**Summary**
+
+The results show that allowing loadings to vary reveals non-negligible heterogeneity across industries. Importantly, the magnitude and timing of these variations are economically meaningful and align with major business-cycle disruptions. Several industries exhibit relatively stable loading paths throughout the sample, suggesting a persistent and robust association with the underlying common factors. In contrast, some industries display pronounced time variation.
+
+However, the industry-level grouping remains too coarse to attribute the detected instability to specific types of survey information. In particular, indicators capturing current assessments, expectations, prices, and short-term changes may differ substantially in how their informational content evolves over time. 
+
+For next step, we therefore extend the analysis by allowing factor loadings to vary jointly across industries and question blocks, enabling a sharper assessment of which types of survey indicators drive the common factors in different economic regimes.
+
+
+
+
+
+
+

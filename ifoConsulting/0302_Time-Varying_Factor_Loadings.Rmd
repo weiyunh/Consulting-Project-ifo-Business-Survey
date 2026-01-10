@@ -1,0 +1,690 @@
+---
+title: "03.2 Industry × Question Block Time-Varying Factor Loadings"
+author: "Weiyun Hong"
+date: "2025-12-28"
+header-includes:
+  - \usepackage{parskip}
+  - \setlength{\parskip}{0.5em}
+output:
+  pdf_document:
+    toc: false
+    latex_engine: xelatex
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: cosmo
+    code_folding: show
+---
+
+```{r setup, include=T}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 6)
+```
+
+```{r}
+dfm02 <- readRDS("output/dfm_results_02.rds")
+
+Y_kfas <- dfm02$Y_kfas
+F_smooth <- dfm02$F_smooth
+Hdiag <- dfm02$Hdiag
+r <- dfm02$r
+dates <- dfm02$dates
+var_names_filtered <- dfm02$var_names_filtered
+var_metadata_filtered <- dfm02$var_metadata_filtered
+source("ifo_data_processing.R")
+```
+
+### Industry $\times$ Question Block Time-Varying Factor Loadings
+
+While the dynamic factor model introduced in Section~02 allows the latent factors 
+$F_t$ to evolve over time, it assumes a stable measurement relationship between 
+observed survey variables and the factors. In practice, however, the relevance of 
+different survey questions for the underlying business cycle may change gradually 
+due to structural transformation, institutional reforms, or shifts in economic 
+expectations.
+
+To allow for \emph{gradual structural change} in the measurement equation, we extend 
+the model by allowing factor loadings to vary over time. To retain parsimony, we impose 
+a grouping structure based on both industry classification and question block.
+
+Let variable $i$ belong to Level-1 industry group $g(i)\in\{1,\dots,G\}$ and question 
+block $b(i)\in\{A,B,C,D\}$. All variables within the same $(g,b)$ cell share a common, 
+possibly time-varying, loading vector.
+
+**Measurement Equation**
+
+The measurement equation becomes
+\begin{equation}
+X_{i,t}
+=
+\lambda_{g(i),b(i),t}^\top F_t + \xi_{i,t},
+\qquad
+\xi_{i,t} \sim \mathcal{N}(0,H_i),
+\end{equation}
+where $F_t\in\mathbb{R}^r$ denotes the dynamic factor vector obtained from the 
+Kalman smoother in Section~02, and 
+$\lambda_{g,b,t}\in\mathbb{R}^r$ is the loading vector shared by all variables 
+belonging to industry $g$ and question block $b$.
+
+**Time Evolution of Loadings**
+
+We model gradual structural change in the measurement relationship by assuming 
+that the group-level loadings follow a random walk:
+\begin{equation}
+\lambda_{g,b,t}
+=
+\lambda_{g,b,t-1} + \eta_{g,b,t},
+\qquad
+\eta_{g,b,t} \sim \mathcal{N}(0, q_{g,b} I_r),
+\end{equation}
+where $q_{g,b}$ controls the degree of time variation in the loadings for 
+industry--block cell $(g,b)$.
+
+**Stacked Observation Equation**
+
+Stacking the $n_{g,b}$ observed variables belonging to cell $(g,b)$ yields the 
+multivariate observation equation
+\begin{equation}
+X_{g,b,t}
+=
+Z_{g,b,t}\,\lambda_{g,b,t} + \xi_{g,b,t},
+\qquad
+\xi_{g,b,t} \sim \mathcal{N}(0,H_{g,b}),
+\end{equation}
+where the time-varying design matrix is given by
+\begin{equation}
+Z_{g,b,t}
+=
+\mathbf{1}_{n_{g,b}} F_t^\top
+\;\in\;
+\mathbb{R}^{n_{g,b}\times r},
+\end{equation}
+and
+\begin{equation}
+H_{g,b}
+=
+\mathrm{diag}(H_i : i\in(g,b)).
+\end{equation}
+
+```{r}
+library(KFAS)
+library(tidyverse)
+library(dplyr)
+
+X_kfas <- Y_kfas
+F_use <- as.matrix(F_smooth) # T x r
+T_obs <- nrow(F_use)
+N_obs <- ncol(X_kfas)
+stopifnot(ncol(F_use) == r, nrow(X_kfas) == T_obs, length(Hdiag) == N_obs)
+```
+
+
+
+
+```{r}
+extract_qcode <- function(vn) {
+  m <- str_match(vn, "_([A-Za-z]{2,4})$")[,2]
+  toupper(m)
+}
+q_code <- extract_qcode(var_names_filtered)
+
+block_map <- function(q) {
+  if (is.na(q)) return(NA_character_)
+  if (q %in% c("GUS","BUS","XUS","LUS")) return("A") # Current
+  if (q %in% c("GES","QES","XES","BES","PRS")) return("B") # Expectations
+  if (q %in% c("PWS","PVS")) return("C") # Prices
+  if (q %in% c("AVS", "BVS","QVS")) return("D") # MoM changes
+  return(NA_character_)
+}
+q_block <- vapply(q_code, block_map, character(1))
+
+table(q_block, useNA = "ifany")
+```
+
+```{r}
+industry_id <- as.character(var_metadata_filtered$industry_code)
+
+cell_id <- ifelse(is.na(q_block),
+                  paste0(industry_id, "_", "UNK"),
+                  paste0(industry_id, "_", q_block))
+
+cells <- sort(unique(cell_id))
+K <- length(cells)
+cat("Number of (industry × block) cells:", K, "\n")
+
+cell_sizes <- as.integer(table(cell_id)[cells])
+cell_table <- data.frame(cell = cells, n_cell = cell_sizes) |>
+  arrange(desc(n_cell))
+```
+
+```{r}
+fit_tvp_cell <- function(X_cell, Fmat, H_vec, q_init = 1e-4) {
+  
+  T_obs <- nrow(Fmat)
+  r <- ncol(Fmat)
+  n_cell <- ncol(X_cell)
+
+  # Z_{t} = 1_{n_cell} x F_t'
+  Z_arr <- array(NA_real_, dim = c(n_cell, r, T_obs))
+  for (t in 1:T_obs) {
+    Z_arr[,,t] <- matrix(rep(Fmat[t, ], each = n_cell), nrow = n_cell, byrow = FALSE)
+  }
+  
+  model0 <- SSModel(
+    X_cell ~ -1 + 
+      SSMcustom(
+        Z = Z_arr,
+        T = diag(r),
+        R = diag(r),
+        Q = diag(NA_real_, r), # updated to q*I_r in updatefn
+        a1 = rep(0, r),
+        P1 = diag(10, r)
+      ),
+    H = diag(H_vec, n_cell)    # fixed diagonal obs noise per series
+  )
+  
+  updatefn <- function(pars, model) {
+    q <- exp(pars[1])
+    model$Q[,,1] <- diag(q, r)
+    model
+  }
+  
+  # Solving for maximum likelihood estimation q
+  fit <- fitSSM(
+    model0,
+    inits = log(q_init),
+    updatefn = updatefn,
+    method = "BFGS"
+  )
+  model <- fit$model
+  q_hat <- exp(fit$optim.out$par[1])
+  
+  kfs <- KFS(model, smoothing = c("state"))
+  lambda_t <- kfs$alphahat # T x r
+  
+  colnames(lambda_t) <- paste0("lambda_", 1:r)
+  list(lambda_t = lambda_t, q_hat = q_hat)
+}
+```
+
+```{r, include=T}
+# Estimate time-varying loadings for all (industry × block) cells
+Lambda_cell_tv <- vector("list", K)
+q_hat_cell <- rep(NA_real_, K)
+names(Lambda_cell_tv) <- cells
+names(q_hat_cell) <- cells
+
+for (kk in seq_along(cells)) {
+  c_id <- cells[kk]
+  idx  <- which(cell_id == c_id)
+  
+  X_cell <- as.matrix(X_kfas[, idx, drop = FALSE]) # T x n_cell
+  H_vec  <- Hdiag[idx]
+  
+  res <- fit_tvp_cell(X_cell = X_cell, Fmat = F_use, H_vec = H_vec, q_init = 1e-4)
+  
+  Lambda_cell_tv[[c_id]] <- res$lambda_t
+  q_hat_cell[c_id]       <- res$q_hat
+  
+  if (kk %% 20 == 0) cat("Done cell", kk, "/", K, "\n")
+}
+
+summary(q_hat_cell)
+
+# Expand cell-level paths to variable-level time-varying loadings:
+# each variable i inherits its cell's loading path lambda_{industry(i),block(i),t}
+Lambda_tv_list <- vector("list", N_obs)
+names(Lambda_tv_list) <- var_names_filtered
+
+for (i in 1:N_obs) {
+  c_id <- cell_id[i]
+  Lambda_tv_list[[i]] <- Lambda_cell_tv[[c_id]] # T x r
+}
+```
+
+```{r, include=T}
+parse_cell <- function(cell) {
+  parts <- str_split(cell, "_", simplify = TRUE)
+  data.frame(
+    industry_code = parts[1], 
+    block = parts[2], 
+    cell = cell, 
+    stringsAsFactors = FALSE
+  )
+}
+
+# Create a metadata table for all unique cells
+cell_meta <- bind_rows(lapply(cells, parse_cell)) |>
+  mutate(n_cell = as.integer(table(cell_id)[cell]))
+
+head(cell_meta, 10)
+```
+
+```{r, include=T}
+# Plot loading paths over time for a specific cell
+plot_cell_loadings <- function(cell) {
+  # Retrieve estimated time-varying loadings (T x r)
+  lambda_t <- Lambda_cell_tv[[cell]]
+  meta <- parse_cell(cell)
+  
+  # Prepare data for ggplot
+  df <- data.frame(date = dates, lambda_t)
+  df_long <- pivot_longer(
+    df, 
+    cols = starts_with("lambda_"),
+    names_to = "factor", 
+    values_to = "loading"
+  )
+  
+  # Create the plot
+  ggplot(df_long, aes(x = date, y = loading, group = factor)) +
+    geom_line(color = "steelblue") +
+    facet_wrap(~ factor, ncol = 1, scales = "free_y") +
+    labs(
+      title = paste0("TV Loadings: Industry = ", meta$industry_code, ", Block = ", meta$block),
+      subtitle = paste("Based on", meta$n_cell, "series"),
+      x = NULL, 
+      y = "Loading Coefficient"
+    ) +
+    theme_minimal()
+}
+
+# Example: Visualize the largest cell (the one with the most series)
+cell_example <- cell_table$cell[1]
+print(plot_cell_loadings(cell_example))
+```
+
+
+```{r, include=T}
+# Calculate instability metrics for every cell
+instability_by_cell <- lapply(cells, function(cell) {
+  L  <- Lambda_cell_tv[[cell]] # T x r matrix
+  dL <- apply(L, 2, diff)      # Calculate first differences (T-1 x r)
+  
+  meta <- parse_cell(cell)
+  
+  data.frame(
+    industry_code    = meta$industry_code,
+    block            = meta$block,
+    cell             = cell,
+    n_cell           = sum(cell_id == cell),
+    q_hat            = q_hat_cell[cell],
+    mean_abs_dlambda = mean(abs(dL), na.rm = TRUE),
+    sd_dlambda       = sd(as.numeric(dL), na.rm = TRUE)
+  )
+}) |> 
+  bind_rows() |> 
+  arrange(desc(mean_abs_dlambda))
+
+# Show the top 20 most unstable cells
+head(instability_by_cell, 20)
+```
+
+```{r}
+qtype_labels <- c(
+  A = "Current assessments (GUS/LUS/BUS/XUS)",
+  B = "Expectations (GES/QES/XES/BES/PRS)",
+  C = "Prices (PVS/PWS)",
+  D = "MoM changes (AVS/BVS/QVS)"
+)
+```
+
+
+```{r}
+instability_by_block <- instability_by_cell |>
+  dplyr::group_by(block) |>
+  dplyr::summarise(
+    n_cells = dplyr::n(),
+    total_series = sum(n_cell),
+    median_q = median(q_hat, na.rm = TRUE),
+    median_mean_abs_dlambda = median(mean_abs_dlambda, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+# Group instability metrics by business block (A, B, C, D)
+instability_by_qtype <- instability_by_block |>
+  mutate(
+    question_type = qtype_labels[block]
+  ) |>
+  dplyr::select(
+    question_type,
+    n_cells,
+    total_series,
+    median_q,
+    median_mean_abs_dlambda
+  ) |>
+  rename(
+    `Question type`              = question_type,
+    `# Cells (industry × type)`  = n_cells,
+    `# Series`                   = total_series,
+    `Median q (RW variance)`     = median_q,
+    `Median |Δλ|`                = median_mean_abs_dlambda
+  )
+
+print(instability_by_qtype)
+
+```
+
+The stability of factor loadings differs across question types: current assessments are the most stable, expectations and price-related questions exhibit moderate time variation, while month-on-month indicators display the highest degree of instability.
+
+
+
+```{r}
+plot_loading_trends_by_qtype <- function(
+  Lambda_cell_tv,
+  dates,
+  factor_j = 1,
+  qtype = "B",                      # A/B/C/D
+  industries = NULL,                # NULL = All industries
+  event_years = c(2008, 2011, 2020),
+  show_legend = TRUE
+) {
+  stopifnot(qtype %in% c("A","B","C","D"))
+
+  parse_cell <- function(cell) {
+    parts <- strsplit(cell, "_", fixed = TRUE)[[1]]
+    list(industry_code = parts[1], qtype = parts[2])
+  }
+
+  cells <- names(Lambda_cell_tv)
+  meta <- lapply(cells, parse_cell)
+
+  meta_df <- data.frame(
+    cell = cells,
+    industry = vapply(meta, `[[`, character(1), "industry_code"),
+    qtype = vapply(meta, `[[`, character(1), "qtype"),
+    stringsAsFactors = FALSE
+  )
+
+  meta_df <- meta_df[meta_df$qtype == qtype, , drop = FALSE]
+
+  # optional subset industries
+  if (!is.null(industries)) {
+    meta_df <- meta_df[meta_df$industry %in% industries, , drop = FALSE]
+  }
+  stopifnot(nrow(meta_df) > 0)
+
+  # build long df: one line per industry
+  df_long <- do.call(rbind, lapply(seq_len(nrow(meta_df)), function(k) {
+    cell_k <- meta_df$cell[k]
+    ind_k  <- meta_df$industry[k]
+    L <- Lambda_cell_tv[[cell_k]]  # T x r
+    if (is.null(L) || ncol(L) < factor_j) return(NULL)
+    data.frame(
+      date = dates,
+      industry = ind_k,
+      industry_name = get_industry_name_en(ind_k),
+      loading = as.numeric(L[, factor_j]),
+      stringsAsFactors = FALSE
+    )
+  }))
+
+  # event lines
+  event_dates  <- as.Date(paste0(event_years, "-01-01"))
+  keep_evt <- event_dates >= min(dates) & event_dates <= max(dates)
+  event_dates  <- event_dates[keep_evt]
+  event_labels <- as.character(event_years[keep_evt])
+
+  # title label
+  qtype_title <- unname(qtype_labels[qtype])
+
+  p <- ggplot2::ggplot(df_long, aes(x = date, y = loading, color = industry_name)) +
+    ggplot2::geom_line(linewidth = 0.9, alpha = 0.85) +
+    ggplot2::geom_hline(yintercept = 0, linetype = 3, color = "gray60") +
+    ggplot2::scale_color_viridis_d(option = "turbo") +
+    ggplot2::labs(
+      title = paste0("Time-varying loadings by industry — ", qtype_title),
+      subtitle = paste0("Factor ", factor_j),
+      x = NULL,
+      y = paste0("Loading (lambda_", factor_j, ")"),
+      color = "Industry (Level 1)"
+    ) +
+    ggplot2::theme_minimal(base_size = 12)
+  
+
+  if (!show_legend) {
+    p <- p + ggplot2::theme(legend.position = "none")
+  } else {
+    p <- p + ggplot2::theme(
+      legend.position = "bottom",
+      legend.key.height = grid::unit(0.45, "lines")
+    ) +
+      ggplot2::guides(color = ggplot2::guide_legend(ncol = 3))
+  }
+
+  if (length(event_dates) > 0) {
+    p <- p +
+      ggplot2::geom_vline(xintercept = event_dates, linetype = 2, color = "red3", linewidth = 0.8) +
+      ggplot2::annotate(
+        "text",
+        x = event_dates,
+        y = Inf,
+        label = event_labels,
+        vjust = 1.2,
+        hjust = 0,
+        color = "red3",
+        size = 3
+      )
+  }
+
+  p
+}
+
+```
+
+**Factor 1 — Capital goods Manufacturing cycle**
+
+Current assessment indicators provide a stable and persistent anchor for the factor, while month-on-month changes contribute higher-frequency variation that reacts more strongly to short-term shocks. The higher volatility of expectations and monthly changes are particularly informative during periods of economic stress, when they respond rapidly to shocks and temporary decouplings in business sentiment. While their loading paths appear irregular, this behavior reflects their role as high-frequency adjustment signals that react rapidly to sudden shocks, such as production disruptions or abrupt changes in demand, rather than persistent cyclical movements.
+
+```{r fig.width=14, fig.height=5}
+plot_loading_trends_by_qtype(Lambda_cell_tv, dates, factor_j = 1, qtype = "A")
+plot_loading_trends_by_qtype(Lambda_cell_tv, dates, factor_j = 1, qtype = "B")
+plot_loading_trends_by_qtype(Lambda_cell_tv, dates, factor_j = 1, qtype = "C")
+plot_loading_trends_by_qtype(Lambda_cell_tv, dates, factor_j = 1, qtype = "D")
+```
+**Factor 2 — Supply-side & Productivity Cycle**
+Factor 2 represents a "benign supply-side expansion," characterized by a distinct inverse relationship where high optimism in upstream industries coexists with contained price pressures downstream.
+
+
+```{r fig.width=14, fig.height=5}
+plot_loading_trends_by_qtype(Lambda_cell_tv, dates, factor_j = 2, qtype = "A")
+plot_loading_trends_by_qtype(Lambda_cell_tv, dates, factor_j = 2, qtype = "B")
+plot_loading_trends_by_qtype(Lambda_cell_tv, dates, factor_j = 2, qtype = "C")
+plot_loading_trends_by_qtype(Lambda_cell_tv, dates, factor_j = 2, qtype = "D")
+```
+
+
+
+
+```{r fig.width=14, fig.height=5}
+plot_loading_trends_by_qtype(Lambda_cell_tv, dates, factor_j = 3, qtype = "A")
+plot_loading_trends_by_qtype(Lambda_cell_tv, dates, factor_j = 3, qtype = "B")
+plot_loading_trends_by_qtype(Lambda_cell_tv, dates, factor_j = 3, qtype = "C")
+plot_loading_trends_by_qtype(Lambda_cell_tv, dates, factor_j = 3, qtype = "D")
+
+```
+**Factor 3: Consumer Demand & Price Dynamics**
+
+
+
+
+
+```{r fig.width=14, fig.height=5}
+plot_loading_trends_by_qtype(Lambda_cell_tv, dates, factor_j = 4, qtype = "A")
+plot_loading_trends_by_qtype(Lambda_cell_tv, dates, factor_j = 4, qtype = "B")
+plot_loading_trends_by_qtype(Lambda_cell_tv, dates, factor_j = 4, qtype = "C")
+plot_loading_trends_by_qtype(Lambda_cell_tv, dates, factor_j = 4, qtype = "D")
+```
+
+```{r fig.width=14, fig.height=5}
+plot_loading_trends_by_qtype(Lambda_cell_tv, dates, factor_j = 5, qtype = "A")
+plot_loading_trends_by_qtype(Lambda_cell_tv, dates, factor_j = 5, qtype = "B")
+plot_loading_trends_by_qtype(Lambda_cell_tv, dates, factor_j = 5, qtype = "C")
+plot_loading_trends_by_qtype(Lambda_cell_tv, dates, factor_j = 5, qtype = "D")
+```
+Across all factors, indicators in Group A - the contemporaneous assessments of business conditions and order books (GUS/LUS/BUS/XUS) — tend to deliver the most stable and persistent measurement relationship with the latent factors, making them a reliable backbone for tracking the underlying manufacturing cycle. By contrast, Group D — month-on-month change indicators (AVS/BVS/QVS) — exhibits markedly higher volatility and stronger time dependence in loadings. While these trajectories can look visually “noisy”, the pattern is consistent with D capturing short-term adjustment dynamics that become especially informative during abrupt disruptions, when firms react quickly to shocks and constraints. 
+
+Group B expectations (GES/QES/XES/BES/PRS) typically lie between these two extremes: their loadings vary more than A but less erratically than D, with more pronounced fluctuations around major stress episodes, suggesting that forward-looking sentiment can intermittently decouple from realized conditions under heightened uncertainty. Group C price indicators (PVS/PWS) also show intermediate behavior and tend to become more salient when cost pressures and inflation-related forces dominate the manufacturing environment. Taken together, the results imply that the informational content of the ifo manufacturing survey is systematically state-dependent: stable “level-type” assessments anchor the common component, whereas high-frequency changes and expectations contribute disproportionately around turning points and short-lived shocks.
+
+These suggest that, separating structural signal from shock sensitivity is crucial when studying propagation and regime changes. For causal and lead–lag analysis, it is generally more defensible to treat Group A as the anchor (a stable measurement layer) and use Groups B and D for early-moving or shock-responsive channels, rather than pooling all questions indiscriminately. 
+
+
+```{r, include=T}
+plot_factor_block_all_industries <- function(
+  Lambda_cell_tv, dates,
+  factor_j = 1, block = "B",
+  event_years = c(2008, 2011, 2020),
+  highlight_top_k = 6,
+  highlight_by = c("instability", "mean_abs"),
+  alpha_other = 0.25
+) {
+  highlight_by <- match.arg(highlight_by)
+
+  # cell metadata
+  parse_cell <- function(cell) {
+    parts <- strsplit(cell, "__", fixed = TRUE)[[1]]
+    if (length(parts) == 1) parts <- strsplit(cell, "_", fixed = TRUE)[[1]]
+    list(industry = parts[1], block = parts[2])
+  }
+  cells <- names(Lambda_cell_tv)
+  meta <- tibble(cell = cells) |>
+    mutate(tmp = lapply(cell, parse_cell),
+           industry = map_chr(tmp, "industry"),
+           blk      = map_chr(tmp, "block")) |>
+    dplyr:: select(-tmp) |>
+    filter(blk == block)
+
+  # build long df: 21 lines
+  df <- map_dfr(meta$cell, function(c_id) {
+    L <- Lambda_cell_tv[[c_id]]
+    tibble(date = dates,
+           industry = meta$industry[meta$cell == c_id],
+           loading = as.numeric(L[, factor_j]))
+  })
+
+  # choose which lines to highlight
+  score <- df |>
+    group_by(industry) |>
+    summarise(
+      mean_abs = mean(abs(loading), na.rm = TRUE),
+      instability = mean(abs(diff(loading)), na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  top_inds <- score |>
+    arrange(desc(.data[[highlight_by]])) |>
+    slice_head(n = highlight_top_k) |>
+    pull(industry)
+
+  df <- df |>
+    mutate(is_highlight = industry %in% top_inds)
+
+  # events
+  event_dates <- as.Date(paste0(event_years, "-01-01"))
+  keep_evt <- event_dates >= min(dates) & event_dates <= max(dates)
+  event_dates <- event_dates[keep_evt]
+  event_labels <- as.character(event_years[keep_evt])
+
+  ggplot(df, aes(x = date, y = loading, group = industry)) +
+    geom_line(aes(color = industry, alpha = is_highlight), linewidth = 0.9) +
+    scale_alpha_manual(values = c(`TRUE` = 0.95, `FALSE` = alpha_other), guide = "none") +
+    scale_color_viridis_d(option = "turbo") +
+    geom_hline(yintercept = 0, linetype = 3, color = "gray60") +
+    geom_vline(xintercept = event_dates, linetype = 2, color = "red3", linewidth = 0.8) +
+    annotate("text", x = event_dates, y = Inf, label = event_labels,
+             vjust = 1.2, hjust = 0, color = "red3", size = 3) +
+    labs(
+      title = paste0("TV Loadings across industries: Factor ", factor_j, ", Block = ", block),
+      subtitle = paste0("Highlight top-", highlight_top_k, " by ", highlight_by, " (others faded)"),
+      x = NULL,
+      y = paste0("Loading (lambda_", factor_j, ")"),
+      color = "Industry"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "bottom") +
+    guides(color = guide_legend(ncol = 3, override.aes = list(alpha = 1)))
+}
+
+```
+
+
+
+```{r fig.width=13, fig.height=6, include=T}
+plot_factor_block_all_industries(Lambda_cell_tv, dates, factor_j = 2, block = "A",
+                                 highlight_top_k = 6, highlight_by = "instability")
+```
+
+
+
+
+
+
+```{r, include=T}
+source("0302_followup_analysis.R")
+   
+all_results <- run_all_0302_followup_analyses(
+     Lambda_cell_tv, dates, instability_by_qtype
+   )
+```
+
+
+```{r 0302-save-for-04, message=FALSE, warning=FALSE}
+# Save objects for Section 04
+stopifnot(exists("X_kfas"), exists("F_smooth"), exists("dates"))
+stopifnot(nrow(X_kfas) == nrow(as.matrix(F_smooth)))
+stopifnot(nrow(X_kfas) == length(dates))
+
+var_map_04 <- data.frame(
+  series_id = colnames(X_kfas),
+  var_name  = var_names_filtered,
+  industry  = as.character(var_metadata_filtered$industry_code),
+  q_block   = q_block,
+  cell_id   = cell_id,
+  stringsAsFactors = FALSE
+)
+
+dfm_state_04 <- list(
+  created_at = Sys.time(),
+  dates      = as.Date(dates),
+  r          = r,
+  F_smooth   = as.matrix(F_smooth),   # T x r
+  X_kfas     = as.matrix(X_kfas),     # T x N
+  var_map    = var_map_04,            # N rows
+  Lambda_cell_tv = if (exists("Lambda_cell_tv")) Lambda_cell_tv else NULL
+)
+
+# save 
+out_dir <- "output"
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+saveRDS(dfm_state_04, file = file.path(out_dir, "dfm_state_04.rds"))
+
+str(dfm_state_04, max.level = 1)
+
+```
+
+
+
+
+你在 0302 已经把每个变量分到了 `cell_id = industry_code + "_" + block`，而且一共 `K = 84` 个 cells :contentReference[oaicite:1]{index=1}。  
+所以 04 最自然的候选预测变量就是：
+
+\[
+x_{c,t} \equiv x_{g,b,t} = \frac{1}{n_{g,b}} \sum_{i \in (g,b)} X_{i,t}
+\]
+
+也就是：**同一个 industry×block cell 内的变量在每期取均值**，得到一个 \(T \times 84\) 的候选矩阵。
+
+
+
+
+
+
+
+
+
+
+
+
+
