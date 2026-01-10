@@ -17,7 +17,7 @@ output:
     code_folding: show
 ---
 
-```{r setup, include=T}
+```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
                       fig.width = 10, fig.height = 6)
 ```
@@ -208,7 +208,7 @@ fit_tvp_cell <- function(X_cell, Fmat, H_vec, q_init = 1e-4) {
 }
 ```
 
-```{r, include=T}
+```{r, include=FALSE}
 # Estimate time-varying loadings for all (industry × block) cells
 Lambda_cell_tv <- vector("list", K)
 q_hat_cell <- rep(NA_real_, K)
@@ -243,7 +243,7 @@ for (i in 1:N_obs) {
 }
 ```
 
-```{r, include=T}
+```{r, include=FALSE}
 parse_cell <- function(cell) {
   parts <- str_split(cell, "_", simplify = TRUE)
   data.frame(
@@ -261,7 +261,7 @@ cell_meta <- bind_rows(lapply(cells, parse_cell)) |>
 head(cell_meta, 10)
 ```
 
-```{r, include=T}
+```{r, include=FALSE}
 # Plot loading paths over time for a specific cell
 plot_cell_loadings <- function(cell) {
   # Retrieve estimated time-varying loadings (T x r)
@@ -290,13 +290,13 @@ plot_cell_loadings <- function(cell) {
     theme_minimal()
 }
 
-# Example: Visualize the largest cell (the one with the most series)
+# Visualize the largest cell (the one with the most series)
 cell_example <- cell_table$cell[1]
 print(plot_cell_loadings(cell_example))
 ```
 
 
-```{r, include=T}
+```{r, include=FALSE}
 # Calculate instability metrics for every cell
 instability_by_cell <- lapply(cells, function(cell) {
   L  <- Lambda_cell_tv[[cell]] # T x r matrix
@@ -531,7 +531,7 @@ Group B expectations (GES/QES/XES/BES/PRS) typically lie between these two extre
 These suggest that, separating structural signal from shock sensitivity is crucial when studying propagation and regime changes. For causal and lead–lag analysis, it is generally more defensible to treat Group A as the anchor (a stable measurement layer) and use Groups B and D for early-moving or shock-responsive channels, rather than pooling all questions indiscriminately. 
 
 
-```{r, include=T}
+```{r, include=FALSE}
 plot_factor_block_all_industries <- function(
   Lambda_cell_tv, dates,
   factor_j = 1, block = "B",
@@ -611,23 +611,12 @@ plot_factor_block_all_industries <- function(
 
 
 
-```{r fig.width=13, fig.height=6, include=T}
+```{r fig.width=13, fig.height=6, include=FALSE}
 plot_factor_block_all_industries(Lambda_cell_tv, dates, factor_j = 2, block = "A",
                                  highlight_top_k = 6, highlight_by = "instability")
 ```
 
 
-
-
-
-
-```{r, include=T}
-source("0302_followup_analysis.R")
-   
-all_results <- run_all_0302_followup_analyses(
-     Lambda_cell_tv, dates, instability_by_qtype
-   )
-```
 
 
 ```{r 0302-save-for-04, message=FALSE, warning=FALSE}
@@ -663,21 +652,6 @@ saveRDS(dfm_state_04, file = file.path(out_dir, "dfm_state_04.rds"))
 str(dfm_state_04, max.level = 1)
 
 ```
-
-
-
-
-你在 0302 已经把每个变量分到了 `cell_id = industry_code + "_" + block`，而且一共 `K = 84` 个 cells :contentReference[oaicite:1]{index=1}。  
-所以 04 最自然的候选预测变量就是：
-
-\[
-x_{c,t} \equiv x_{g,b,t} = \frac{1}{n_{g,b}} \sum_{i \in (g,b)} X_{i,t}
-\]
-
-也就是：**同一个 industry×block cell 内的变量在每期取均值**，得到一个 \(T \times 84\) 的候选矩阵。
-
-
-
 
 
 
