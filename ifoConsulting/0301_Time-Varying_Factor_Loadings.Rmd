@@ -1,7 +1,5 @@
 ---
 title: "03.1 Time-Varying Factor Loadings"
-author: "Weiyun Hong"
-date: "2025-12-28"
 header-includes:
   - \usepackage{parskip}
   - \setlength{\parskip}{0.5em}
@@ -18,8 +16,8 @@ output:
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
-                      fig.width = 10, fig.height = 6)
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 5)
 ```
 
 ```{r}
@@ -37,11 +35,12 @@ var_metadata_filtered <- dfm02$var_metadata_filtered
 ```
 
 
-While the dynamic factor model allows the latent factors to evolve over time, it assumes that the mapping between the observed variables and the latent factors is stable. However, the relevance of individual questions for the underlying business cycle may evolve gradually over time due to structural change, institutional reforms, or shifts in economic expectations.
 
-To allow for **gradual structural change** in the measurement relationship, we extend the measurement equation by letting factor loadings vary over time. We impose a parsimonious restriction that all survey variables within the same Level-1 industry group share the same (possibly time-varying) factor loading vector.
+While the dynamic factor model allows the latent factors to evolve over time, it typically maintains a time-invariant measurement relationship between the observed variables and the latent factors. However, the economic relevance of individual indicators may change gradually over time. Such shifts can arise from structural transformation of the economy, institutional reforms, or persistent changes in firms’ expectations.
 
-Let \(g(i)\in\{1,\dots,G\}\) denote the Level-1 group membership (here: `industry_code`) of variable \(i\).
+To allow for **gradual structural change** in the measurement relationship, we extend the measurement equation by letting factor loadings vary over time. To maintain tractability, we first impose a parsimonious restriction that all variables within the same Level-1 industry group share the common (time-varying) factor loading vector.
+
+Let \(g(i)\in\{1,\dots,G\}\) denote the Level-1 group membership of variable \(i\).
 The measurement equation becomes
 
 \[
@@ -62,10 +61,11 @@ Stacking the \(n_g\) observed series in group \(g\) yields a multivariate observ
 
 \[
 X_{g,t} = \mathbf 1_{n_g}\lambda_{g,t}^\top F_t + \xi_{g,t},
-\quad \xi_{g,t}\sim \mathcal N(0, H_g),
+\quad \xi_{g,t}\sim \mathcal N(0, H_g), \quad H_g=\mathrm{diag}(H_i: i\in g)
 \]
 
-where \(H_g=\mathrm{diag}(H_i: i\in g)\).
+The stacked observation vector $X_{g,t}$ represents all survey responses within industry $g$ at time $t$. Under the group-level loading structure, these responses share a common latent signal driven by the dynamic factors, while differences across questions are attributed to idiosyncratic measurement noise.
+
 
 ```{r}
 library(KFAS)
@@ -415,7 +415,7 @@ plot_factor_all_industries <- function(
 ```
 
 
-```{r fig.width=14, fig.height=6}
+```{r fig.width=14, fig.height=6, echo=FALSE, include=FALSE}
 #for (j in 1:r) {
 #  print(plot_factor_all_industries(Lambda_g_tv, dates, factor_j = j, show_legend = (j == 5)))
 #}
@@ -424,39 +424,75 @@ for (j in 1:r) {
   print(plot_factor_all_industries(Lambda_g_tv, dates, factor_j = j, fade_highvol = TRUE, top_k = 5))
 }
 ```
-**Factor 1 — Capital goods Manufacturing cycle**
+
+
+
+
+```{r}
+print(plot_factor_all_industries(Lambda_g_tv, dates, factor_j = 1, fade_highvol = TRUE, top_k = 5))
+```
+
+**Factor 1: Capital goods Manufacturing cycle**
 
 Factor 1 captures the largest share of common variation in the data, reflecting the investment-driven core of German manufacturing activity. It summarizes the synchronized expansion and contraction of key capital goods industries and serves as a broad indicator of underlying macroeconomic conditions in the manufactuaring sector.
-  Core capital-goods industries: Machinery, Electrical Equipment, Fabricated Metal Products, these three industries exhibit persistently positive and relatively high loadings throughout the sample, confirming that Factor 1 remains tightly anchored in investment-related manufacturing.
+
+  Core capital-goods industries: Machinery, Electrical Equipment, Fabricated Metal Products, these three industries exhibit persistently positive and relatively high loadings throughout the sample. This tight clustering of loadings indicates strong cross-sectional co-movement, confirming that Factor 1 remains firmly anchored in investment-related manufacturing dynamics.
+  
   Rubber and Plastics show a marked increase after 2011, likely reflecting their integration into machinery and automotive supply chains. 
-  The relatively higher volatility of Factor-1 loadings reflects the broad and heterogeneous nature of the investment cycle. As this factor aggregates multiple stages of the production chain, shifts in investment composition and crisis-driven disruptions tend to reallocate exposure across industries, resulting in visible cross-sectional and time-series variation in loadings.
+  The relatively high volatility of Factor-1 loadings reflects the broad and heterogeneous nature of the investment cycle. As this factor aggregates multiple stages of the production chain, shifts in investment composition and crisis-driven disruptions tend to reallocate exposure across industries, resulting in visible cross-sectional and time-series variation in loadings.
 
-**Factor 2 — Supply-side & Productivity Cycle**
+\vspace{0.5cm}
 
-Loadings on Factor 2 exhibit noticeably more heterogeneity than Factor 1. Leather Products show a clear increase in loadings after 2011, suggesting rising sensitivity to efficiency and expectation-driven dynamics in the post-crisis period.
-  Printing loads relatively strongly before 2005 and weakens thereafter.
-  Petroleum refining loads strongly on the supply-side factor in the mid-2000s, weakens for a long period after the financial crisis, and re-emerges again after 2023. This pattern suggests that energy-related supply conditions played an important role in shaping aggregate supply-side expectations prior to 2008, but gradually lost relevance after the Global Financial Crisis . 
+```{r, fig.height = 5}
+print(plot_factor_all_industries(Lambda_g_tv, dates, factor_j = 2, fade_highvol = TRUE, top_k = 5))
+```
 
+**Factor 2: Supply-side & Productivity Cycle**
+
+Leather Products show a clear increase in loadings after 2011, indicating an increasing exposure of Leather Products to supply-side conditions in the post-crisis period. Printing loads relatively strongly before 2005 and weakens thereafter. Paper Products exhibit persistently positive and relatively high loadings throughout the period, indicating a stable and sustained exposure to supply-side conditions.
+
+  Petroleum refining loads strongly on the supply-side factor around 2005, weakens for a long period after the financial crisis, and re-emerges again after 2023. Taken together, these patterns point to a time-varying role of energy-related and input-intensive industries in shaping the cross-sectional structure of supply-side conditions, with their relevance declining in the post-crisis period and re-intensifying amid recent energy-market disruptions.
+
+
+
+```{r}
+print(plot_factor_all_industries(Lambda_g_tv, dates, factor_j = 3, fade_highvol = TRUE, top_k = 5))
+```
   
 **Factor 3: Consumer Demand & Price Dynamics**
 
-Factor 3 loadings are relatively more stable. This reflects the smoother and more persistent nature of consumer demand dynamics, which tend to adjust gradually and are less prone to abrupt reallocation across industries than investment-driven cycles. Beverages increase gradually over time, signaling growing integration with household demand cycles. 
+Factor 3 has a diffuse and low-amplitude cross-sectional structure with limited concentration in any single sector. This reflects the smoother and more persistent nature of consumer demand dynamics, which tend to adjust gradually and are less prone to abrupt reallocation across industries than investment-driven cycles. Beverages increase gradually over time, signaling growing integration with household demand cycles. 
 
+It indicates that no industry persistently dominates this dimension, resulting in weaker cross-sectional identification and higher uncertainty in the estimated factor path, consistent with its relatively high estimation uncertainty and moderate sample stability.
+
+
+\vspace{0.3cm}
+
+
+```{r}
+print(plot_factor_all_industries(Lambda_g_tv, dates, factor_j = 4, fade_highvol = TRUE, top_k = 5))
+```
 
 **Factor 4: Global Industrial Demand**
 
-Basic Metals maintain high loadings over the entire sample, underscoring their sustained exposure to external demand. Wood Products load weakly throughout, suggesting limited sensitivity to global trade cycles. Wearing Apparel shows a gradual increase during 2005–2008, consistent with the pre-crisis expansion in global trade. Coke and Petroleum Refining collapse after 2021, coinciding with energy crisis.
+Basic Metals maintain high loadings over the entire sample, underscoring their sustained exposure to external demand. Wood Products load weakly throughout, suggesting limited sensitivity to global trade cycles. Wearing Apparel shows a gradual increase during 2005–2008, consistent with the pre-crisis expansion in global trade. Coke and Petroleum Refining collapse after 2021, coinciding with energy market shocks on global industrial demand.
 
+\vspace{0.5cm}
+
+```{r}
+print(plot_factor_all_industries(Lambda_g_tv, dates, factor_j = 5, fade_highvol = TRUE, top_k = 5))
+```
 
 **Factor 5: Specialized Manufacturing**
 
 Factor 5 exhibits the greatest dispersion in loadings across industries, demonstrating its highly specialized structure. Motor Vehicles and Beverages load most strongly, while Other Manufacturing and Other Transport Equipment also show relatively pronounced and persistent exposure. 
-  The strong cross-sectional heterogeneity and moderate time variation of Factor-5 loadings indicate that this factor captures a narrow, project-based or sector-specific dimension rather than a broad cyclical force. Consequently, differences across industries dominate over common temporal movements.
+
+  The strong cross-sectional heterogeneity and moderate time variation of Factor-5 loadings indicate that this factor captures a narrow, project-based or sector-specific dimension rather than a broad cyclical force. Consequently, differences across industries dominate over common temporal movements. As such, Factor 5 should be interpreted as reflecting localized manufacturing dynamics rather than a persistent source of aggregate co-movement.
 
 
 
 
-
+\vspace{0.3cm}
 
 ```{r}
 plot_industry_loadings <- function(
