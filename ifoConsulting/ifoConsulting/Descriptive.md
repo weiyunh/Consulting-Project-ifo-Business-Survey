@@ -1,1 +1,0 @@
-ifoConsulting/Descriptive.md
