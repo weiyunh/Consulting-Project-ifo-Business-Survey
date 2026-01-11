@@ -1,0 +1,238 @@
+---
+title: "Dynamic Time Warping"
+author: "Yiming Zhao"
+date: "2025-12-9"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readr)
+library(tidyverse)
+library(tidyr)
+library(dtwclust)
+library(ggplot2)
+#setwd("C:/Users/BonSn/Desktop/")
+```
+
+
+
+```{r Read data}
+data_long <- read_csv("data_b_long.csv")
+data_wide <- read_csv("data_b_wide.csv")
+```
+
+\Large \textbf{1. DTW Clustering}
+
+\large \textbf{1.1 Cluster Industries with Similar Temporal Evolution}
+
+\normalsize If two industries exhibit similar dynamic patterns across all questions, they will be clustered together.
+```{r DTW industry}
+dl_level1 <- data_long %>%  ## extract industries from level1
+  filter(level == 1)
+
+dw_level1 <- dl_level1 %>%  ## wide format
+  select(date, industry_code, question, value) %>%
+  tidyr::pivot_wider(names_from = question, values_from = value) %>%
+  arrange(industry_code, date)
+
+dw_level1_clean <- dw_level1 %>% ## drop NA
+  group_by(industry_code) %>%
+  drop_na() %>%   
+  ungroup()
+
+ts_list <- dw_level1_clean %>%  ## build bivariate time series (wide format)
+  group_by(industry_code) %>%
+  group_split() %>%
+  lapply(function(df) {
+    df %>%
+      select(-industry_code, -date) %>%
+      as.matrix()
+  })
+names(ts_list) <- unique(dw_level1_clean$industry_code)
+
+## DTW clustering
+set.seed(123)
+cluster_result <- tsclust(
+  ts_list,
+  type = "partitional",
+  k = 4,
+  distance = "dtw_basic",
+  centroid = "dba",
+  trace = TRUE
+)
+cluster_result ## cluster size
+
+cluster_result@cluster ## cluster assignment
+industry_cluster <- tibble( ## cluster assignment table
+  industry_code = names(ts_list),
+  cluster = cluster_result@cluster
+) %>%
+  left_join(
+    dl_level1 %>% 
+      distinct(industry_code, industry_name),
+    by = "industry_code"
+  )
+industry_cluster
+
+industry_centroids <- cluster_result@centroids ## cluster centroid
+industry_centroid_long <- map2_df(
+  industry_centroids,
+  seq_along(industry_centroids),
+  ~ {
+    as_tibble(.x) %>%
+      mutate(time = row_number(),
+             cluster = .y) %>%
+      pivot_longer(
+        -c(time, cluster),
+        names_to = "question",
+        values_to = "value"
+      )
+  }
+)
+
+ggplot(industry_centroid_long,  ## plot DBA centroid
+       aes(x = time, y = value, color = factor(cluster))) +
+  geom_line(linewidth = 0.8) +
+  facet_wrap(~ question, ncol = 3, scales = "free_y") +
+  labs(
+    title = "DBA Centroid Dynamics by Question",
+    x = "DTW-aligned Time Index",
+    y = "Centroid Value",
+    color = "Cluster"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+```
+
+\textbf{Results:}
+\begin{enumerate}
+\item \textbf{Cluster assignment:} 
+4 clusters in total, industries within the same cluster exhibit similar dynamic patterns in survey-based business-cycle conditions (not similarity in production technology or sector definitions), allowing for time shifts across cycles.
+\item \textbf{Cluter size:} 
+  \begin{itemize}
+  \item Small size (1): markedly different dynamic behavior, idiosyncratic or sector-specific   dynamics. Potentially reflects: idiosyncratic industries (e.g. energy, automotive, highly export-dependent sectors); extremely strong reactions to the business cycle, may be lead/lag.
+  \item Medium size (5–8): shared and similar/core business-cycle dynamics while allowing for lead-lag structure, the type of non-obvious structure to be identified.
+  \end{itemize}
+\item \textbf{DBA centroids: common business-cycle trajectory of each cluster.}
+
+We also compare the evolution of the same survey question across clusters. This allows us to isolate differences in timing, amplitude, and persistence of cyclical responses, and to assess which clusters and indicators may contain leading information for aggregate business conditions.
+
+$\rightarrow$ Axis:
+\begin{itemize}
+  \item \textbf{x-axis: the DTW-aligned time index}\\
+It reflects a common latent time scale obtained after dynamic time warping, allowing for lead–lag adjustments across industries. As a result, identical x-axis positions do not necessarily correspond to the same calendar date, but to comparable phases of the business cycle.
+  \item \textbf{y-axis: DBA centroid value of the respective indicator}\\
+Each centroid represents the average dynamic trajectory of all industries within a cluster, computed under DTW alignment. The values correspond to standardized survey balances, with positive values indicating favorable assessments and negative values indicating pessimistic sentiment.
+\end{itemize}
+
+$\rightarrow$ Characteristics:
+\begin{itemize}
+  \item \textbf{Timing (lead–lag)}:\\
+Cluster 1 exhibits systematically earlier downturns in expectations-related indicators, suggesting potential leading-indicator properties for aggregate business sentiment.
+Cluster 4 does not exhibit systematic leading or lagging behavior, but rather phase-shifted or regime-specific responses.
+  \item \textbf{Amplitude:}\\
+Cluster 1 includes the most sentiment-sensitive industries, showing amplified reactions to macroeconomic shocks.
+Cluster 3 corresponds to structurally stable industries whose sentiment indicators remain close to neutral throughout the cycle.
+Cluster 4 displays selective sensitivity: strong reactions in specific indicators, but muted responses elsewhere.
+  \item \textbf{Persistence:}\\
+Cluster 1 captures highly cyclical industries with strong but short-lived responses to macroeconomic shocks.
+Cluster 2 displays high persistence of negative sentiment, indicating sectors with slower adjustment and prolonged weakness after downturns.
+Cluster 3 corresponds to structurally stable industries whose sentiment indicators remain close to neutral throughout the cycle.
+Cluster 4 is characterized by low persistence but pronounced episodic deviations.
+\end{itemize}
+\end{enumerate}
+
+$\rightarrow$ \textbf{In summary:}
+Cluster 1 reacts early and strongly to shocks, making it a potential leading indicator.
+Cluster 2 exhibits persistent negative sentiment and slow recovery, while Cluster 3 represents more stable industries with muted cyclical responses.
+Cluster 4 represents industries with atypical, regime-dependent dynamics: neither clear leaders nor followers, but sectors that temporarily deviate from the main cycle, potentially signaling structural or shock-specific adjustments.
+\bigskip
+
+
+\large \textbf{1.2 Cluster Questions with Similar Temporal Evolution}
+
+\normalsize If two survey questions exhibit similar dynamic patterns across industries and over time, they may capture the same underlying economic mechanism, even if their wording or interpretation differs.
+
+```{r DTW question}
+dw_question <- dl_level1 %>%  ## wide format
+  select(date, industry_code, question, value) %>%
+  pivot_wider(
+    names_from = industry_code,
+    values_from = value
+  ) %>%
+  arrange(question, date)
+
+dw_question_clean <- dw_question %>%  ## drop NA
+  group_by(question) %>%
+  drop_na() %>%
+  ungroup()
+
+ts_question_list <- dw_question_clean %>% ## build bivariate time series
+  group_by(question) %>%
+  group_split() %>%
+  lapply(function(df) {
+    df %>%
+      select(-question, -date) %>%
+      as.matrix()
+  })
+names(ts_question_list) <- unique(dw_question_clean$question)
+
+## DTW clustering
+set.seed(123)
+cluster_result_question <- tsclust(
+  ts_question_list,
+  type = "partitional",
+  k = 4,
+  distance = "dtw_basic",
+  centroid = "dba",
+  trace = TRUE
+)
+cluster_result_question
+
+cluster_result_question@cluster ## cluster assignment
+question_cluster <- tibble(  ## cluster assignment table
+  question = names(ts_question_list),
+  cluster = cluster_result_question@cluster
+) %>%
+  left_join(
+    data_long %>%
+      distinct(question, question_name, question_type),
+    by = "question"
+  )
+question_cluster
+
+```
+In contrast to industry clustering, the purpose of question clustering is not to identify leading or lagging behavior, but to uncover groups of survey indicators that exhibit similar cyclical dynamics across industries.
+
+\textbf{Results:}
+The DTW clustering of survey questions yields four clusters.
+All clusters exhibit relatively large average DTW distances, indicating that even within clusters, questions are not identical but share similar temporal evolution up to phase shifts and scale differences.
+
+$\rightarrow$ \textbf{Economic interpretation of question clusters:}
+\begin{itemize}
+  \item \textbf{Cluster 1:} Auftragseingang (AVS), Nachfrage gegen Vormonat (BVS), Geschäftslage (GUS).\\
+        $\rightarrow$ Current-state dimension:\\
+        Cluster 1 may indicate current business conditions and short-term demand changes. These questions are closely tied to firms’ contemporaneous assessments of order inflows and overall business situation. 
+  \item \textbf{Cluster 2:} Geschäftserwartungen (GES), Geschäftsklima (KLD), Exporterwartungen (XES).\\
+        $\rightarrow$ General expectations factor:\\
+        Cluster 2 consists of forward-looking and composite indicators, combining expectations about future business conditions with export-oriented sentiment. 
+  \item \textbf{Cluster 3:} Beschäftigungserwartung (BES), Bestellungsbestand (BUS), Inlandsnachfrage Erwartung (QES), Inlandsnachfrage gegen Vormonat (QVS), Auslandsauftragsbestand (XUS).\\
+        $\rightarrow$ Capacity-planning and workload dimension:\\
+        Despite mixing current and expectation-based questions, Cluster 3 is the largest cluster and these indicators share a common dynamic pattern related to demand pressure and production planning.   
+  \item \textbf{Cluster 4:} Kapazitätsauslastung (LUS), Produktionserwartung (PRS), Verkaufspreise (PVS), Verkaufspreise Erwartung (PWS)\\
+        $\rightarrow$ Cost–capacity–price channel:\\
+        Cluster 4 is related to a supply-side adjustment mechanism, where firms respond to demand conditions through utilization, output planning, and pricing.  
+\end{itemize}
+
+\textbf{In summary:}
+Rather than reproducing predefined survey categories, the clustering uncovers latent dynamic structures based on the temporal evolution of indicators. This provides a data-driven way to reduce dimensionality and select representative questions for monitoring business-cycle dynamics in practice, while avoiding over-interpretation of lead–lag relations at the question level.
+
+
+
+
+Next step planned:
+\Large \textbf{2. Network Based on DTW}
+
+\normalsize The DTW distance measures the dynamic similarity of the overall survey-question vector between two industries over the commonly observed months.
