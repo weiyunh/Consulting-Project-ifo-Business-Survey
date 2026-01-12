@@ -307,7 +307,6 @@ cat("Loadings:", nrow(Lambda_hat), " x ", ncol(Lambda_hat), "\n")
 ```
 
 
-
 ```{r, include=FALSE}
 # Print top loadings 
 for (j in 1:r) {
@@ -335,7 +334,6 @@ for (j in 1:r) {
   ))
 }
 ```
-
 ```{r}
 factor_texts <- list(
   # Factor 1
@@ -472,7 +470,7 @@ The median R² of 0.71 indicates that for over half of the 294 variables, the fi
 
 \newpage
 
-```{r error_corr, fig.height=4}
+```{r error_corr, fig.height=5}
 cor_e <- cor(e_hat)
 upper_cor <- cor_e[upper.tri(cor_e)]
 mean_abs_cor <- mean(abs(upper_cor))
@@ -486,249 +484,7 @@ ggplot(data.frame(Cor = upper_cor), aes(x = Cor)) +
 ```
 The mean absolute error correlation of 0.1093 indicates that the residuals (the portion of each series not explained by the common factors) contain very little shared or systematic co-movement. This confirms that the 5 extracted factors have largely captured the dominant common fluctuations across the dataset, leaving behind mostly idiosyncratic, variable-specific noise.
 
-
-
-### Split-sample stability and out-of-sample validation
-
-The sample is split at January 2016, leaving a long pre-2016 estimation window to ensure a stable identification of the factor structure, while reserving the subsequent period for out-of-sample evaluation.
-This split is informative as the test sample includes several major macroeconomic disruptions, providing a stringent assessment of the stability and generalizability of the estimated factors.
-
-The split-sample analysis indicates a high degree of stability for the core factors extracted from the static PCA. Factor 1 exhibits an exceptionally strong correlation between the training-sample and full-sample loading vectors (0.962), confirming that the capital-goods-related manufacturing cycle is a highly robust and persistent source of comovement across industries. Factor 2 also remains stable, with a correlation of 0.891, suggesting that the supply-side and productivity-related component is largely invariant to the inclusion of post-2016 observations. Similarly, Factor 4 displays substantial stability (0.820), indicating that the global industrial demand factor retains a consistent cross-sectional structure even when evaluated against the later sample period.
-
-In contrast, Factors 3 and 5 show noticeably weaker stability. Factor 3, with a loading correlation of 0.695, appears moderately sensitive to the sample split, consistent with its interpretation as a consumer-demand and price-dynamics component that is more exposed to structural shifts associated with the post-2016 period, including the pandemic and subsequent inflationary pressures. Factor 5 exhibits very low stability (0.131), indicating that this specialized manufacturing component is highly sample-dependent and likely driven by episodic or project-based dynamics rather than a persistent common structure.
-
-```{r oos_split_sample, fig.height=4}
-# Out-of-sample / Split-sample checks (Static PCA)
-
-split_date <- as.Date("2016-01-01")
-
-idx_train <- which(dates < split_date)
-idx_test  <- which(dates >= split_date)
-
-stopifnot(length(idx_train) >= 60, length(idx_test) >= 60)
-
-X_train <- X_std[idx_train, , drop = FALSE]
-X_test  <- X_std[idx_test,  , drop = FALSE]
-
-# Re-estimate PCA on training sample
-pca_train <- prcomp(X_train, rank. = r, center = FALSE, scale. = FALSE)
-F_train_hat <- pca_train$x
-Lambda_train <- pca_train$rotation
-
-# Helper: align factors (permutation + sign) to FULL-sample Lambda_hat
-# because PCA columns can be permuted / sign-flipped across samples
-best_align_perm_sign <- function(L_ref, L_new) {
-  r <- ncol(L_ref)
-  perms <- as.matrix(gtools::permutations(r, r))  # needs gtools
-  best <- list(score = -Inf, perm = 1:r, sign = rep(1, r))
-  
-  for (k in 1:nrow(perms)) {
-    p <- perms[k, ]
-    Lp <- L_new[, p, drop = FALSE]
-    C <- cor(L_ref, Lp)   # r x r
-    
-    # choose signs to maximize diagonal correlation
-    s <- sign(diag(C)); s[s==0] <- 1
-    score <- mean(abs(diag(C)))
-    if (score > best$score) best <- list(score=score, perm=p, sign=s)
-  }
-  best
-}
-
-# If you don't have gtools installed, use brute-force base R (r=5 -> 120 perms)
-all_perms <- function(v) {
-  if (length(v) == 1) return(list(v))
-  out <- list()
-  for (i in seq_along(v)) {
-    rest <- v[-i]
-    for (p in all_perms(rest)) out[[length(out)+1]] <- c(v[i], p)
-  }
-  out
-}
-perms_list <- all_perms(1:r)
-
-best_align_base <- function(L_ref, L_new, perms_list) {
-  best <- list(score=-Inf, perm=1:r, sign=rep(1,r))
-  for (p in perms_list) {
-    Lp <- L_new[, p, drop=FALSE]
-    C  <- cor(L_ref, Lp)
-    s  <- sign(diag(C)); s[s==0] <- 1
-    score <- mean(abs(diag(C)))
-    if (score > best$score) best <- list(score=score, perm=p, sign=s)
-  }
-  best
-}
-
-align <- best_align_base(L_ref = Lambda_hat, L_new = Lambda_train, perms_list = perms_list)
-
-Lambda_train_aligned <- Lambda_train[, align$perm, drop=FALSE]
-F_train_aligned <- F_train_hat[, align$perm, drop=FALSE]
-
-for (j in 1:r) {
-  if (align$sign[j] < 0) {
-    Lambda_train_aligned[, j] <- -Lambda_train_aligned[, j]
-    F_train_aligned[, j] <- -F_train_aligned[, j]
-  }
-}
-
-# --- (1) Split-sample stability: loading correlations with full-sample loadings
-loading_cor <- sapply(1:r, function(j) cor(Lambda_hat[, j], Lambda_train_aligned[, j]))
-stability_tbl <- data.frame(
-  Factor = paste0("F", 1:r),
-  Loading_Correlation_Train_vs_Full = round(loading_cor, 3)
-)
-knitr::kable(stability_tbl, caption = "Split-sample stability: correlation of loadings (train vs full)")
-
-
-# --- (2) Out-of-sample reconstruction using TRAIN loadings
-# Factor scores for test: projection using train loadings
-F_test_proj <- X_test %*% Lambda_train_aligned
-X_test_hat  <- F_test_proj %*% t(Lambda_train_aligned)
-
-# OOS R2 per variable on test set
-R2_oos <- sapply(1:ncol(X_test), function(i) {
-  y <- X_test[, i]
-  yhat <- X_test_hat[, i]
-  1 - sum((y - yhat)^2) / sum((y - mean(y))^2)
-})
-
-# Compare to in-sample R2 you already computed (R2) on full sample
-oos_summary <- data.frame(
-  Sample = c("In-sample (full)", "Out-of-sample (test)"),
-  Median_R2 = c(median(R2), median(R2_oos)),
-  Mean_R2   = c(mean(R2), mean(R2_oos))
-)
-knitr::kable(oos_summary, digits = 3, caption = "Model fit: in-sample vs out-of-sample R2")
-
-# Plot distribution of OOS R2
-ggplot(data.frame(R2_oos = R2_oos), aes(x = R2_oos)) +
-  geom_histogram(bins = 30, fill = "steelblue", alpha = 0.8) +
-  geom_vline(xintercept = median(R2_oos), linetype = "dashed", color = "red") +
-  labs(title = paste0("Out-of-sample R2 (test set from ", split_date, ")"),
-       x = "R2 (OOS)", y = "count")
-
-```
-
-While explanatory power naturally declines outside the estimation window, the factor model continues to account for a substantial share of variation in the test sample. The median $R^2$ decreases from 0.71 in-sample to 0.56 out-of-sample, indicating that more than half of the variation in a typical survey series remains explainable using factor loadings estimated solely from pre-2016 data.
-
-The distribution of out-of-sample $R^2$ values is right-skewed, with the majority of series exhibiting positive out-of-sample explanatory power and only a small fraction showing negative $R^2$. This pattern indicates that the retained explanatory power is not driven by a few favorable series, but instead reflects a broad-based common structure that remains relevant across industries during the post-2016 period, which includes several major macroeconomic disruptions.
- 
-Overall, the 2016 split demonstrates a clear difference between structurally stable core factors and more fragile components. The strong stability of Factors 1, 2, and 4 supports the interpretation of these factors as genuine, economically meaningful sources of common variation that generalize well beyond the estimation sample. At the same time, the instability of Factors 3 and 5 underscores the limitations of a purely static framework and motivates the use of dynamic factor models with explicit uncertainty quantification to better distinguish persistent signals from transitory fluctuations.
-
-
-### Business-cycle frequency diagnostics
-To assess whether the extracted static PCA factors primarily reflect business-cycle dynamics rather than being driven mechanically by high persistence, we examine their frequency-domain representation. For a weakly stationary time series $x_t$, the spectral density function is defined as the Fourier transform of its autocovariance sequence,
-
-$$f(\omega) = \frac{1}{2\pi} \sum_{k=-\infty}^{\infty} \gamma(k) e^{-i\omega k}, \quad \gamma(k) = \text{Cov}(x_t, x_{t-k}),$$
-and describes how the total variance of the series is distributed across different frequencies ω. Low frequencies correspond to slow-moving, long-horizon fluctuations, while higher frequencies capture more rapid, short-term movements.
-
-Here, the frequency ω represents angular frequency measured in radians, and is related to the cycle length of the underlying oscillations. Specifically, a frequency corresponds to a cycle with period $$T = \frac{2\pi}{\omega},$$
-so that lower values of $\omega$ imply longer cycle lengths, while higher values of $\omega$ correspond to shorter, more rapidly oscillating dynamics. In this representation, purely persistent or trend-like behavior concentrates spectral mass at frequencies close to zero, reflecting fluctuations that evolve only very slowly over time. In contrast, cyclical dynamics imply the existence of a **non-zero dominant frequency $\omega^* > 0$**, such that the spectral density attains a local maximum at $\omega^*$,
-
-$$\exists \omega^* > 0 \quad \text{s.t.} \quad f(\omega^*) > f(\omega) \quad \text{for nearby } \omega.$$
-This distinction is structural: persistence alone raises spectral power at $\omega = 0$, whereas genuine cyclical behavior manifests itself through a concentrated peak at a strictly positive frequency corresponding to a preferred cycle length.
-
-A key distinction in the frequency domain is between high persistence and cyclical behavior. High persistence inevitably leads to elevated spectral power near zero frequency, reflecting slow mean reversion and long memory. However, persistence alone does not generate localized peaks at non-zero frequencies: in the absence of oscillatory dynamics, the spectral density typically declines monotonically as frequency increases. In contrast, business-cycle dynamics are characterized by an accumulation of spectral mass at medium-term frequencies, corresponding to preferred cycle lengths rather than purely trend-like behavior.
-
-
-```{r spectral_density_factors, fig.height=6, fig.width=10, message=FALSE, warning=FALSE}
-# Spectral density diagnostics for PCA factors (Static DFM)
-# Business-cycle band: 24–96 months  ->  freq in [1/96, 1/24] cycles/month
-
-stopifnot(exists("F_hat"), exists("dates"), exists("r"))
-
-freq_lo <- 1/96
-freq_hi <- 1/24
-
-spec_list <- lapply(1:r, function(j) {
-  sp <- spectrum(F_hat[, j], plot = FALSE, method = "pgram", detrend = TRUE)
-  data.frame(
-    factor = paste0("F", j),
-    freq = sp$freq,          # cycles per month (since data are monthly)
-    spec = sp$spec
-  )
-})
-
-spec_df <- do.call(rbind, spec_list)
-
-library(ggplot2)
-
-ggplot(spec_df, aes(x = freq, y = spec)) +
-  geom_line() +
-  geom_vline(xintercept = c(freq_lo, freq_hi), linetype = "dashed", alpha = 0.7) +
-  facet_wrap(~ factor, scales = "free_y", ncol = 1) +
-  labs(
-    title = "Spectral density of static PCA factors",
-    subtitle = "Dashed lines indicate the business-cycle frequency band (24–96 months)",
-    x = "Frequency (cycles per month)",
-    y = "Spectral density"
-  )
-
-```
-
-From a spectral perspective, high persistence alone would generate elevated power near zero frequency but would not produce localized peaks at non-zero frequencies. In contrast, business-cycle dynamics are characterized by pronounced spectral mass concentrated around specific medium-term frequencies. The presence of clear spectral peaks within the 24–96 month band therefore indicates oscillatory behavior at business-cycle horizons, rather than variance driven solely by highly persistent low-frequency movements.
-
-For Factors 1, 2, and 4 in particular, a substantial share of spectral mass is concentrated in this medium-term frequency range, indicating pronounced oscillatory behavior at business-cycle horizons. Factors 3 and 5 exhibit comparatively stronger low-frequency dominance and less sharply defined peaks, suggesting that while business-cycle fluctuations are present, they are mixed with additional low-frequency or sector-specific movements. This pattern is consistent with the weaker stability of these factors in split-sample analyses and their more heterogeneous economic interpretation.
-
-Overall, the spectral evidence indicates that the static PCA factors are not merely aggregations of highly persistent series producing spurious common trends. Rather, they combine slow-moving components with distinct medium-term oscillations that align closely with standard definitions of business-cycle dynamics. The presence of pronounced spectral mass in the 24–96 month band provides direct frequency-domain support for interpreting the leading factors as business-cycle indicators, while also highlighting heterogeneity in the degree to which different factors are dominated by cyclical versus structural variation.
-
----
-
-
-
-```{r bk_bandpass_correlation, message=FALSE, warning=FALSE, include=FALSE}
-## 2) BK band-pass（24–96 Months）
-
-# Baxter–King band-pass filter (24–96 months) + correlation
-
-# BK filter requires mFilter package
-if (!requireNamespace("mFilter", quietly = TRUE)) {
-  stop("Package 'mFilter' is required. Please install it: install.packages('mFilter')")
-}
-
-library(mFilter)
-
-bk_corr <- data.frame(
-  Factor = paste0("F", 1:r),
-  Corr_with_BK_24_96 = NA_real_,
-  Share_NA = NA_real_
-)
-
-bk_series_list <- vector("list", r)
-
-for (j in 1:r) {
-  # bkfilter returns an object with $cycle (band-pass component)
-  # Note: BK drops endpoints -> NAs at beginning/end
-  bk_obj <- mFilter::bkfilter(F_hat[, j], pl = 24, pu = 96, nfix = 12)  # nfix typical choice
-  
-  f_bp <- as.numeric(bk_obj$cycle)
-  f_raw <- as.numeric(F_hat[, j])
-  
-  idx <- which(!is.na(f_bp) & !is.na(f_raw))
-  bk_corr$Corr_with_BK_24_96[j] <- cor(f_raw[idx], f_bp[idx])
-  bk_corr$Share_NA[j] <- mean(is.na(f_bp))
-  
-  bk_series_list[[j]] <- data.frame(
-    date = dates,
-    factor = paste0("F", j),
-    raw = f_raw,
-    bp_24_96 = f_bp
-  )
-}
-
-bk_corr$Corr_with_BK_24_96 <- round(bk_corr$Corr_with_BK_24_96, 3)
-bk_corr$Share_NA <- round(bk_corr$Share_NA, 3)
-
-knitr::kable(
-  bk_corr,
-  caption = "Baxter–King band-pass (24–96 months): correlation between factor and its business-cycle component (endpoints dropped by BK)"
-)
-```
-
-
-
-
-## Summary
+# Summary
 
 **Data**:
 
@@ -753,4 +509,14 @@ knitr::kable(
 - TV-FAVAR analysis
 
 
-
+```{R}
+saveRDS(
+  list(
+    X_std = X_std,
+    F_hat = F_hat,
+    Lambda_hat = Lambda_hat,
+    var_names_filtered = var_names_filtered
+  ),
+  file = "dfm_static_objects.rds"
+)
+```
