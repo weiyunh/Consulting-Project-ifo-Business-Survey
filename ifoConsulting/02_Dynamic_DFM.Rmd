@@ -553,7 +553,28 @@ alpha_smooth <- ks$a_smooth   # T x m
 F_smooth <- alpha_smooth[, 1:r, drop = FALSE]
 colnames(F_smooth) <- paste0("F_smooth", 1:r)
 
+# Uncertainty Quantification (UQ): smoothed factor bands
+# The Kalman smoother also returns the conditional state covariance
+#   P_{t|T} = Var(alpha_t | Y_1,...,Y_T).
+# For the j-th factor, a pointwise (approx.) 95% band is:
+#   \hat F_{t|T,j} \pm 1.96 \sqrt{ (P_{t|T})_{jj} }.
+P_smooth <- ks$P_smooth   # m x m x T
+
+F_var <- sapply(1:r, function(j) P_smooth[j, j, ])
+F_se  <- sqrt(pmax(F_var, 0))
+
+F_lower <- F_smooth - 1.96 * F_se
+F_upper <- F_smooth + 1.96 * F_se
+
+F_uq_df <- data.frame(
+  date  = rep(dates, times = r),
+  factor = rep(paste0("Factor ", 1:r), each = length(dates)),
+  mean  = as.numeric(as.matrix(F_smooth)),
+  lower = as.numeric(as.matrix(F_lower)),
+  upper = as.numeric(as.matrix(F_upper))
+)
 ```
+
 
 
 ```{r}
@@ -668,7 +689,6 @@ legend("bottom",
        lty    = c(lty_static, lty_dynamic),
        lwd    = c(lwd_static, lwd_dynamic),
        bty    = "n", horiz = TRUE, cex = 0.95)
-
 ```
 
 \vspace{-2em}
@@ -681,9 +701,285 @@ However, the distinction becomes clearer in Factors 3 and 4. These factors are m
 
 
 
-**Next steps**:
+we assess the sensitivity of the inferred factors to parameter uncertainty using a parametric bootstrap. Synthetic datasets are generated from the estimated state-space model, and the Kalman smoother is re-applied to each bootstrap sample. The resulting distribution of smoothed factors reflects both state uncertainty and sampling variability stemming from parameter estimation.*
 
-- Introduce time-varying factor loadings or regime-dependent dynamics
-- Analyze impulse responses of the dynamic factors
-- Extend the analysis to deeper industry hierarchy
+
+### Uncertainty Quantification with Parameter Uncertainty (Bootstrap)
+
+Standard Kalman smoothing provides uncertainty bands conditional on the estimated model parameters being treated as known and fixed. However, in finite samples, the parameters $(\Lambda, A, Q, \Psi)$ are themselves estimates with sampling uncertainty. To rigorously quantify the **total uncertainty**, we therefore implement a parametric bootstrap procedure.
+
+Specifically, the bootstrap is centered at the estimated dynamic factor model. In each replication, artificial factor paths are generated from the estimated VAR law of motion using Gaussian innovations drawn from the estimated shock covariance matrix $Q$. Conditional on these simulated factors and the estimated loading matrix $\Lambda$, synthetic observations are constructed by adding idiosyncratic disturbances with variances given by $\Psi$. The dynamic factor model is then fully re-estimated on each bootstrap sample, yielding bootstrap draws of the parameters $(\Lambda^{(b)}, A^{(b)}, Q^{(b)}, \Psi^{(b)})$.
+
+For each bootstrap parameter draw, the Kalman smoother is applied to the original observed data, producing a smoothed factor path $\mathbb{E}(F_t \mid X, \theta^{(b)})$ and the corresponding conditional variance $\text{Var}(F_t \mid X, \theta^{(b)})$. Aggregating across bootstrap replications allows us to decompose the total uncertainty in the factor estimates as:
+
+$$
+\text{Var}(F_t \mid X) \approx \underbrace{\mathbb{E}_{\theta}[\text{Var}(F_t \mid X, \theta)]}_{\text{Filtering Uncertainty}} + \underbrace{\text{Var}_{\theta}(\mathbb{E}[F_t \mid X, \theta])}_{\text{Parameter Uncertainty}},
+$$
+
+
+```{r bootstrap_uq, cache=TRUE, include=FALSE}
+if (!requireNamespace("clue", quietly = TRUE)) install.packages("clue")
+library(clue)
+
+align_factors_to_ref <- function(F_boot, L_boot, F_ref) {
+  # F_boot: T x r
+  # L_boot: N x r
+  # F_ref : T x r (reference factors)
+
+  r <- ncol(F_boot)
+
+  # Correlation matrix between bootstrap factors and reference factors
+  C <- suppressWarnings(cor(F_boot, F_ref, use = "pairwise.complete.obs"))  # r x r
+  C[!is.finite(C)] <- 0  # replace NA/Inf with 0
+
+  # We want to maximize abs(correlation), equivalent to minimizing (1 - abs(correlation)).
+  cost <- 1 - abs(C)
+  cost[!is.finite(cost)] <- 1
+  cost[cost < 0] <- 0  # numeric safety
+
+  # Solve assignment (perm maps rows -> columns)
+  perm <- tryCatch({
+    as.integer(solve_LSAP(cost))  # minimizes cost
+  }, error = function(e) {
+    # Fallback: identity permutation
+    seq_len(r)
+  })
+
+  # Apply permutation
+  F_boot2 <- F_boot[, perm, drop = FALSE]
+  L_boot2 <- L_boot[, perm, drop = FALSE]
+
+  # After permutation, align sign so corr with corresponding ref factor is positive
+  C2 <- suppressWarnings(cor(F_boot2, F_ref, use = "pairwise.complete.obs"))
+  C2[!is.finite(C2)] <- 0
+
+  for (j in seq_len(r)) {
+    if (C2[j, j] < 0) {
+      F_boot2[, j] <- -F_boot2[, j]
+      L_boot2[, j] <- -L_boot2[, j]
+    }
+  }
+
+  list(F = F_boot2, L = L_boot2, perm = perm, C = C, C2 = C2)
+}
+
+
+# Bootstrap Settings
+n_boot <- 100
+set.seed(123)
+
+boot_means <- array(NA_real_, dim = c(T_obs, r, n_boot))  # E[F | X, theta_b]
+boot_vars  <- array(NA_real_, dim = c(T_obs, r, n_boot))  # Var(F | X, theta_b)
+
+Lambda_ref <- Lambda_hat
+F_ref <- F_smooth  
+
+cat("Starting Bootstrap UQ with", n_boot, "replications...\n")
+
+# Bootstrap Loop
+for (b in 1:n_boot) {
+
+  if (b %% 10 == 0) cat("Bootstrap iter:", b, "/", n_boot, "\n")
+
+  # 1) Simulate Factor Path using VAR(2)
+  F_sim <- matrix(0, T_obs, r)
+
+  # Initialize first 2 periods
+  F_sim[1:2, ] <- matrix(rnorm(2 * r), 2, r)
+
+  # Generate innovations u_t ~ N(0, Q)
+  eta_sim <- matrix(rnorm(T_obs * r), T_obs, r) %*% chol(Q)
+
+  for (t in 3:T_obs) {
+    F_sim[t, ] <- (A_array[, , 1] %*% F_sim[t - 1, ]) +
+                  (A_array[, , 2] %*% F_sim[t - 2, ]) +
+                  eta_sim[t, ]
+  }
+
+  # 2) Simulate Data X using Loadings and Idiosyncratic Errors
+  E_sim <- matrix(rnorm(T_obs * N), T_obs, N)
+  E_sim <- sweep(E_sim, 2, sqrt(psi_diag), "*")
+  X_sim <- F_sim %*% t(Lambda_ref) + E_sim
+
+  # 3) Re-estimate Step 1: PCA on Bootstrap Data
+  pca_boot <- prcomp(X_sim, rank. = r, center = FALSE, scale. = FALSE)
+  F_boot_hat <- pca_boot$x         # T x r
+  L_boot_hat <- pca_boot$rotation  # N x r
+
+  # 4) Align Factors to Reference (Permutation + Sign)
+  aligned <- align_factors_to_ref(F_boot_hat, L_boot_hat, F_ref)
+  F_boot_hat <- aligned$F
+  L_boot_hat <- aligned$L
+
+  # 5) Re-estimate Step 2: VAR on Bootstrap Factors
+  var_boot <- vars::VAR(as.data.frame(F_boot_hat), p = p_var, type = "const")
+  B_boot   <- vars::Bcoef(var_boot)
+  B_noC_boot <- B_boot[, colnames(B_boot) != "const", drop = FALSE]
+
+  A_boot <- array(0, dim = c(r, r, p_var))
+  for (lag in 1:p_var) {
+    cols <- ((lag - 1) * r + 1):(lag * r)
+    A_boot[, , lag] <- B_noC_boot[, cols, drop = FALSE]
+  }
+
+  U_boot <- resid(var_boot)
+  Q_boot <- crossprod(as.matrix(U_boot)) / nrow(U_boot)
+  Q_boot <- (Q_boot + t(Q_boot)) / 2
+
+  # 6) Re-estimate Idiosyncratic Variance (Psi_boot)
+  X_fit_boot <- F_boot_hat %*% t(L_boot_hat)
+  E_hat_boot <- X_sim - X_fit_boot
+  psi_boot <- apply(E_hat_boot, 2, var)
+  psi_boot[!is.finite(psi_boot)] <- median(psi_diag, na.rm = TRUE)
+  psi_boot[psi_boot < 1e-8] <- 1e-8
+
+  # 7) Construct State-Space Matrices for Bootstrap Iteration
+  m <- r * p_var
+
+  T_boot <- matrix(0, m, m)
+  for (lag in 1:p_var) {
+    T_boot[1:r, ((lag - 1) * r + 1):(lag * r)] <- A_boot[, , lag]
+  }
+  if (p_var > 1) {
+    T_boot[(r + 1):m, 1:(m - r)] <- diag(m - r)
+  }
+
+  Z_boot <- matrix(0, N, m)
+  Z_boot[, 1:r] <- L_boot_hat
+
+  R_boot <- matrix(0, m, r)
+  R_boot[1:r, 1:r] <- diag(r)
+
+  # 8) Run Kalman Smoother on ORIGINAL DATA with bootstrap parameters
+  ks_boot <- kalman_smoother_missing(
+    Y = Y_kfas,
+    Z = Z_boot, Tmat = T_boot, Rmat = R_boot,
+    Q = Q_boot, Hdiag = psi_boot,
+    a1 = rep(0, m), P1 = diag(10, m)
+  )
+
+  # Store smoothed means and variances
+  boot_means[, , b] <- ks_boot$a_smooth[, 1:r]
+
+  for (j in 1:r) {
+    boot_vars[, j, b] <- ks_boot$P_smooth[j, j, ]
+  }
+}
+
+
+# Aggregate Uncertainty
+param_uncertainty  <- apply(boot_means, c(1, 2), var, na.rm = TRUE)
+filter_uncertainty <- apply(boot_vars,  c(1, 2), mean, na.rm = TRUE)
+
+total_variance <- param_uncertainty + filter_uncertainty
+total_se <- sqrt(pmax(total_variance, 0))
+
+# Center line choice: original dynamic smoother
+F_center <- F_smooth
+
+# Or bootstrap mean (more conservative, often flatter)
+# F_center <- apply(boot_means, c(1, 2), mean, na.rm = TRUE)
+
+F_lower_boot <- F_center - 1.96 * total_se
+F_upper_boot <- F_center + 1.96 * total_se
+
+F_uq_df <- data.frame(
+  date   = rep(dates, times = r),
+  factor = rep(paste0("Factor ", 1:r), each = length(dates)),
+  mean   = as.numeric(F_center),
+  lower  = as.numeric(F_lower_boot),
+  upper  = as.numeric(F_upper_boot)
+)
+
+```
+
+
+```{r, fig.width=10, fig.height=9.5}
+# Re-plot Static vs Dynamic using the Bootstrap Mean as the Dynamic Estimate
+
+factor_titles <- c(
+  "Factor 1: Capital Goods Manufacturing Cycle",
+  "Factor 2: Supply-side Conditions & Productivity Cycle",
+  "Factor 3: Consumer Demand & Price Dynamics",
+  "Factor 4: Global Industrial Demand",
+  "Factor 5: Specialized Manufacturing"
+)
+
+# Setup Colors
+col_static  <- adjustcolor("gray40", alpha.f = 0.6)
+col_dynamic <- adjustcolor("dodgerblue3", alpha.f = 1.0) 
+col_uq      <- adjustcolor("dodgerblue3", alpha.f = 0.2) # Light blue shading
+
+# Setup Layout
+op <- par(no.readonly = TRUE)
+on.exit(par(op), add = TRUE)
+
+par(mfrow = c(r, 1),
+    mar  = c(3, 4, 2, 1),
+    oma  = c(2, 0, 3, 0))
+
+for (j in 1:r) {
+  # Y-axis limits handling total UQ
+  y_rng <- range(F_hat[, j], F_upper_boot[, j], F_lower_boot[, j], na.rm = TRUE)
+  pad   <- 0.1 * diff(y_rng)
+  y_lim <- c(y_rng[1] - pad, y_rng[2] + pad)
+
+  plot(dates, F_hat[, j], type = "n", ylim = y_lim,
+       xlab = "", ylab = paste0("F", j), main = factor_titles[j])
+  
+  # Draw UQ Band (Polygon)
+  polygon(c(dates, rev(dates)), 
+          c(F_upper_boot[, j], rev(F_lower_boot[, j])),
+          col = col_uq, border = NA)
+  
+  abline(h = 0, lty = 3, col = "gray")
+  
+  # Static PCA Line
+  lines(dates, F_hat[, j], col = col_static, lwd = 1.5)
+  
+  lines(dates, F_smooth[, j], col = col_dynamic, lwd = 1.3)
+  
+  # Events
+  abline(v = as.Date(c("2008-09-15",  "2011-08-01", "2020-03-01")), col = "red", lty = 2)
+}
+
+mtext("Comparison: Static PCA vs Dynamic DFM (with Parameter Uncertainty)", 
+      outer = TRUE, font = 2, cex = 1.2)
+
+par(fig = c(0, 1, 0, 1), new = TRUE)
+plot.new()
+legend("bottom", inset = 0.02, horiz = TRUE, bty = "n",
+       legend = c("Static PCA", "Dynamic DFM", "95% Total Uncertainty"),
+       col = c("gray40", "dodgerblue3", NA),
+       lty = c(1, 1, NA), lwd = c(2, 2, NA),
+       fill = c(NA, NA, col_uq), border = NA)
+```
+The shaded areas represent 95% total uncertainty bands around the dynamic factor estimates, accounting jointly for state uncertainty arising from the Kalman smoothing step and parameter uncertainty due to estimation error in the factor loadings, transition dynamics, and shock variances.
+
+The incorporation of parameter uncertainty via the parametric bootstrap confirms the robustness of the identified factors. While the confidence bands naturally widen during periods of macroeconomic stress, most notably during the Global Financial Crisis (2008–2010) and the COVID-19 shock, the core cyclical signal captured by Factor 1 (Capital Goods Manufacturing Cycle) remains tightly estimated across both expansionary and contractionary phases. This relative precision reflects the strong and stable cross-sectional comovement among investment-related industries and survey indicators.
+
+The pronounced widening of the uncertainty bands during crisis reflects a combination of increased measurement uncertainty and more difficult state identification. Survey dispersion rises sharply in these periods, and the cross-industry comovement structure becomes less stable, reducing the informational content of individual observations. At the same time, the Kalman smoother must continuously balance whether observed fluctuations represent persistent common shocks or transitory noise, leading to increased conditional state uncertainty $\text{Var}(F_t \mid X, \theta)$.
+
+
+
+
+
+```{r, echo=FALSE}
+# ---- Save outputs for Section 03 ----
+dir.create("output", showWarnings = FALSE)
+
+saveRDS(
+  list(
+    Y_kfas               = Y_kfas,
+    F_smooth             = F_smooth,
+    Hdiag                = Hdiag,
+    r                    = r,
+    dates                = dates,
+    var_names_filtered   = var_names_filtered,
+    var_metadata_filtered= var_metadata_filtered
+  ),
+  file = "output/dfm_results_02.rds"
+)
+```
+
 
