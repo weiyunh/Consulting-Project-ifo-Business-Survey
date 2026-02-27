@@ -1,0 +1,771 @@
+---
+title: "04.1 Incremental Predictive Power Analysis"
+author: "Weiyun Hong"
+date: "2026-01-03"
+header-includes:
+  - \usepackage{parskip}
+  - \setlength{\parskip}{0.5em}
+output:
+  pdf_document:
+    toc: false
+    latex_engine: xelatex
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: cosmo
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE, 
+  warning = FALSE, 
+  message = FALSE,
+  fig.width = 12, 
+  fig.align = "center"
+)
+```
+
+
+In Section 03, we established that the measurement relationship between observed survey variables and latent factors exhibits significant time variation. The loadings $\lambda_{g,b,t}$ describe how each industry *reflects* the common factor (measurement direction: $F_t \to X_{i,t}$).
+
+This section addresses the reverse question: which industry-block combinations can *predict* future factor movements? This identifies **leading indicators** that provide advance signals of aggregate cycle turning points.
+
+| Aspect | Time-Varying Loadings (03) | Predictive Power (04) |
+|--------|---------------------------|----------------------|
+| Direction | $F_t \to X_{i,t}$ | $\bar{x}_{c,t-\ell} \to F_{j,t}$ |
+| Question | How does industry reflect the cycle? | Which industries act as leading indicators for the factor? |
+| Coefficient | $\lambda$ (loading) | $\beta$ (regression) |
+
+```{r load-packages}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(knitr)
+
+source("ifo_data_processing.R")
+theme_set(theme_minimal())
+```
+
+```{r load-data}
+# Load saved state from Section 03
+dfm_state <- readRDS("output/dfm_results_02.rds")
+dfm_state <- readRDS("output/dfm_state_04.rds")
+
+dates      <- dfm_state$dates
+r          <- dfm_state$r
+F_smooth   <- dfm_state$F_smooth    # T x r
+X_kfas     <- dfm_state$X_kfas      # T x N
+var_map    <- dfm_state$var_map     # N rows
+
+T_obs <- nrow(F_smooth)
+N_obs <- ncol(X_kfas)
+
+# Cell structure
+cells <- sort(unique(var_map$cell_id))
+K <- length(cells)
+
+cell_meta <- data.frame(cell_id = cells, stringsAsFactors = FALSE) |>
+  mutate(
+    industry = sub("_[ABCD]$", "", cell_id),
+    block = sub("^.*_", "", cell_id),
+    n_series = sapply(cell_id, function(c) sum(var_map$cell_id == c))
+  )
+
+cat("Sample: ", as.character(min(dates)), " to ", as.character(max(dates)), 
+    " (T=", T_obs, ", N=", N_obs, ", K=", K, " cells)\n", sep = "")
+```
+
+
+### Candidate Predictor Construction
+
+For cell $c = (g, b)$ containing $n_c$ individual series, the candidate predictor is:
+\begin{equation*}
+\bar{x}_{c,t} = \frac{1}{n_c} \sum_{i \in c} X_{i,t}
+\end{equation*}
+
+This aggregation reduces idiosyncratic noise while preserving cell-specific signals.
+
+```{r construct-cell-averages}
+X_cell <- matrix(NA_real_, nrow = T_obs, ncol = K)
+colnames(X_cell) <- cells
+
+for (k in seq_along(cells)) {
+  idx <- which(var_map$cell_id == cells[k])
+  X_cell[, k] <- if (length(idx) == 1) X_kfas[, idx] else rowMeans(X_kfas[, idx], na.rm = TRUE)
+}
+```
+
+### Granger Causality Test
+
+We test whether cell $c$ provides **incremental predictive power** for factor $F_j$ beyond the factor's own history.
+
+**Restricted Model** (baseline):
+\begin{equation*}
+F_{j,t} = \alpha_0 + \sum_{k=1}^{p} \phi_k F_{j,t-k} + \varepsilon_t^{(R)}
+\end{equation*}
+
+**Unrestricted Model** (adding candidate):
+\begin{equation*}
+F_{j,t} = \alpha_0 + \sum_{k=1}^{p} \phi_k F_{j,t-k} + \sum_{\ell=1}^{q} \beta_\ell \bar{x}_{c,t-\ell} + \varepsilon_t^{(U)}
+\end{equation*}
+
+The null hypothesis $H_0: \beta_1 = \cdots = \beta_q = 0$ is tested via F-statistic:
+\begin{equation*}
+F = \frac{(SSE_R - SSE_U)/q}{SSE_U/(T-p-q-1)} \sim F(q, T-p-q-1)
+\end{equation*}
+
+**Model Fit Measures**: The coefficient of determination $R^2$ quantifies explained variance:
+\begin{align}
+R^2_R &= 1 - \frac{SSE_R}{SST}, \quad \text{(restricted model)} \\
+R^2_U &= 1 - \frac{SSE_U}{SST}, \quad \text{(unrestricted model)}
+\end{align}
+where $SST = \sum_t (F_{j,t} - \bar{F}_j)^2$ is the total sum of squares.
+
+**Incremental $R^2$** measures additional variance explained by the cell's lagged values:
+\begin{equation*}
+\Delta R^2 = R^2_U - R^2_R = \frac{SSE_R - SSE_U}{SST}
+\end{equation*}
+
+Information Gain: A high $\Delta R^2$ indicates that the industry cell provides significant unique information that is not already captured by the factor's own historical price action.
+
+**Sign Interpretation**: The sum $\sum_\ell \beta_\ell$ indicates the direction of the predictive relationship:
+
+- $\sum \beta > 0$: Increases in cell average predict factor increases (procyclical, e.g., business expectations)
+- $\sum \beta < 0$: Cell increases predict factor decreases (countercyclical, e.g., cost pressures, inventorybuildup)
+
+Both types are valid leading indicators. Countercyclical indicators (e.g., inventory buildup, cost pressures) can be equally informative for forecasting.
+
+The autoregressive order is set to $p=2$. The maximum lag length of the candidate predictors is set to $q=5$, allowing for distributed lead effects over a short- to medium-horizon window. 
+
+```{r granger-test-function}
+granger_test_factor <- function(F_j, x_c, p = 2, q = 5) {
+  T_full <- length(F_j)
+  max_lag <- max(p, q)
+  T_eff <- T_full - max_lag
+  
+  y <- F_j[(max_lag + 1):T_full]
+  
+  # Factor lags
+  F_lags <- matrix(NA_real_, nrow = T_eff, ncol = p)
+  for (k in 1:p) F_lags[, k] <- F_j[(max_lag + 1 - k):(T_full - k)]
+  colnames(F_lags) <- paste0("F_lag", 1:p)
+  
+  # Predictor lags
+  x_lags <- matrix(NA_real_, nrow = T_eff, ncol = q)
+  for (ell in 1:q) x_lags[, ell] <- x_c[(max_lag + 1 - ell):(T_full - ell)]
+  colnames(x_lags) <- paste0("x_lag", 1:q)
+  
+  # Models
+  fit_R <- lm(y ~ ., data = data.frame(y = y, F_lags))
+  fit_U <- lm(y ~ ., data = data.frame(y = y, F_lags, x_lags))
+  
+  SSE_R <- sum(residuals(fit_R)^2)
+  SSE_U <- sum(residuals(fit_U)^2)
+  SST <- sum((y - mean(y))^2)
+  
+  # F-test
+  df1 <- q
+  df2 <- T_eff - p - q - 1
+  F_stat <- ((SSE_R - SSE_U) / df1) / (SSE_U / df2)
+  p_value <- pf(F_stat, df1, df2, lower.tail = FALSE)
+  
+  # Coefficients
+  beta_coefs <- coef(fit_U)[grep("^x_lag", names(coef(fit_U)))]
+  
+  # R-squared values
+  R2_R <- summary(fit_R)$r.squared
+  R2_U <- summary(fit_U)$r.squared
+  
+  list(
+    F_stat = F_stat,
+    p_value = p_value,
+    R2_R = R2_R,
+    R2_U = R2_U,
+    delta_R2 = R2_U - R2_R,
+    beta_coefs = beta_coefs,
+    beta_sum = sum(beta_coefs),
+    T_eff = T_eff
+  )
+}
+```
+
+## Full-Sample Analysis
+
+```{r run-granger-tests, cache=TRUE}
+p_lags <- 2
+q_lags <- 5
+
+granger_results <- vector("list", r)
+names(granger_results) <- paste0("Factor_", 1:r)
+
+for (j in 1:r) {
+  results_j <- data.frame(
+    cell_id = cells,
+    industry = cell_meta$industry,
+    block = cell_meta$block,
+    F_stat = NA_real_,
+    p_value = NA_real_,
+    R2_R = NA_real_,
+    R2_U = NA_real_,
+    delta_R2 = NA_real_,
+    beta_sum = NA_real_,
+    stringsAsFactors = FALSE
+  )
+  
+  for (k in seq_along(cells)) {
+    test <- tryCatch(
+      granger_test_factor(F_smooth[, j], X_cell[, k], p = p_lags, q = q_lags),
+      error = function(e) NULL
+    )
+    if (!is.null(test)) {
+      results_j$F_stat[k] <- test$F_stat
+      results_j$p_value[k] <- test$p_value
+      results_j$R2_R[k] <- test$R2_R
+      results_j$R2_U[k] <- test$R2_U
+      results_j$delta_R2[k] <- test$delta_R2
+      results_j$beta_sum[k] <- test$beta_sum
+    }
+  }
+  
+  granger_results[[j]] <- results_j
+}
+```
+
+
+
+### Leading Indicator Selection
+### Benjamini-Hochberg Correction
+
+With `r K` cells tested per factor across `r r` factors, multiple testing correction is essential. After Benjamini-Hochberg (BH) correction, we identify cells with **statistically significant incremental predictive power** (BH-adjusted $p < 0.05$). The primary metric is $\Delta R^2$, which measures how much additional variance in the factor is explained by the cell's lagged values.
+
+```{r bh-correction, include=FALSE}
+# We apply the Benjamini-Hochberg (BH) procedure to control the false discovery rate (FDR) at 5%.
+# Apply BH correction within each factor
+for (j in 1:r) {
+  granger_results[[j]]$p_adj_bh <- p.adjust(granger_results[[j]]$p_value, method = "BH")
+}
+
+# Summary of correction impact
+bh_summary <- lapply(1:r, function(j) {
+  res <- granger_results[[j]]
+  data.frame(
+    Factor = j,
+    Raw_Significant = sum(res$p_value < 0.05, na.rm = TRUE),
+    BH_Significant = sum(res$p_adj_bh < 0.05, na.rm = TRUE)
+  )
+}) |> bind_rows()
+
+bh_summary$Retention_Rate <- round(bh_summary$BH_Significant / bh_summary$Raw_Significant * 100, 1)
+
+kable(bh_summary,
+      col.names = c("Factor", "Raw p < 0.05", "BH-adjusted p < 0.05", "Retention (%)"),
+      caption = "Impact of Benjamini-Hochberg Correction on Significant Indicators")
+```
+
+```{r select-leading-indicators}
+# Summary across factors (using BH-corrected p-values)
+leading_summary <- lapply(1:r, function(j) {
+  res <- granger_results[[j]]
+  sig_mask <- res$p_adj_bh < 0.05
+  n_sig <- sum(sig_mask, na.rm = TRUE)
+  n_pos <- sum(sig_mask & res$beta_sum > 0, na.rm = TRUE)
+  n_neg <- sum(sig_mask & res$beta_sum < 0, na.rm = TRUE)
+  max_dR2 <- max(res$delta_R2[sig_mask], na.rm = TRUE)
+  
+  data.frame(
+    Factor = j,
+    Significant = n_sig,
+    Procyclical = n_pos,
+    Countercyclical = n_neg,
+    Max_Delta_R2 = ifelse(is.finite(max_dR2), max_dR2 * 100, NA)
+  )
+}) |> bind_rows()
+
+kable(leading_summary, 
+      col.names = c("Factor", "Significant (BH)", "Σβ > 0", "Σβ < 0", "Max ΔR² (%)"),
+      digits = c(0, 0, 0, 0, 3),
+      caption = "Leading Indicator Summary by Factor (BH-corrected p < 0.05)")
+```
+
+
+Factor 2 shows mostly countercyclical relationships (79 significant indicators have $\sum\beta < 0$). This suggests Factor 2 captures a dimension that moves inversely to industry-level improvements, potentially reflecting cost pressures or capacity constraints.
+
+
+\newpage
+
+### Top Leading Indicators by Factor
+
+```{r top-indicators-table}
+# Top 5 per factor by delta_R2
+top_indicators <- lapply(1:r, function(j) {
+  res <- granger_results[[j]] |>
+    filter(p_value < 0.05) |>
+    arrange(desc(delta_R2)) |>
+    slice_head(n = 5)
+  
+  if (nrow(res) > 0) {
+    res$factor <- j
+    res$industry_name <- as.character(sapply(res$industry, function(x) 
+      tryCatch(get_industry_name_en(x), error = function(e) as.character(x))))
+    res
+  } else {
+    NULL
+  }
+}) |> bind_rows()
+
+# Create the formatted table
+top_indicators |>
+  dplyr::select(factor, industry_name, block, delta_R2, p_value, beta_sum) |>
+  mutate(
+    delta_R2 = paste0(round(delta_R2 * 100, 3), "%"),
+    p_value = format.pval(p_value, digits = 2),
+    beta_sum = round(beta_sum, 3)
+  ) |>
+  kable(
+    col.names = c("Factor", "Industry", "Block", "ΔR²", "p-value", "ΣB"),
+    caption = "Top 5 Leading Indicators per Factor (by Incremental R²)"
+  )
+```
+
+
+### Block-Level Predictive Power
+
+```{r block-analysis, out.width = "100%"}
+# Aggregate by block (no sign filter)
+all_results <- bind_rows(lapply(1:r, function(j) {
+  granger_results[[j]] |> mutate(factor = paste0("Factor ", j))
+}))
+
+block_summary <- all_results |>
+  filter(p_value < 0.05) |>
+  group_by(factor, block) |>
+  summarise(
+    n_valid = n(),
+    mean_delta_R2 = mean(delta_R2, na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+ggplot(block_summary, aes(x = block, y = mean_delta_R2, fill = block)) +
+  geom_col(alpha = 0.85) +
+  geom_text(aes(label = paste0("n=", n_valid)), vjust = -0.3, size = 3) +
+  facet_wrap(~ factor, nrow = 1) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Mean Predictive Power by Question Block",
+    subtitle = "Significant indicators only (p<0.05) | Labels show count",
+    x = "Question Block", y = "Mean ΔR² (%)"
+  ) +
+  theme(legend.position = "none")
+```
+
+
+
+Block D (month-on-month changes) exhibit the highest average incremental predictive power across all factors, showing their central role in capturing short-horizon dynamics. Expectations (Block B) also provide meaningful forward-looking information. Current assessments (Block A) and price indicators (Block C) display weaker incremental contributions, suggesting that their information content is largely contemporaneous once factor persistence is accounted for. 
+
+
+
+
+```{r top-indicators-plot, out.width = "100%", fig.height=9}
+if (nrow(top_indicators) > 0) {
+  top_indicators |>
+    mutate(
+      label = paste0(industry_name, " (", block, ")"),
+      sign_label = ifelse(beta_sum > 0, "+", "−")
+    ) |>
+    ggplot(aes(x = reorder(label, delta_R2), y = delta_R2 * 100, fill = block)) +
+    geom_col(alpha = 0.85) +
+    geom_text(aes(label = paste0(round(delta_R2 * 100, 2), "% ", sign_label)), 
+              hjust = -0.1, size = 3) +
+    coord_flip(clip = "off") +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.2))) +
+    facet_wrap(~ paste("Factor", factor), scales = "free", ncol = 2) +
+    scale_fill_brewer(palette = "Set2") +
+    labs(
+      title = "Top Leading Indicators by Factor",
+      subtitle = "Ranked by ΔR² | Sign (+/−) indicates direction of predictive relationship",
+      x = NULL, y = "Incremental R² (%)", fill = "Block"
+    ) +
+    theme(legend.position = "bottom", strip.text = element_text(face = "bold"))
+}
+```
+
+
+
+## Rolling Window Analysis: Time-Varying Predictive Power
+
+The full-sample analysis assumes stable predictive relationships. We now examine whether predictive power varies over the business cycle using rolling 60-month windows.
+
+```{r rolling-function}
+rolling_granger_test <- function(F_j, x_c, dates, window_width = 60, p = 2, q = 5) {
+  T_full <- length(F_j)
+  start_idx <- window_width + max(p, q)
+  
+  if (start_idx >= T_full) return(NULL)
+  
+  results <- data.frame(
+    date = dates[start_idx:T_full],
+    delta_R2 = NA_real_,
+    beta_sum = NA_real_
+  )
+  
+  for (t in start_idx:T_full) {
+    window_idx <- (t - window_width + 1):t
+    test <- tryCatch(
+      granger_test_factor(F_j[window_idx], x_c[window_idx], p = p, q = q),
+      error = function(e) NULL
+    )
+    row_idx <- t - start_idx + 1
+    if (!is.null(test)) {
+      results$delta_R2[row_idx] <- test$delta_R2
+      results$beta_sum[row_idx] <- test$beta_sum
+    }
+  }
+  results
+}
+```
+
+```{r rolling-analysis-all-factors, fig.height=17, out.width = "100%"}
+event_dates  <- as.Date(c("2008-09-01", "2011-08-01", "2020-03-01"))
+event_labels <- c("2008", "2011", "2020")
+
+# Create rolling analysis plots for ALL 5 factors
+rolling_plots <- list()
+
+for (fac in 1:r) {
+  # Get top 5 indicators for this factor
+  top5_fac <- granger_results[[paste0("Factor_", fac)]] |>
+    filter(p_value < 0.05) |>
+    arrange(desc(delta_R2)) |>
+    slice_head(n = 5) |>
+    pull(cell_id)
+  
+  if (length(top5_fac) > 0) {
+    rolling_results_fac <- lapply(top5_fac, function(c_id) {
+      k <- which(cells == c_id)
+      res <- rolling_granger_test(F_smooth[, fac], X_cell[, k], dates, window_width = 60)
+      if (!is.null(res)) {
+        res$cell_id <- c_id
+        res$industry <- cell_meta$industry[cell_meta$cell_id == c_id]
+        res$block <- cell_meta$block[cell_meta$cell_id == c_id]
+      }
+      res
+    }) |> bind_rows()
+    
+    if (nrow(rolling_results_fac) > 0) {
+      rolling_df_fac <- rolling_results_fac |>
+        mutate(
+          industry_name = as.character(sapply(industry, function(x) 
+            tryCatch(get_industry_name_en(x), error = function(e) as.character(x)))),
+          label = paste0(industry_name, " (", block, ")")
+        )
+      
+      p_fac <- ggplot(rolling_df_fac, aes(x = date, y = delta_R2 * 100, color = label)) +
+        geom_line(linewidth = 0.9, alpha = 0.8) +
+        geom_hline(yintercept = 0, linetype = 3, color = "gray50") +
+        # event dashed lines + labels
+        geom_vline(xintercept = event_dates, linetype = "dashed", color = "red", linewidth = 0.6) + 
+            annotate(
+            "text", x = event_dates, y = max(rolling_df_fac$delta_R2 * 100, na.rm = TRUE),
+             label = event_labels, angle = 90, vjust = -0.3, hjust = 0, color = "red", size = 2) +
+        coord_cartesian(clip = "off") +
+        scale_color_viridis_d(option = "turbo") +
+        labs(
+          title = paste0("Factor ", fac),
+          x = NULL, y = "ΔR² (%)", color = "Predictor"
+        ) +
+        theme(legend.position = "bottom", legend.text = element_text(size = 7)) +
+        guides(color = guide_legend(ncol = 2))
+      
+      rolling_plots[[fac]] <- p_fac
+    }
+  }
+}
+
+# Combine all plots
+if (length(rolling_plots) > 0) {
+  library(patchwork)
+  combined_plot <- wrap_plots(rolling_plots, ncol = 1) +
+    plot_annotation(
+      title = "Time-Varying Predictive Power by Factor",
+      subtitle = "Rolling 60-month window | Top 5 leading indicators"
+    )
+  print(combined_plot)
+}
+```
+
+Predictive power is not constant over time, it spikes around turning points and recessions.
+
+### Composite Leading Indicator
+
+We construct a composite leading indicator using the top 3 predictors weighted by $\Delta R^2$. The sign of each component's contribution is determined by its $\sum \beta$:
+
+```{r composite-indicator}
+# Select top 3 predictors for Factor 1 (no sign filter)
+top3_F1 <- granger_results[["Factor_1"]] |>
+  filter(p_value < 0.05) |>
+  arrange(desc(delta_R2)) |>
+  slice_head(n = 3)
+
+if (nrow(top3_F1) >= 1) {
+  # Weight by delta_R2
+  weights <- top3_F1$delta_R2 / sum(top3_F1$delta_R2)
+  # Sign adjustment: if beta_sum < 0, flip the contribution
+  signs <- sign(top3_F1$beta_sum)
+  
+  leading_indicator_F1 <- rep(0, T_obs)
+  for (i in 1:nrow(top3_F1)) {
+    k <- which(cells == top3_F1$cell_id[i])
+    # Multiply by sign so that increases in composite always predict factor increases
+    leading_indicator_F1 <- leading_indicator_F1 + weights[i] * signs[i] * X_cell[, k]
+  }
+  leading_indicator_F1 <- scale(leading_indicator_F1)[, 1]
+  
+  cat("Composite Leading Indicator Components:\n")
+  for (i in 1:nrow(top3_F1)) {
+    ind_name <- tryCatch(get_industry_name_en(top3_F1$industry[i]), 
+                         error = function(e) top3_F1$industry[i])
+    sign_str <- ifelse(signs[i] > 0, "+", "−")
+    cat("  ", sign_str, " ", ind_name, " (", top3_F1$block[i], "): ", 
+        round(weights[i] * 100, 1), "%\n", sep = "")
+  }
+}
+```
+
+```{r plot-composite, fig.height=5, out.width = "100%"}
+if (exists("leading_indicator_F1")) {
+  plot_df <- data.frame(
+    date = dates,
+    Factor_1 = scale(F_smooth[, 1])[, 1],
+    Leading_Indicator = leading_indicator_F1
+  ) |>
+    pivot_longer(cols = -date, names_to = "series", values_to = "value")
+  
+  ggplot(plot_df, aes(x = date, y = value, color = series)) +
+    geom_line(linewidth = 1, alpha = 0.85) +
+    geom_hline(yintercept = 0, linetype = 3, color = "gray50") +
+    # event dashed lines + labels
+    geom_vline(xintercept = event_dates, linetype = "dashed", color = "red", linewidth = 0.6) +
+    annotate(
+       "text",
+        x = event_dates,
+        y = max(plot_df$value, na.rm = TRUE),
+        label = event_labels,
+        angle = 90,
+        vjust = -0.3,
+        hjust = 0,
+        color = "red",
+        size = 3
+      ) +
+  coord_cartesian(clip = "off") +
+  theme(plot.margin = margin(5.5, 20, 5.5, 5.5))+
+    scale_color_manual(
+      values = c("Factor_1" = "steelblue", "Leading_Indicator" = "darkorange"),
+      labels = c("Factor 1 (Capital Goods)", "Composite Leading Indicator")
+    ) +
+    labs(
+      title = "Factor 1 vs Composite Leading Indicator",
+      x = NULL, y = "Standardized value", color = NULL
+    ) +
+    theme(legend.position = "bottom")
+}
+```
+
+
+The composite indicator systematically leads major downturns in the factor, with pronounced declines preceding the 2008–2009 financial crisis, the European debt crisis, and the COVID-19 shock. It captures early stress signals that are not yet reflected in the latent factor itself. This makes the indicator particularly suitable for driving time-varying regime transition probabilities in the subsequent regime-switching framework.
+
+
+
+
+
+## Implications for Regime-Switching Models
+
+We consider following transition probability specification in which regime changes depend on lagged leading signals. The signals are summarized by a composite leading indicator $z_{t-1}$, constructed as a weighted combination of the top 10 industry–block predictors ranked by incremental $R^2$. 
+
+\begin{equation*}
+P(s_t = 1 | s_{t-1}, z_{t-1}) = \Phi(\gamma_0 + \gamma_1 z_{t-1})
+\end{equation*}
+
+where the latent state variable $s_t \in \{0,1\}$ indicates the current business cycle regime, and $\Phi(\cdot)$ is the standard normal CDF. When leading indicators deteriorate, the probability of transitioning to recession regime increases.
+
+
+
+```{r save-results}
+# Save for Section 05
+predictive_power_results <- list(
+  created_at = Sys.time(),
+  granger_results = granger_results,
+  X_cell = X_cell,
+  cells = cells,
+  cell_meta = cell_meta,
+  leading_indicator_F1 = if (exists("leading_indicator_F1")) leading_indicator_F1 else NULL,
+  top_indicators = top_indicators
+)
+
+saveRDS(predictive_power_results, file = "output/predictive_power_04.rds")
+#$P(s_t=1\mid s_{t-1}, \mathbf{x}_{t-1})=\Phi\big(\gamma_0+\boldsymbol{\gamma}'\mathbf{x}_{t-1}\big)$
+```
+
+
+
+
+
+
+\newpage
+
+
+
+### Appendix
+
+```{r}
+top_k <- 10     
+alpha_sig <- 0.05
+
+leading_indicator <- vector("list", length = 5)
+names(leading_indicator) <- paste0("Factor_", 1:5)
+
+top_predictors <- vector("list", length = 5)
+names(top_predictors) <- paste0("Factor_", 1:5)
+
+for (j in 1:5) {
+
+  key <- paste0("Factor_", j)
+
+  dfj <- granger_results[[key]] |>
+    filter(p_value < alpha_sig) |>
+    arrange(desc(delta_R2)) |>
+    slice_head(n = top_k)
+
+  top_predictors[[key]] <- dfj
+
+  if (nrow(dfj) >= 1) {
+
+    # weights by delta_R2
+    weights <- dfj$delta_R2 / sum(dfj$delta_R2)
+
+    # sign adjustment: ensure increases in composite predict factor increases
+    signs <- sign(dfj$beta_sum)
+    signs[signs == 0] <- 1  
+
+    z <- rep(0, T_obs)
+
+    for (i in seq_len(nrow(dfj))) {
+      k <- which(cells == dfj$cell_id[i])
+      if (length(k) != 1) next  
+      z <- z + weights[i] * signs[i] * X_cell[, k]
+    }
+
+    leading_indicator[[key]] <- scale(z)[, 1]
+
+    cat("\n## Composite Leading Indicator Components for ", key, ":\n", sep = "")
+    for (i in seq_len(nrow(dfj))) {
+      ind_name <- tryCatch(
+        get_industry_name_en(dfj$industry[i]),
+        error = function(e) dfj$industry[i]
+      )
+      sign_str <- ifelse(signs[i] > 0, "+", "−")
+      cat("  ", sign_str, " ", ind_name, " (", dfj$block[i], "): ",
+          round(weights[i] * 100, 1), "%\n", sep = "")
+    }
+
+  } else {
+    leading_indicator[[key]] <- rep(NA_real_, T_obs)
+    cat("\n## ", key, ": no significant predictors at alpha = ", alpha_sig, "\n", sep = "")
+  }
+}
+
+leading_indicator_F1 <- leading_indicator[["Factor_1"]]
+leading_indicator_F2 <- leading_indicator[["Factor_2"]]
+leading_indicator_F3 <- leading_indicator[["Factor_3"]]
+leading_indicator_F4 <- leading_indicator[["Factor_4"]]
+leading_indicator_F5 <- leading_indicator[["Factor_5"]]
+
+```
+
+```{r plot-composite-all, fig.height=9, out.width="100%"}
+library(patchwork)
+
+plot_one_factor <- function(factor_j,
+                            F_smooth, dates,
+                            leading_indicator,
+                            event_dates, event_labels) {
+
+  key <- paste0("Factor_", factor_j)
+
+  # leading_indicator: list (recommended) or fall back to leading_indicator_Fj
+  z <- NULL
+  if (is.list(leading_indicator) && !is.null(leading_indicator[[key]])) {
+    z <- leading_indicator[[key]]
+  } else {
+    varname <- paste0("leading_indicator_F", factor_j)
+    if (exists(varname, inherits = TRUE)) {
+      z <- get(varname, inherits = TRUE)
+    }
+  }
+
+  if (is.null(z) || all(is.na(z))) {
+    message("Skip ", key, ": leading indicator not found or all NA.")
+    return(NULL)
+  }
+
+  plot_df <- data.frame(
+    date = dates,
+    Factor = scale(F_smooth[, factor_j])[, 1],
+    Leading_Indicator = as.numeric(z)
+  ) |>
+    pivot_longer(cols = -date, names_to = "series", values_to = "value")
+
+  ggplot(plot_df, aes(x = date, y = value, color = series)) +
+    geom_line(linewidth = 1, alpha = 0.85) +
+    geom_hline(yintercept = 0, linetype = 3, color = "gray50") +
+    geom_vline(xintercept = event_dates, linetype = "dashed",
+               color = "red", linewidth = 0.6) +
+    annotate(
+      "text",
+      x = event_dates,
+      y = max(plot_df$value, na.rm = TRUE),
+      label = event_labels,
+      angle = 90,
+      vjust = -0.3,
+      hjust = 0,
+      color = "red",
+      size = 3
+    ) +
+    coord_cartesian(clip = "off") +
+    theme(plot.margin = margin(5.5, 20, 5.5, 5.5)) +
+    scale_color_manual(
+      values = c("Factor" = "steelblue", "Leading_Indicator" = "darkorange"),
+      labels = c(paste0("Factor ", factor_j), "Composite Leading Indicator")
+    ) +
+    labs(
+      title = paste0("Factor ", factor_j, " vs Composite Leading Indicator"),
+      x = NULL, y = "Standardized value", color = NULL
+    ) +
+    theme(legend.position = "bottom")
+}
+
+# generate 5 plots
+plots <- lapply(1:5, function(j) {
+  plot_one_factor(
+    factor_j = j,
+    F_smooth = F_smooth,
+    dates = dates,
+    leading_indicator = leading_indicator,  
+    event_dates = event_dates,
+    event_labels = event_labels
+  )
+})
+
+# drop NULLs (in case some are missing)
+plots <- Filter(Negate(is.null), plots)
+
+wrap_plots(plots, ncol = 2)
+```
+
+
+
+
+
+
+

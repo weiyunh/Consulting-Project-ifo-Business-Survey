@@ -1,0 +1,845 @@
+---
+title: "06 Factor-Augmented VAR: Out-of-Sample Forecasting Evaluation"
+header-includes:
+- \usepackage{parskip}
+- \setlength{\parskip}{0.5em}
+- \usepackage{amsmath}
+- \usepackage{booktabs}
+- \usepackage{float}
+output:
+  pdf_document:
+    toc: false
+    latex_engine: xelatex
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: cosmo
+    code_folding: show
+  word_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 6, fig.pos = "H")
+options(knitr.table.format = "latex")
+```
+
+
+We construct a Factor-Augmented Vector Autoregression (FAVAR) to predict the aggregate manufacturing Business Climate Index ($\text{KLD}_{t}$, industry code \texttt{C0000000}). 
+
+We evaluate the FAVAR against a hierarchy of benchmarks to determine whether
+
+(i) any predictability exists beyond a random walk,
+(ii) the extracted factors provide incremental forecasting gains over a pure AR benchmark, given that $\text{KLD}_{t}$ is constructed from only two survey dimensions (current situation and expectations),
+(iii) such gains (if present) are stable across horizons and regimes or concentrated in specific episodes.
+
+To assess robustness, we consider multiple training/evaluation splits.
+
+```{r packages, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(zoo)
+library(knitr)
+library(kableExtra)
+library(patchwork)
+
+source("ifo_data_processing.R")
+theme_set(theme_minimal())
+```
+
+
+## Model Specification
+
+### FAVAR Forecasting Equation
+
+The direct $h$-step-ahead forecasting regression takes the form:
+\begin{equation}
+y_{t+h} = \alpha^{(h)} + \sum_{k=1}^{p} \beta_k^{(h)} \, y_{t+1-k}
+          + \sum_{k=1}^{q} \gamma_k^{(h)\prime} \hat{F}_{t+1-k}
+          + \varepsilon_{t+h}^{(h)},
+\label{eq:favar}
+\end{equation}
+
+where $y_t \equiv \text{KLD}_t$ denotes the aggregate manufacturing Business Climate Index (\texttt{C0000000\_KLD}), $\hat{F}_t = (\hat{F}_{1,t},\ldots,\hat{F}_{r,t})'$ is the $r \times 1$ vector of estimated common factors, $p=2$ is the AR lag order, and $q$ is the factor lag order. We consider both $q=p=2$ (full FAVAR) and $q=1$ (parsimonious FAVAR).
+
+Rather than iterating a one-step-ahead VAR forward, we estimate separate projection regressions for each horizon $h \in \{1, 3, 6, 12\}$, avoiding the compounding of one-step-ahead estimation errors.
+
+The factors entering Equation\eqref{eq:favar} are principal components $\hat{F}_t$ estimated by static PCA on the standardised panel $X_{1:t}$, conditioning only on information available up to time $t$. Static PCA is retained here for computational tractability in recursive estimation, as re-estimating and smoothing a state-space model would substantially increase computational cost and introduce additional tuning choices. Consequently, the results should be interpreted as evidence on whether cross-sectional information in the survey panel adds incremental forecasting value beyond AR.
+
+
+### Benchmark Models
+
+We compare the FAVAR against the following benchmarks:
+
+\begin{center}
+\begin{tabular}{llc}
+\toprule
+\textbf{Model} & \textbf{Specification} & \textbf{Params} \\
+\midrule
+Random Walk (RW)
+  & $\hat{y}_{t+h|t} = y_t$ & 0 \\[3pt]
+AR($p$)
+  & $y_{t+h} = \alpha + \sum_{k=1}^{p} \beta_k \, y_{t+1-k} + \varepsilon_{t+h}$
+  & 3 \\[3pt]
+AR + F1
+  & AR($p$) augmented with $q=1$ lag of Factor~1
+  & 4 \\[3pt]
+FAVAR-P
+  & AR($p$) + $q=1$ lag of all $r=5$ factors (parsimonious)
+  & 8 \\[3pt]
+FAVAR
+  & AR($p$) + $q=2$ lags of all $r=5$ factors (full)
+  & 13 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+With an initial training window of approximately 126 months (1997:07--2007:12), the usable sample at $h = 12$ declines to roughly 114--120 observations, depending on lag structure. 
+The full FAVAR specification with 13 parameters implies that the model may be susceptible to overfitting in a limited sample.
+
+By contrast, the parsimonious FAVAR-P specification retains only 8 parameters. This reduction in dimensionality lowers estimation variance while preserving most of the relevant forecasting signal.
+
+## Evaluation Metrics
+
+For each model $m$ and horizon $h$, let
+$e_{t+h|t}^{(m)} = y_{t+h} - \hat{y}_{t+h|t}^{(m)}$
+denote the forecast error. We report:
+
+\vspace{0.5em}
+
+\textbf{Root Mean Squared Forecast Error (RMSFE):}
+$$\text{RMSFE}^{(m)}_h = \sqrt{\frac{1}{P} \sum_{t=t_0}^{t_0+P-1}
+  \left(e_{t+h|t}^{(m)}\right)^2}$$
+where $P$ is the number of evaluation periods.
+
+\vspace{1em}
+
+\textbf{Relative RMSFE:}
+$\text{RMSFE}^{(m)}_h / \text{RMSFE}^{(\text{RW})}_h$; values below 1 indicate
+improvement over the random walk.
+
+\vspace{1em}
+
+\textbf{Out-of-sample $R^2$:}
+$$R^2_{\text{OOS},h} = 1 - \frac{\sum_t (e_{t+h|t}^{(m)})^2}
+                              {\sum_t (e_{t+h|t}^{(\text{RW})})^2}$$
+Positive values indicate that model $m$ outperforms the random walk.
+
+\vspace{1em}
+
+\textbf{Diebold--Mariano test:}
+$$\text{DM} = \frac{\bar{d}}{\hat{\sigma}_d / \sqrt{P}},
+\quad d_t = (e_{t}^{(A)})^2 - (e_{t}^{(B)})^2$$
+with HAC-robust standard errors (Newey--West, bandwidth $= \lfloor h^{1/3} \rfloor$).
+A significantly negative DM statistic indicates that model A produces smaller squared
+errors than model B.
+
+\vspace{1em}
+
+\textbf{Cumulative Sum of Squared Forecast Error Differences (CSSED):}
+$$\text{CSSED}_t = \sum_{\tau=t_0}^{t}
+  \left[(e_{\tau}^{(\text{AR})})^2 - (e_{\tau}^{(m)})^2\right]$$
+An upward-sloping CSSED indicates periods where model $m$ outperforms the AR benchmark.
+
+
+\vspace{1em}
+
+## Data Preparation
+
+```{r load-data, results='asis'}
+data_wide <- read_csv("data_b_wide.csv", show_col_types = FALSE)
+dates     <- as.Date(data_wide$date)
+var_names <- colnames(data_wide)[-1]
+
+y_all <- data_wide$C0000000_KLD
+```
+
+
+```{r prepare-panel, results='asis'}
+var_metadata <- data.frame(
+  var_name      = var_names,
+  industry_code = sapply(var_names, extract_industry_code),
+  stringsAsFactors = FALSE
+)
+var_metadata$level <- sapply(var_metadata$industry_code, get_level)
+
+keep_vars <- var_metadata$level == 1
+X_raw_full <- as.matrix(data_wide[, c(FALSE, keep_vars)])
+vnames     <- var_names[keep_vars]
+
+kld_idx    <- grepl("_KLD$", vnames)
+X_raw_full <- X_raw_full[, !kld_idx]
+vnames     <- vnames[!kld_idx]
+
+pharma_idx <- grepl("^C2100000_", vnames)
+X_raw_full <- X_raw_full[, !pharma_idx]
+vnames     <- vnames[!pharma_idx]
+```
+
+The dataset comprises `r nrow(data_wide)` months (`r format(min(dates))` to `r format(max(dates))`) with `r ncol(X_raw_full)` variables in the factor extraction panel (21 industries $\times$ 14 questions = 294 cells, excluding KLD and Pharmaceuticals).
+The target variable is the aggregate manufacturing Business Climate Index (C0000000\_KLD), with mean `r round(mean(y_all, na.rm=TRUE), 1)` and SD `r round(sd(y_all, na.rm=TRUE), 1)`.
+
+
+## Recursive Out-of-Sample Estimation
+
+The evaluation window starts at 2008:01, providing an initial training sample of approximately 126 months (1997:07--2007:12). At each subsequent month $t$, the entire estimation pipeline is re-run using only data available up to $t$.
+
+```{r Helper function}
+# Helper function: build direct h-step regression matrix
+# s ranges from s_min to s_max; Y = y_{s+h}, X = [1, y_{s}, y_{s-1}, ..., F_{s}, F_{s-1}, ...]
+build_direct_reg <- function(y_t, F_mat, h, p_ar, p_fac, T_t) {
+  # p_fac: number of lags for factors
+  s_min <- max(p_ar, p_fac)
+  s_max <- T_t - h
+  if (s_max <= s_min + 2) return(NULL)
+
+  n_obs <- s_max - s_min + 1
+  Y_h   <- y_t[(s_min + h):(s_max + h)]
+
+  r_fac <- if (!is.null(F_mat)) ncol(F_mat) else 0
+  n_reg <- 1 + p_ar + p_fac * r_fac
+  X_h   <- matrix(NA_real_, n_obs, n_reg)
+  X_h[, 1] <- 1
+  for (k in 1:p_ar) {
+    X_h[, 1 + k] <- y_t[(s_min + 1 - k):(s_max + 1 - k)]
+  }
+  if (r_fac > 0 && p_fac > 0) {
+    for (k in 1:p_fac) {
+      for (j in 1:r_fac) {
+        col_idx <- 1 + p_ar + (k - 1) * r_fac + j
+        X_h[, col_idx] <- F_mat[(s_min + 1 - k):(s_max + 1 - k), j]
+      }
+    }
+  }
+  list(Y = Y_h, X = X_h, n_reg = n_reg)
+}
+
+# Build prediction vector for time T_t
+build_xnew <- function(y_t, F_mat, p_ar, p_fac, T_t) {
+  r_fac <- if (!is.null(F_mat)) ncol(F_mat) else 0
+  n_reg <- 1 + p_ar + p_fac * r_fac
+  x_new <- numeric(n_reg)
+  x_new[1] <- 1
+  for (k in 1:p_ar) x_new[1 + k] <- y_t[T_t + 1 - k]
+  if (r_fac > 0 && p_fac > 0) {
+    for (k in 1:p_fac) {
+      for (j in 1:r_fac) {
+        x_new[1 + p_ar + (k - 1) * r_fac + j] <- F_mat[T_t + 1 - k, j]
+      }
+    }
+  }
+  x_new
+}
+```
+
+
+
+```{r run-oos-fn}
+# Main recursive OOS evaluation function
+run_oos_evaluation <- function(eval_start_date, X_raw_full, y_all, dates,
+                                r = 5, p_ar = 2,
+                                horizons = c(1, 3, 6, 12)) {
+
+  T_total  <- length(dates)
+  max_h    <- max(horizons)
+  eval_idx <- which(dates >= eval_start_date)
+  eval_idx <- eval_idx[eval_idx + max_h <= T_total]
+  n_eval   <- length(eval_idx)
+  if (n_eval < 10) return(NULL)
+
+  # Models: RW, AR, AR_F1(q=1), FAVAR_P(q=1), FAVAR(q=2)
+  model_names <- c("RW", "AR", "AR_F1", "FAVAR_P", "FAVAR")
+  n_models    <- length(model_names)
+  n_horizons  <- length(horizons)
+
+  fcst   <- array(NA_real_, dim = c(n_eval, n_horizons, n_models),
+                  dimnames = list(NULL, paste0("h", horizons), model_names))
+  actual <- matrix(NA_real_, nrow = n_eval, ncol = n_horizons,
+                   dimnames = list(NULL, paste0("h", horizons)))
+
+  exp_start <- as.Date("2005-01-01")
+  exp_end   <- as.Date("2007-12-01")
+
+  for (i in seq_len(n_eval)) {
+    t_origin <- eval_idx[i]
+    X_t      <- X_raw_full[1:t_origin, ]
+    y_t      <- y_all[1:t_origin]
+    dates_t  <- dates[1:t_origin]
+    T_t      <- length(y_t)
+
+    for (hi in seq_along(horizons)) {
+      actual[i, hi] <- y_all[t_origin + horizons[hi]]
+    }
+
+    # (1) Random Walk
+    for (hi in seq_along(horizons)) fcst[i, hi, "RW"] <- y_t[T_t]
+
+    # (2) AR(p) - direct h-step
+    if (T_t > p_ar + max_h) {
+      for (hi in seq_along(horizons)) {
+        h   <- horizons[hi]
+        reg <- build_direct_reg(y_t, NULL, h, p_ar, 0, T_t)
+        if (is.null(reg)) next
+        valid <- complete.cases(reg$Y, reg$X)
+        if (sum(valid) > reg$n_reg + 2) {
+          fit <- lm.fit(reg$X[valid, , drop=FALSE], reg$Y[valid])
+          x_new <- build_xnew(y_t, NULL, p_ar, 0, T_t)
+          fcst[i, hi, "AR"] <- sum(fit$coefficients * x_new)
+        }
+      }
+    }
+
+    # Factor extraction: recursive PCA
+    X_filled_t <- apply(X_t, 2, function(x) {
+      if (all(is.na(x))) return(x); zoo::na.approx(x, rule = 2)
+    })
+    mu_t <- colMeans(X_filled_t, na.rm = TRUE)
+    sd_t <- apply(X_filled_t, 2, sd, na.rm = TRUE)
+    sd_t[sd_t < 1e-10 | is.na(sd_t)] <- 1
+    X_std_t <- sweep(sweep(X_filled_t, 2, mu_t, "-"), 2, sd_t, "/")
+
+    valid_cols <- apply(X_std_t, 2, function(x) all(is.finite(x)) && sd(x) > 1e-10)
+    X_std_t    <- X_std_t[, valid_cols, drop = FALSE]
+
+    pca_t   <- prcomp(X_std_t, rank. = r, center = FALSE, scale. = FALSE)
+    F_pca_t <- pca_t$x
+
+    exp_idx_t <- dates_t >= exp_start & dates_t <= exp_end
+    if (sum(exp_idx_t) > 0) {
+      for (j in 1:r) {
+        if (mean(F_pca_t[exp_idx_t, j], na.rm = TRUE) < 0) {
+          F_pca_t[, j] <- -F_pca_t[, j]
+        }
+      }
+    }
+    colnames(F_pca_t) <- paste0("F", 1:r)
+
+    if (T_t > p_ar + max_h) {
+
+      # (3) AR + F1: p_ar lags of y + 1 lag of F1 only
+      F1_mat <- F_pca_t[, 1, drop = FALSE]
+      for (hi in seq_along(horizons)) {
+        h   <- horizons[hi]
+        reg <- build_direct_reg(y_t, F1_mat, h, p_ar, 1, T_t)
+        if (is.null(reg)) next
+        valid <- complete.cases(reg$Y, reg$X)
+        if (sum(valid) > reg$n_reg + 2) {
+          fit <- lm.fit(reg$X[valid,,drop=FALSE], reg$Y[valid])
+          x_new <- build_xnew(y_t, F1_mat, p_ar, 1, T_t)
+          fcst[i, hi, "AR_F1"] <- sum(fit$coefficients * x_new)
+        }
+      }
+
+      # (4) FAVAR-P: p_ar lags of y + 1 lag of all r factors (parsimonious)
+      for (hi in seq_along(horizons)) {
+        h   <- horizons[hi]
+        reg <- build_direct_reg(y_t, F_pca_t, h, p_ar, 1, T_t)
+        if (is.null(reg)) next
+        valid <- complete.cases(reg$Y, reg$X)
+        if (sum(valid) > reg$n_reg + 2) {
+          fit <- lm.fit(reg$X[valid,,drop=FALSE], reg$Y[valid])
+          x_new <- build_xnew(y_t, F_pca_t, p_ar, 1, T_t)
+          fcst[i, hi, "FAVAR_P"] <- sum(fit$coefficients * x_new)
+        }
+      }
+
+      # (5) FAVAR: p_ar lags of y + p_ar lags of all r factors (full)
+      for (hi in seq_along(horizons)) {
+        h   <- horizons[hi]
+        reg <- build_direct_reg(y_t, F_pca_t, h, p_ar, p_ar, T_t)
+        if (is.null(reg)) next
+        valid <- complete.cases(reg$Y, reg$X)
+        if (sum(valid) > reg$n_reg + 2) {
+          fit <- lm.fit(reg$X[valid,,drop=FALSE], reg$Y[valid])
+          x_new <- build_xnew(y_t, F_pca_t, p_ar, p_ar, T_t)
+          fcst[i, hi, "FAVAR"] <- sum(fit$coefficients * x_new)
+        }
+      }
+    }
+  }
+
+  list(fcst = fcst, actual = actual, eval_idx = eval_idx,
+       eval_dates = dates[eval_idx], n_eval = n_eval,
+       model_names = model_names, n_models = n_models,
+       horizons = horizons, n_horizons = n_horizons)
+}
+```
+
+```{r run-baseline, cache=TRUE}
+horizons <- c(1, 3, 6, 12)
+res_base <- run_oos_evaluation(
+  eval_start_date = as.Date("2008-01-01"),
+  X_raw_full = X_raw_full, y_all = y_all, dates = dates
+)
+
+fcst        <- res_base$fcst
+actual      <- res_base$actual
+eval_idx    <- res_base$eval_idx
+eval_dates  <- res_base$eval_dates
+n_eval      <- res_base$n_eval
+model_names <- res_base$model_names
+n_models    <- res_base$n_models
+n_horizons  <- res_base$n_horizons
+```
+
+The evaluation window runs from `r format(eval_dates[1])` to `r format(eval_dates[n_eval])` (`r n_eval` forecast origins).
+
+
+
+## Forecast Evaluation Results
+
+The out-of-sample evaluation compares the predictive accuracy of five model specifications against a Random Walk (RW) benchmark across horizons h=1,3,6,12. 
+
+### RMSFE and Relative RMSFE
+
+\vspace{-1em}
+
+```{r compute-errors}
+errors <- array(NA_real_, dim = c(n_eval, n_horizons, n_models),
+                dimnames = list(NULL, paste0("h", horizons), model_names))
+for (m in 1:n_models) {
+  for (hi in 1:n_horizons) {
+    errors[, hi, m] <- actual[, hi] - fcst[, hi, m]
+  }
+}
+
+rmsfe <- matrix(NA_real_, n_models, n_horizons,
+                dimnames = list(model_names, paste0("h=", horizons)))
+for (m in 1:n_models) {
+  for (hi in 1:n_horizons) {
+    e <- errors[, hi, m]; v <- !is.na(e)
+    if (sum(v) > 5) rmsfe[m, hi] <- sqrt(mean(e[v]^2))
+  }
+}
+
+rel_rmsfe <- sweep(rmsfe, 2, rmsfe["RW", ], "/")
+```
+
+```{r tbl-rmsfe}
+kbl(round(rmsfe, 3), booktabs = TRUE,
+    caption = "Root Mean Squared Forecast Error by Model and Horizon") %>%
+  kable_styling(full_width = FALSE, latex_options = c("HOLD_position"))
+```
+\vspace{-1em}
+```{r tbl-rel-rmsfe}
+kbl(round(rel_rmsfe, 3), booktabs = TRUE,
+    caption = "Relative RMSFE (ratio to Random Walk). Values below 1 indicate improvement.") %>%
+  kable_styling(full_width = FALSE, latex_options = c("HOLD_position"))
+```
+
+
+### Out-of-Sample $R^2$
+\vspace{-1.5em}
+```{r tbl-oos-r2}
+R2_oos <- matrix(NA_real_, n_models, n_horizons,
+                 dimnames = list(model_names, paste0("h=", horizons)))
+for (m in 1:n_models) {
+  for (hi in 1:n_horizons) {
+    e_m  <- errors[, hi, m]; e_rw <- errors[, hi, "RW"]
+    v <- !is.na(e_m) & !is.na(e_rw)
+    if (sum(v) > 5) R2_oos[m, hi] <- 1 - sum(e_m[v]^2) / sum(e_rw[v]^2)
+  }
+}
+
+kbl(round(R2_oos * 100, 2), booktabs = TRUE,
+    caption = "Out-of-Sample $R^2_{OOS}$ (\\%, relative to Random Walk).") %>%
+  kable_styling(full_width = FALSE, latex_options = c("HOLD_position"))
+```
+
+
+### Diebold--Mariano Tests
+\vspace{-1.3em}
+```{r dm-function}
+dm_test_nw <- function(e1, e2, h) {
+  d <- e1^2 - e2^2; v <- !is.na(d); d <- d[v]; n <- length(d)
+  if (n < 10) return(c(stat = NA, pval = NA))
+  d_bar <- mean(d); bw <- max(1, floor(h^(1/3)))
+  gamma0 <- var(d) * (n - 1) / n; nw_sum <- gamma0
+  d_centered <- d - mean(d)
+  for (j in 1:min(bw, n - 1)) {
+    w <- 1 - j / (bw + 1)
+    nw_sum <- nw_sum + 2*w* sum(d_centered[1:(n-j)] * d_centered[(1+j):n]) / n
+  }
+  se <- sqrt(nw_sum / n)
+  if (se < 1e-10) return(c(stat = NA, pval = NA))
+  dm_stat <- d_bar / se
+  c(stat = dm_stat, pval = 2 * pt(-abs(dm_stat), df = n - 1))
+}
+```
+
+
+```{r dm-tables, results='asis'}
+comparisons <- list(
+  c("AR",      "RW",      "AR vs RW"),
+  c("AR_F1",   "AR",      "AR+F1 vs AR"),
+  c("FAVAR_P", "AR",      "FAVAR-P vs AR"),
+  c("FAVAR_P", "AR_F1",   "FAVAR-P vs AR+F1"),
+  c("FAVAR",   "AR",      "FAVAR vs AR"),
+  c("FAVAR",   "FAVAR_P", "FAVAR vs FAVAR-P")
+)
+
+rows <- lapply(comparisons, function(comp) {
+  stats <- sapply(seq_along(horizons), function(hi) {
+    h <- horizons[hi]
+    res <- dm_test_nw(errors[, hi, comp[1]], errors[, hi, comp[2]], h)
+    stat <- round(res[["stat"]], 2)
+    sig <- ifelse(res[["pval"]] < 0.01, "***",
+           ifelse(res[["pval"]] < 0.05, "**",
+           ifelse(res[["pval"]] < 0.10, "*", "")))
+    paste0(stat, sig)
+  })
+  as.data.frame(t(c(Comparison = comp[3], stats)), stringsAsFactors = FALSE)
+})
+
+dm_wide <- bind_rows(rows)
+colnames(dm_wide) <- c("Comparison", paste0("h=", horizons))
+
+kbl(dm_wide, booktabs = TRUE, row.names = FALSE,
+    caption = "Diebold-Mariano test statistics across forecast horizons. Significance: * $p < 0.10$, ** $p < 0.05$, *** $p < 0.01$. HAC standard errors (Newey-West).",
+    label = "dm-combined") %>%
+  kable_styling(full_width = FALSE, latex_options = c("HOLD_position"), font_size = 9) %>%
+  add_footnote(c("Negative DM: first model has smaller MSE."), notation = "none")
+```
+
+\vspace{-1em}
+
+Across all horizons and comparisons, the AR benchmark dominates factor-augmented models, the full-sample DM tests suggest that factor-augmented variants increase forecast errors relative to AR benchmark. The full FAVAR with two factor lags performs worst among the factor-augmented specifications, which exhibits signs of overfitting. 
+
+Although 126 observations appear sufficient, the effective information content is substantially lower due to the high persistence of the target variable and the strong collinearity among factor lags. As a result, the model estimates become unstable and sensitive to sampling variation. In this setting, the additional estimation noise can outweigh the incremental predictive content of the factors.
+
+Importantly, the aggregate KLD is is calculated as a transformed mean of the balances of the business situation and the expectations. Since the factors are extracted from the same underlying industry panel, there is a structural overlap between the predictors and the target variable. Therefore, the target variable KLD already embeds much of the common cross-sectional variation, so its own lag structure implicitly captures a substantial share of the factor information.
+
+The factor augmentation brings in additional survey dimensions (prices, MoM changes, export orders etc.) that go beyond what KLD directly measures, but these dimensions do not appear to have a stable marginal relationship with the future level of the GUS–GES geometric mean under normal conditions.
+
+
+
+### Cumulative Squared Error Differences (CSSED)
+
+\vspace{-1.2em}
+
+```{r fig-cssed, fig.width=10, fig.height=7, fig.cap="CSSED: upward slope = factor model outperforms AR. Shaded regions: GFC (2008--09), EDC(2010), COVID (2020)."}
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+for (hi in seq_along(horizons)) {
+  h <- horizons[hi]
+  e_ar <- errors[, hi, "AR"]; e_fp <- errors[, hi, "FAVAR_P"]
+  e_fv <- errors[, hi, "FAVAR"]; e_f1 <- errors[, hi, "AR_F1"]
+  v_fp <- !is.na(e_ar) & !is.na(e_fp)
+  v_fv <- !is.na(e_ar) & !is.na(e_fv)
+  v_f1 <- !is.na(e_ar) & !is.na(e_f1)
+
+  d_fp <- cumsum(e_ar[v_fp]^2 - e_fp[v_fp]^2)
+  d_fv <- cumsum(e_ar[v_fv]^2 - e_fv[v_fv]^2)
+  d_f1 <- cumsum(e_ar[v_f1]^2 - e_f1[v_f1]^2)
+
+  ylim <- range(c(d_fp, d_fv, d_f1), na.rm = TRUE)
+
+  plot(eval_dates[v_fp], d_fp, type = "l", col = "dodgerblue3", lwd = 2.5,
+       main = sprintf("CSSED: h = %d months", h),
+       xlab = "", ylab = "Cumulative SED", ylim = ylim)
+  lines(eval_dates[v_fv], d_fv, col = "dodgerblue3", lwd = 1, lty = 3)
+  lines(eval_dates[v_f1], d_f1, col = "darkorange", lwd = 1.5, lty = 2)
+  abline(h = 0, lty = 3, col = "gray40")
+  rect(as.Date("2008-01-01"), ylim[1]*2, as.Date("2009-03-01"), ylim[2]*2,
+       col = adjustcolor("gray80", 0.3), border = NA)
+  rect(as.Date("2009-12-01"), par("usr")[3], as.Date("2011-04-01"), par("usr")[4],
+       col = adjustcolor("gray80", 0.2), border = NA)
+  rect(as.Date("2020-01-01"), ylim[1]*2, as.Date("2020-12-01"), ylim[2]*2,
+       col = adjustcolor("gray80", 0.3), border = NA)
+  legend("bottomleft", legend = c("FAVAR-P vs AR", "FAVAR vs AR", "AR+F1 vs AR"),
+         col = c("dodgerblue3", "dodgerblue3", "darkorange"),
+         lty = c(1, 3, 2), lwd = c(2.5, 1, 1.5), bty = "n", cex = 0.75)
+}
+```
+
+
+The CSSED plots reveal that relative forecast performance is strongly regime-dependent, with clear level shifts around the GFC (2008–09) and the COVID shock (2020). Factor-augmented models display marginal value mainly at cyclical turning points, periods of peak cross-sectional dispersion when the common factors carry genuine incremental information beyond the AR benchmark. 
+
+The CSSED paths exhibit a sharp drop around 2009–10, indicating that the AR benchmark delivered substantially smaller multi-step errors in the immediate post-crisis adjustment. Over 2010–19, the CSSED paths drift upward at shorter horizons, suggesting that factor augmentation delivers modest but persistent gains over the AR benchmark through the mid-cycle expansion.
+
+The CSSED for FAVAR-P shows a clear upward spike around 2020, indicating that the factor model outperformed the AR benchmark during this episode. This suggests that the cross-sectional information embedded in the PCA factors was particularly valuable for medium-horizon forecasting when the pandemic triggered a sharp, broad-based disruption across industries.
+
+FAVAR and FAVAR-P tend to move together, suggesting that a second factor lag contributes little incremental predictive content. So additional factor dynamics are largely redundant and serve mainly to inflate estimation variance without improving forecast accuracy. The AR+F1 specification also fails to deliver robust gains, suggesting that the dominant factor alone provides little standalone forecasting power once the AR dynamics are already accounted for.
+
+
+
+
+
+```{r fig-forecasts, fig.width=10, fig.height=12, fig.cap="Forecasts vs. Actual across horizons. Shaded: GFC, COVID.", include=FALSE}
+### Forecast Comparison Plots
+
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+for (hi in seq_along(horizons)) {
+  h <- horizons[hi]
+  y_range <- range(actual[, hi], fcst[, hi, "AR"], fcst[, hi, "FAVAR_P"], na.rm = TRUE)
+  plot(eval_dates, actual[, hi], type = "l", lwd = 2, col = "black",
+       main = sprintf("Forecasts vs. Actual (h = %d)", h),
+       xlab = "", ylab = "KLD", ylim = y_range)
+  rect(as.Date("2008-01-01"), par("usr")[3], as.Date("2009-06-01"), par("usr")[4],
+       col = adjustcolor("gray80", 0.2), border = NA)
+  rect(as.Date("2020-01-01"), par("usr")[3], as.Date("2020-12-01"), par("usr")[4],
+       col = adjustcolor("gray80", 0.2), border = NA)
+  lines(eval_dates, fcst[, hi, "AR"], col = "gray50", lwd = 1.2, lty = 2)
+  lines(eval_dates, fcst[, hi, "FAVAR_P"], col = "dodgerblue3", lwd = 1.5)
+  legend("bottomleft", legend = c("Actual", "AR(2)", "FAVAR-P"),
+         col = c("black", "gray50", "dodgerblue3"),
+         lty = c(1, 2, 1), lwd = c(2, 1.2, 1.5), bty = "n", cex = 0.8)
+}
+```
+
+
+
+
+
+## Sub-sample Analysis
+
+To assess whether forecast performance varies across economic regimes, we split the
+evaluation window into three sub-periods.
+
+```{r tbl-subsample, results='asis', include=F}
+subperiods <- list(
+  "2008-2009 (GFC Shock Phase)" = c(as.Date("2008-01-01"), as.Date("2009-03-01")), #Germany’s Industrial Trough – Q1 2009
+  "2010-2012 (European Sovereign Debt Crisis)" = c(as.Date("2010-04-01"), as.Date("2012-09-01")),
+  "2014-2019 (Recovery)" = c(as.Date("2014-01-01"), as.Date("2019-12-01")),
+  "2020-2024 (COVID+)"   = c(as.Date("2020-01-01"), as.Date("2024-12-01"))
+)
+sp_counter <- 0
+for (sp_name in names(subperiods)) {
+  sp_counter <- sp_counter + 1
+  sp_range <- subperiods[[sp_name]]
+  sp_idx   <- eval_dates >= sp_range[1] & eval_dates <= sp_range[2]
+  if (sum(sp_idx) < 5) next
+
+  rmsfe_sp <- matrix(NA_real_, n_models, n_horizons,
+                     dimnames = list(model_names, paste0("h=", horizons)))
+  for (m in 1:n_models) {
+    for (hi in 1:n_horizons) {
+      e <- errors[sp_idx, hi, m]; v <- !is.na(e)
+      if (sum(v) > 3) rmsfe_sp[m, hi] <- sqrt(mean(e[v]^2))
+    }
+  }
+  rel_sp <- sweep(rmsfe_sp, 2, rmsfe_sp["RW", ], "/")
+
+  cat(sprintf("\n\n\\textbf{%s} (n = %d):\n\\vspace{-1.7em}\n", sp_name, sum(sp_idx)))
+  print(
+    kbl(round(rel_sp, 3), booktabs = TRUE,
+        caption = sprintf("Relative RMSFE: %s", sp_name),
+        label = sprintf("sub-%d", sp_counter)) %>%
+      kable_styling(full_width = FALSE, latex_options = c("HOLD_position"), font_size = 9)
+  )
+}
+```
+
+```{r tbl-subsample-merged, results='asis'}
+subperiods <- list(
+  "GFC Shock\n(2008--09)"     = c(as.Date("2008-01-01"), as.Date("2009-03-01")),
+  "Euro Debt\n(2010--12)"     = c(as.Date("2010-04-01"), as.Date("2012-09-01")),
+  "COVID+\n(2020--24)"        = c(as.Date("2020-01-01"), as.Date("2024-12-01"))
+)
+
+model_order  <- c("RW", "AR", "AR_F1", "FAVAR_P", "FAVAR")
+model_labels <- c("RW", "AR", "AR+F1", "FAVAR-P", "FAVAR")
+horizon_labs <- paste0("h=", horizons)   # c("h=1","h=3","h=6","h=12")
+
+# Collect all relative RMSFEs 
+sp_results <- lapply(subperiods, function(sp_range) {
+  sp_idx <- eval_dates >= sp_range[1] & eval_dates <= sp_range[2]
+  n_sp   <- sum(sp_idx)
+  if (n_sp < 5) return(NULL)
+
+  rmsfe_sp <- matrix(NA_real_, n_models, n_horizons,
+                     dimnames = list(model_names, horizon_labs))
+  for (m in seq_len(n_models)) {
+    for (hi in seq_along(horizons)) {
+      e <- errors[sp_idx, hi, m]; v <- !is.na(e)
+      if (sum(v) > 3) rmsfe_sp[m, hi] <- sqrt(mean(e[v]^2))
+    }
+  }
+  rel_sp <- sweep(rmsfe_sp, 2, rmsfe_sp["RW", ], "/")
+  list(rel = rel_sp, n = n_sp)
+})
+sp_results <- Filter(Negate(is.null), sp_results)
+
+# Build wide merged data frame
+# Each period contributes 4 columns (h=1,3,6,12); rows = models
+merged_mat <- do.call(cbind, lapply(sp_results, function(x) x$rel))
+merged_mat <- merged_mat[model_order, ]   # enforce row order
+rownames(merged_mat) <- model_labels
+
+# Period sample sizes for header
+n_per_period <- sapply(sp_results, function(x) x$n)
+period_header_names <- mapply(function(nm, n) {
+  clean_nm <- gsub("\n", " ", nm)
+  sprintf("%s (n=%d)", clean_nm, n)
+}, names(sp_results), n_per_period)
+
+# Column group sizes (4 horizons per period)
+n_periods      <- length(sp_results)
+group_widths   <- setNames(rep(4L, n_periods), period_header_names)
+
+# Rename columns to h=1 h=3 h=6 h=12 repeated
+colnames(merged_mat) <- rep(horizon_labs, n_periods)
+
+# Format
+fmt_cell <- function(x) {
+  formatC(round(x, 2), digits = 2, format = "f")
+}
+merged_fmt <- apply(merged_mat, c(1, 2), fmt_cell)
+
+# Bold FAVAR-P cells where FAVAR-P < AR (column-wise comparison)
+ar_row     <- merged_mat["AR",      ]
+favarp_row <- merged_mat["FAVAR-P", ]
+bold_cols  <- which(!is.na(favarp_row) & !is.na(ar_row) & favarp_row < ar_row)
+
+for (j in bold_cols) {
+  merged_fmt["FAVAR-P", j] <- paste0("\\textbf{", merged_fmt["FAVAR-P", j], "}")
+}
+
+# Render with kableExtra
+kbl(merged_fmt,
+    booktabs  = TRUE,
+    escape    = FALSE,
+    align     = c("l", rep("r", n_periods * 4)),
+    caption   = paste0(
+      "Relative RMSFE by sub-period and forecast horizon (relative to Random Walk). ",
+      "Values below 1 indicate improvement over the RW benchmark. ",
+      "The AR row (bold) serves as the primary benchmark for factor-augmented models."
+    ),
+    label     = "subsample-merged"
+) |>
+  kable_styling(
+    full_width    = TRUE,
+    latex_options = c("HOLD_position", "scale_down"),
+    font_size     = 10
+  ) |>
+  add_header_above(
+    c(" " = 1, group_widths),
+    bold      = TRUE,
+    font_size = 9,
+    line      = TRUE
+  ) |>
+  row_spec(0, bold = TRUE) |>
+  row_spec(which(model_labels == "AR"), bold = TRUE, hline_after = FALSE) |>
+  column_spec(1, bold = FALSE, width = "1.8cm") |>
+  footnote(
+    general       = "Relative RMSFE = RMSFE(model) / RMSFE(RW). Bold FAVAR-P entries: FAVAR-P outperforms AR benchmark.",
+    general_title = "",
+    footnote_as_chunk = TRUE,
+    escape        = FALSE
+  )
+```
+
+
+
+During the GFC shock phase (2008–09), FAVAR-P performs best with the lowest relative RMSFE across all horizons. Factor-augmented specifications are also competitive with the pure AR at short
+horizons during European Sovereign Debt Crisis (2010–12).
+
+The European Sovereign Debt Crisis was characterised by fragmented transmission and policy-driven regime shifts (risk-premia spikes followed by abrupt stabilisation), so that medium- and long-horizon outcomes were dominated by non-linear turning points rather than by smooth extrapolation of the contemporaneous common component. In this environment, factor models tend to extrapolate stress too persistently, leading to large errors at h=12 relative to the more robust AR benchmark. 
+
+During the COVID+ period (2020–2024), forecast performance deteriorates markedly and all models struggle relative to the random walk at short horizons (h=1, 3). This occurs because the pandemic induced abrupt, unprecedented level shifts in KLD that violated the mean-reverting dynamics. The factor-augmented models extracted from the same disrupted cross-section, also exhibit discontinuities that the linear projection cannot accommodate. 
+
+At longer horizons, the AR recovers partially, beating the random walk at h=12 (0.899), indicating some remaining mean reversion at annual horizons. The factor-augmented models outperform both the RW and AR at h=6 and h=12: FAVAR-P reaches 0.934 and 0.721 respectively, and FAVAR 0.927 and 0.700. This aligns with the idea that PCA factors become most informative when a shock is broad-based and highly synchronised across industries, so that cross-sectional co-movement contains genuine signal about the medium-run trajectory of aggregate sentiment.
+
+Overall, the results reveal that the factor information is horizon-dependent and Regime-dependent. During episodes of broad-based disruption or gradual structural divergence across industries, the factors carry genuine predictive content beyond what KLD's own lag structure provides. 
+
+
+
+## Robustness: Alternative Training/Evaluation Splits
+
+We re-evaluate using two alternative splits: a post-crisis split starting 2012:01, and a proportional
+70/30 split.
+
+```{r tbl-alt-splits, results='asis', cache=TRUE}
+split_70pct_idx  <- floor(length(dates) * 0.70)
+split_70pct_date <- dates[split_70pct_idx]
+split_70pct_name <- sprintf("70/30 split (%s)", format(split_70pct_date, "%Y:%m"))
+
+alt_splits <- list(
+  "Baseline (2008:01)"    = as.Date("2008-01-01"),
+  "Post-crisis (2012:01)" = as.Date("2012-01-01")
+)
+alt_splits[[split_70pct_name]] <- split_70pct_date
+
+split_counter <- 0
+for (split_name in names(alt_splits)) {
+  split_counter <- split_counter + 1
+  split_date <- alt_splits[[split_name]]
+
+  if (split_date == as.Date("2008-01-01")) {
+    alt_rel <- rel_rmsfe; alt_n <- n_eval
+  } else {
+    res_alt <- run_oos_evaluation(
+      eval_start_date = split_date,
+      X_raw_full = X_raw_full, y_all = y_all, dates = dates)
+    if (is.null(res_alt)) {
+      cat(sprintf("\n\n\\textbf{%s}: insufficient data.\n\n", split_name)); next
+    }
+    alt_n <- res_alt$n_eval
+    alt_err <- array(NA_real_, dim = c(alt_n, n_horizons, n_models))
+    for (m in 1:n_models) {
+      for (hi in 1:n_horizons) {
+        alt_err[, hi, m] <- res_alt$actual[, hi] - res_alt$fcst[, hi, m]
+      }
+    }
+    alt_rmsfe <- matrix(NA_real_, n_models, n_horizons,
+                        dimnames = list(model_names, paste0("h=", horizons)))
+    for (m in 1:n_models) {
+      for (hi in 1:n_horizons) {
+        e <- alt_err[, hi, m]; v <- !is.na(e)
+        if (sum(v) > 5) alt_rmsfe[m, hi] <- sqrt(mean(e[v]^2))
+      }
+    }
+    alt_rel <- sweep(alt_rmsfe, 2, alt_rmsfe["RW", ], "/")
+  }
+
+  train_end <- dates[max(which(dates < split_date))]
+  cat(sprintf("\n\n\\textbf{%s} (training to %s, n = %d):\n\\vspace{-1.7em}\n",
+              split_name, format(train_end), alt_n))
+  print(
+    kbl(round(alt_rel, 3), booktabs = TRUE,
+        caption = sprintf("Relative RMSFE: %s", split_name),
+        label = sprintf("alt-%d", split_counter)) %>%
+      kable_styling(full_width = FALSE, latex_options = c("HOLD_position"), font_size = 9)
+  )
+}
+```
+
+The robustness checks suggest that the baseline results are sensitive to the inclusion of crisis episodes. The relative ranking of models is broadly preserved: FAVAR-P consistently outperforms the full FAVAR, and AR outperforms AR+F1. 
+
+Besides, the magnitude of the gains from factor augmentation varies with the composition of the evaluation period. In the post-crisis split (starting 2012) when the GFC is excluded, factor models struggle to deliver clear improvements at short horizons. As removing the GFC also removes the high-dispersion episode in which cross-sectional factor signals were most informative for forecasting aggregate KLD. Under the 70/30 split (starting 2016), where the evaluation period is dominated by the late recovery and COVID episode, short-horizon performance remains worse than RW.
+
+Taken together, these results suggest that the competitiveness of factor-augmented models is closely tied to episodes characterized by broad, synchronized movements across industries. When such high-dispersion environments are included, factor information can add value, particularly at longer horizons.
+
+
+```{r tbl-summary, include=FALSE}
+## Summary
+summary_df <- data.frame(
+  Horizon    = paste0("h=", horizons),
+  Best_Model = apply(rmsfe, 2, function(x) names(which.min(x))),
+  Best_RMSFE = round(apply(rmsfe, 2, min, na.rm = TRUE), 2),
+  Rel_vs_RW  = round(apply(rel_rmsfe, 2, min, na.rm = TRUE), 3),
+  R2_OOS_pct = apply(R2_oos, 2, function(x) round(max(x, na.rm = TRUE) * 100, 1))
+)
+kbl(summary_df, booktabs = TRUE, row.names = FALSE,
+    caption = "Best-performing model per forecast horizon") %>%
+  kable_styling(full_width = FALSE, latex_options = c("HOLD_position"))
+```
+
+
+
+## Discussion
+
+Overall, the AR benchmark provides a robust baseline on average, but factor-augmented models deliver substantial gains at medium-to-long horizons during major systemic shocks. As KLD’s own lag structure already absorbs much of the common cross-sectional variation. For factor augmentation to improve upon AR, the factors would need to capture predictive content in the cross-sectional dispersion across industries, which could contain information that the aggregate trajectory cannot capture.
+
+For applied business-cycle monitoring, this pattern suggests that in tranquil periods, simple autoregressive models are often sufficient. During systemic shocks, industries diverge sharply in timing and magnitude, creating cross-sectional dispersion that the aggregate KLD cannot reflect. Therefore, the factor structure could provide early signal about the medium-run trajectory of aggregate sentiment around turning points that AR benchmark could miss.
+
+At the same time, the split-sample stability analysis in Section 01 revealed that Factors 3 and 5 exhibit instability in their economic interpretation across recursive estimation windows, deviating from the full-sample loading pattern. Accordingly, we treat the results here as aggregate evidence for the value of cross-sectional information, the individual factors in this section should be interpreted with caution. The subsequent analysis should focus on the more stable and economically interpretable factors, primarily Factors 1, 2 and 4, where the mapping between latent structure and observable industry dynamics is robust enough to support further inference.
+
+
+
+
+
+
+
+
+

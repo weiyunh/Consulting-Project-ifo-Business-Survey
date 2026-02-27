@@ -1,0 +1,1246 @@
+---
+title: "04.2 Robustness Analysis: Leave-Cell-Out Cross-Fitting"
+author: "Weiyun Hong"
+header-includes:
+  - \usepackage{parskip}
+  - \setlength{\parskip}{0.5em}
+  - \usepackage{amsmath}
+output:
+  pdf_document:
+    toc: false
+    latex_engine: xelatex
+  html_document:
+    toc: false
+    toc_float: true
+    number_sections: true
+    theme: cosmo
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = F, 
+  warning = FALSE, 
+  message = FALSE,
+  fig.width = 10, 
+  fig.height = 6,
+  fig.align = "center",
+  cache = TRUE
+)
+```
+
+Section 04.1 identified leading indicators using Granger causality tests of cell averages $\bar{x}_{c,t-\ell}$ on factors $\hat{F}_t$. A methodological concern arises: the factors were estimated using *all* $N$ series, including those in the candidate cell $c$. This creates potential circularity, apparent predictive power may reflect mechanical correlation rather than genuine leading information.
+
+This section implements **leave-cell-out (LCO) cross-fitting** to provide a cleaner identification of leading indicators.
+
+
+| Concern | Problem | Solution |
+|---------|---------|----------|
+| **Look-ahead bias** | Smoothed factors $F_{t|T}$ use future information | Use filtered factors $F_{t|t}$ |
+| **Circularity (tautology)** | Cell $c$ contributes to factor construction | Estimate $\hat{F}^{(-c)}$ excluding cell $c$ |
+
+
+```{r load-packages}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(knitr)
+library(kableExtra)
+library(KFAS)
+library(patchwork)
+
+source("ifo_data_processing.R")
+theme_set(theme_minimal())
+```
+
+```{r load-data}
+# Load saved state from Section 0401
+dfm_state <- readRDS("output/dfm_state_04.rds")
+baseline_results <- readRDS("output/predictive_power_04.rds")
+
+dates      <- dfm_state$dates
+r          <- dfm_state$r
+F_smooth   <- dfm_state$F_smooth    # T x r (baseline factors)
+X_kfas     <- dfm_state$X_kfas      # T x N
+var_map    <- dfm_state$var_map     # N rows
+Lambda     <- dfm_state$Lambda      # N x r loadings (if available)
+
+T_obs <- nrow(X_kfas)
+N_obs <- ncol(X_kfas)
+
+# Cell structure
+cells <- sort(unique(var_map$cell_id))
+K <- length(cells)
+
+cell_meta <- data.frame(cell_id = cells, stringsAsFactors = FALSE) |>
+  mutate(
+    industry = sub("_[ABCD]$", "", cell_id),
+    block = sub("^.*_", "", cell_id),
+    n_series = sapply(cell_id, function(c) sum(var_map$cell_id == c))
+  )
+
+# Cell averages from baseline
+X_cell <- baseline_results$X_cell
+granger_results_baseline <- baseline_results$granger_results
+
+# Lag parameters
+p_lags <- 2
+q_lags <- 5
+
+cat("Sample: ", as.character(min(dates)), " to ", as.character(max(dates)), 
+    " (T=", T_obs, ", N=", N_obs, ", K=", K, " cells)\n", sep = "")
+```
+
+```{r compute-filtered-baseline, include=FALSE}
+# Use FILTERED factors for comparison
+# Both baseline and LCO should use one-sided (filtered) factors
+
+if (!is.null(dfm_state$F_filtered)) {
+  F_baseline <- dfm_state$F_filtered
+  cat("Using pre-computed filtered factors from dfm_state\n")
+} else {
+  # Compute filtered factors from scratch using same method as LCO
+  cat("Computing filtered factors for baseline (one-sided Kalman filter)...\n")
+  
+  # Handle missing values
+  X_complete <- X_kfas
+  for (j in 1:N_obs) {
+    na_idx <- is.na(X_complete[, j])
+    if (any(na_idx)) {
+      X_complete[na_idx, j] <- mean(X_complete[, j], na.rm = TRUE)
+    }
+  }
+  X_std <- scale(X_complete)
+  
+  # PCA initialization
+  pca_full <- prcomp(X_std, center = FALSE, scale. = FALSE, rank. = r)
+  F_pca <- pca_full$x[, 1:r, drop = FALSE]
+  Lambda_pca <- pca_full$rotation[, 1:r, drop = FALSE]
+  
+  # SIGN NORMALIZATION (same as Section 03)
+  expansion_period <- dates >= as.Date("2005-01-01") & dates <= as.Date("2008-12-31")
+  for (j in 1:r) {
+   mean_expansion <- mean(F_pca[expansion_period, j], na.rm = TRUE)
+   if (mean_expansion < 0) {
+     F_pca[, j] <- -F_pca[, j]
+     Lambda_pca[, j] <- -Lambda_pca[, j]
+     cat("Factor", j, "flipped to align with economic expansion\n")
+    }
+  }
+  
+  # KFAS Kalman filtering (one-sided)
+  F_baseline <- tryCatch({
+    # VAR(1) for state equation
+    F_lag <- F_pca[-T_obs, , drop = FALSE]
+    F_now <- F_pca[-1, , drop = FALSE]
+    Phi_init <- t(solve(t(F_lag) %*% F_lag) %*% t(F_lag) %*% F_now)
+    
+    # Ensure stationarity
+    eigen_vals <- eigen(Phi_init)$values
+    if (any(Mod(eigen_vals) >= 1)) {
+      Phi_init <- Phi_init * 0.95 / max(Mod(eigen_vals))
+    }
+    
+    # Variances
+    resid_var <- F_now - F_lag %*% t(Phi_init)
+    Q_init <- cov(resid_var)
+    obs_resid <- X_std - F_pca %*% t(Lambda_pca)
+    H_diag <- apply(obs_resid, 2, var, na.rm = TRUE)
+    H_diag[H_diag < 1e-6] <- 1e-6
+    
+    # KFAS model
+    model <- SSModel(
+      X_std ~ -1 + SSMcustom(
+        Z = Lambda_pca,
+        T = Phi_init,
+        R = diag(r),
+        Q = Q_init,
+        a1 = rep(0, r),
+        P1 = diag(r) * 10
+      ),
+      H = diag(H_diag)
+    )
+    
+    # Kalman filter (one-sided, no smoothing)
+    kf_out <- KFS(model, filtering = "state", smoothing = "none")
+    kf_out$att[1:T_obs, , drop = FALSE]
+    
+  }, error = function(e) {
+    warning("KFAS failed for baseline: ", e$message, ". Using PCA factors.")
+    F_pca
+  })
+  
+  cat("Baseline filtered factors computed.\n")
+}
+```
+
+## Leave-Cell-Out Cross-Fitting Methodology
+
+### Formal Specification
+
+For each candidate cell $c$, we re-estimate the complete DFM using only the remaining $N - n_c$ series:
+
+**Observation Equation (excluding cell $c$):**
+\begin{equation}
+X^{(-c)}_t = \Lambda^{(-c)} F^{(-c)}_t + \varepsilon^{(-c)}_t, \quad \varepsilon^{(-c)}_t \sim N(0, H^{(-c)})
+\end{equation}
+
+**State Equation:**
+\begin{equation}
+F^{(-c)}_t = \Phi^{(-c)} F^{(-c)}_{t-1} + \eta^{(-c)}_t, \quad \eta^{(-c)}_t \sim N(0, Q^{(-c)})
+\end{equation}
+
+where:
+
+- $X^{(-c)}_t \in \mathbb{R}^{N-n_c}$ is the data matrix excluding all series in cell $c$
+- ${\theta}^{(-c)} = \{\Lambda^{(-c)}$, $\Phi^{(-c)}$, $H^{(-c)}$, $Q^{(-c)}\}$ are re-estimated parameters
+- $F^{(-c)}_t$ are the leave-cell-out factors
+
+### Estimation Procedure
+
+We use the same two-step estimation as the baseline:
+
+**Step 1: PCA Initialization**
+\begin{equation}
+\hat{F}^{(-c),\text{PCA}}_t = \text{PC}_r\left( X^{(-c)} \right)
+\end{equation}
+
+
+**Step 2: Kalman Filtering**
+
+Conditional on the parameters $\hat{\theta}^{(-c)}$ obtained in Step 1, the state-space representation is treated as fixed and latent factors are extracted using the one-sided Kalman filter to avoid look-ahead bias:
+
+\begin{equation}
+\hat{F}^{(-c)}_{t|t} = E\left[ F^{(-c)}_t \mid X^{(-c)}_1, \ldots, X^{(-c)}_t; \hat{\theta}^{(-c)} \right]
+\end{equation}
+
+### Factor Alignment via Procrustes Rotation
+
+Since each LCO factor set $\hat{F}^{(-c)}$ is estimated from a different data subset, the factor spaces may differ in rotation and sign. We align to the baseline factors using Procrustes rotation:
+
+\begin{equation}
+\tilde{F}^{(-c)} = \hat{F}^{(-c)} R^{(-c)}, \quad R^{(-c)} = \arg\min_{R: R'R = I} \left\|\hat{F}^{(-c)} R - \hat{F} \right\|_F
+\end{equation}
+
+where $\tilde{F}^{(-c)} \in \mathbb{R}^{T \times r}$ denotes the **aligned** leave-cell-out factors that are comparable to the baseline factors $\hat{F}$ in terms of rotation and sign. The optimal orthogonal rotation matrix is obtained via SVD: if $\hat{F}^{(-c)\prime} \hat{F} = U \Sigma V'$, then $R^{(-c)} = U V'$.
+
+
+
+```{r define-lco-estimation-function}
+# Leave-Cell-Out DFM Estimation Function
+
+estimate_lco_dfm <- function(X_mat, var_map, cell_id, r, 
+                              F_baseline, method = "pca_kfas") {
+  # Estimate DFM excluding series from specified cell
+
+  #' @param X_mat T x N data matrix
+  #' @param var_map data frame with cell_id column
+  #' @param cell_id cell to exclude
+  #' @param r number of factors
+  #' @param F_baseline baseline factors for Procrustes alignment
+  #' @param method estimation method: "pca_only" or "pca_kfas"
+  #' @return T x r matrix of aligned LCO factors
+  
+  # Identify series to exclude
+  exclude_idx <- which(var_map$cell_id == cell_id)
+  
+  if (length(exclude_idx) == 0 || length(exclude_idx) >= ncol(X_mat) - r) {
+    warning("Cell ", cell_id, ": insufficient series after exclusion")
+    return(F_baseline)
+  }
+  
+  # Subset data
+  X_subset <- X_mat[, -exclude_idx, drop = FALSE]
+  T_obs <- nrow(X_subset)
+  N_subset <- ncol(X_subset)
+  
+  # Handle missing values for PCA
+  X_complete <- X_subset
+  for (j in 1:N_subset) {
+    na_idx <- is.na(X_complete[, j])
+    if (any(na_idx)) {
+      X_complete[na_idx, j] <- mean(X_complete[, j], na.rm = TRUE)
+    }
+  }
+  
+  X_std <- scale(X_complete)
+  
+  # Step 1: PCA initialization
+  pca_result <- prcomp(X_std, center = FALSE, scale. = FALSE, rank. = r)
+  F_pca <- pca_result$x[, 1:r, drop = FALSE]
+  Lambda_pca <- pca_result$rotation[, 1:r, drop = FALSE]
+  
+  if (method == "pca_only") {
+    F_lco <- F_pca
+  } else {
+    # Step 2: KFAS refinement with Kalman filter
+    F_lco <- tryCatch({
+      # Build state-space model
+      # Observation: X_t = Lambda * F_t + eps_t
+      # State: F_t = Phi * F_{t-1} + eta_t
+      
+      # Estimate VAR(1) on PCA factors for state equation
+      F_lag <- F_pca[-T_obs, , drop = FALSE]
+      F_now <- F_pca[-1, , drop = FALSE]
+      Phi_init <- solve(t(F_lag) %*% F_lag) %*% t(F_lag) %*% F_now
+      Phi_init <- t(Phi_init)  # r x r
+      
+      # Ensure stationarity
+      eigen_vals <- eigen(Phi_init)$values
+      if (any(Mod(eigen_vals) >= 1)) {
+        Phi_init <- Phi_init * 0.95 / max(Mod(eigen_vals))
+      }
+      
+      # State variance from VAR residuals
+      resid_var <- F_now - F_lag %*% t(Phi_init)
+      Q_init <- cov(resid_var)
+      
+      # Observation variance (diagonal)
+      obs_resid <- X_std - F_pca %*% t(Lambda_pca)
+      H_diag <- apply(obs_resid, 2, var, na.rm = TRUE)
+      H_diag[H_diag < 1e-6] <- 1e-6
+      
+      # Build KFAS model
+      # State dimension = r
+      model <- SSModel(
+        X_std ~ -1 + SSMcustom(
+          Z = Lambda_pca,           # N_subset x r
+          T = Phi_init,             # r x r
+          R = diag(r),              # r x r
+          Q = Q_init,               # r x r
+          a1 = rep(0, r),           # initial state mean
+          P1 = diag(r) * 10         # diffuse initial variance
+        ),
+        H = diag(H_diag)
+      )
+      
+      # Kalman filter (one-sided)
+      kf_out <- KFS(model, filtering = "state", smoothing = "none")
+      
+      # Extract filtered states
+      F_filtered <- kf_out$att[-1, , drop = FALSE]  # a is T+1 x r, drop first row
+      
+      if (nrow(F_filtered) != T_obs) {
+        F_filtered <- kf_out$att[1:T_obs, , drop = FALSE]
+      }
+      
+      F_filtered
+      
+    }, error = function(e) {
+      warning("KFAS failed for cell ", cell_id, ": ", e$message, ". Using PCA factors.")
+      F_pca
+    })
+  }
+  
+  # Procrustes alignment to baseline factors
+  svd_result <- svd(t(F_lco) %*% F_baseline)
+  R_procrustes <- svd_result$u %*% t(svd_result$v)
+  F_aligned <- F_lco %*% R_procrustes
+  
+  return(F_aligned)
+}
+```
+
+```{r estimate-all-lco-factors, include=FALSE}
+# Estimate LCO Factors for All Cells
+
+cat("Estimating leave-cell-out factors for", K, "cells...\n")
+cat("Method: PCA + KFAS Kalman filtering (one-sided)\n\n")
+
+F_lco_list <- vector("list", K)
+names(F_lco_list) <- cells
+
+# Track estimation quality
+lco_diagnostics <- data.frame(
+  cell_id = cells,
+  n_excluded = integer(K),
+  method_used = character(K),
+  corr_with_baseline = numeric(K),
+  stringsAsFactors = FALSE
+)
+
+for (k in seq_along(cells)) {
+  cell <- cells[k]
+  n_excl <- sum(var_map$cell_id == cell)
+  
+  F_lco <- estimate_lco_dfm(
+    X_mat = X_kfas,
+    var_map = var_map,
+    cell_id = cell,
+    r = r,
+    F_baseline = F_baseline,  # Use filtered baseline for alignment
+    method = "pca_kfas"
+  )
+  
+  F_lco_list[[k]] <- F_lco
+  
+  # Diagnostics
+  lco_diagnostics$n_excluded[k] <- n_excl
+  lco_diagnostics$method_used[k] <- "pca_kfas"
+  lco_diagnostics$corr_with_baseline[k] <- mean(diag(cor(F_lco, F_baseline)))
+  
+  if (k %% 20 == 0 || k == K) {
+    cat("  Processed", k, "of", K, "cells\n")
+  }
+}
+
+cat("\n\nLCO Factor Estimation Summary:\n")
+cat("  Mean correlation with baseline: ", round(mean(lco_diagnostics$corr_with_baseline), 4), "\n")
+cat("  Min correlation: ", round(min(lco_diagnostics$corr_with_baseline), 4), "\n")
+cat("  Series excluded per cell: ", min(lco_diagnostics$n_excluded), "-", 
+    max(lco_diagnostics$n_excluded), "\n")
+```
+
+## LCO Factor Stability Analysis
+
+Before proceeding with Granger tests, we verify that LCO factors remain stable and comparable to baseline factors.
+
+```{r lco-stability-analysis}
+# Correlation between LCO and baseline factors
+stability_summary <- data.frame(
+  Factor = 1:r,
+  Mean_Corr = sapply(1:r, function(j) {
+    mean(sapply(F_lco_list, function(F_lco) cor(F_lco[, j], F_baseline[, j])))
+  }),
+  Min_Corr = sapply(1:r, function(j) {
+    min(sapply(F_lco_list, function(F_lco) cor(F_lco[, j], F_baseline[, j])))
+  }),
+  Max_Corr = sapply(1:r, function(j) {
+    max(sapply(F_lco_list, function(F_lco) cor(F_lco[, j], F_baseline[, j])))
+  })
+)
+
+kable(
+  stability_summary,
+  col.names = c("Factor", "Mean Corr", "Min Corr", "Max Corr"),
+  digits = 4,
+  caption = "Correlation between LCO and Baseline Factors (across all cell exclusions)"
+) |>
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+The high correlations confirm that removing any cell leaves the factor space essentially unchanged. This is expected given $N = `r N_obs`$ series and $n_c \leq `r max(cell_meta$n_series)`$ per cell.
+
+## LCO Granger Causality Tests
+
+```{r lco-granger-function}
+# Granger Test 
+
+granger_test <- function(F_j, x_c, p = 2, q = 5) {
+  T_full <- length(F_j)
+  max_lag <- max(p, q)
+  T_eff <- T_full - max_lag
+  
+  y <- F_j[(max_lag + 1):T_full]
+  
+  # Factor lags
+  F_lags <- matrix(NA_real_, nrow = T_eff, ncol = p)
+  for (k in 1:p) F_lags[, k] <- F_j[(max_lag + 1 - k):(T_full - k)]
+  colnames(F_lags) <- paste0("F_lag", 1:p)
+  
+  # Predictor lags
+  x_lags <- matrix(NA_real_, nrow = T_eff, ncol = q)
+  for (ell in 1:q) x_lags[, ell] <- x_c[(max_lag + 1 - ell):(T_full - ell)]
+  colnames(x_lags) <- paste0("x_lag", 1:q)
+  
+  # Models
+  fit_R <- lm(y ~ ., data = data.frame(y = y, F_lags))
+  fit_U <- lm(y ~ ., data = data.frame(y = y, F_lags, x_lags))
+  
+  SSE_R <- sum(residuals(fit_R)^2)
+  SSE_U <- sum(residuals(fit_U)^2)
+  SST <- sum((y - mean(y))^2)
+  
+  # F-test
+  df1 <- q
+  df2 <- T_eff - p - q - 1
+  F_stat <- ((SSE_R - SSE_U) / df1) / (SSE_U / df2)
+  p_value <- pf(F_stat, df1, df2, lower.tail = FALSE)
+  
+  # Coefficients
+  beta_coefs <- coef(fit_U)[grep("^x_lag", names(coef(fit_U)))]
+  
+  list(
+    F_stat = F_stat,
+    p_value = p_value,
+    delta_R2 = (SSE_R - SSE_U) / SST,
+    beta_sum = sum(beta_coefs, na.rm = TRUE),
+    T_eff = T_eff
+  )
+}
+```
+
+```{r baseline-granger-filtered}
+# Run Baseline Granger Tests with FILTERED factors
+
+granger_results_baseline_filtered <- vector("list", r)
+names(granger_results_baseline_filtered) <- paste0("Factor_", 1:r)
+
+for (j in 1:r) {
+  results_j <- data.frame(
+    cell_id = cells,
+    industry = cell_meta$industry,
+    block = cell_meta$block,
+    F_stat = NA_real_,
+    p_value = NA_real_,
+    delta_R2 = NA_real_,
+    beta_sum = NA_real_,
+    stringsAsFactors = FALSE
+  )
+  
+  for (k in seq_along(cells)) {
+    test <- tryCatch(
+      granger_test(F_baseline[, j], X_cell[, k], p = p_lags, q = q_lags),
+      error = function(e) NULL
+    )
+    
+    if (!is.null(test)) {
+      results_j$F_stat[k] <- test$F_stat
+      results_j$p_value[k] <- test$p_value
+      results_j$delta_R2[k] <- test$delta_R2
+      results_j$beta_sum[k] <- test$beta_sum
+    }
+  }
+  
+  granger_results_baseline_filtered[[j]] <- results_j
+}
+```
+
+```{r run-lco-granger-tests}
+# Run LCO Granger Tests
+
+granger_results_lco <- vector("list", r)
+names(granger_results_lco) <- paste0("Factor_", 1:r)
+
+for (j in 1:r) {
+  results_j <- data.frame(
+    cell_id = cells,
+    industry = cell_meta$industry,
+    block = cell_meta$block,
+    F_stat = NA_real_,
+    p_value = NA_real_,
+    delta_R2 = NA_real_,
+    beta_sum = NA_real_,
+    stringsAsFactors = FALSE
+  )
+  
+  for (k in seq_along(cells)) {
+    # Use LCO factor that excludes this cell
+    F_lco_k <- F_lco_list[[k]]
+    
+    test <- tryCatch(
+      granger_test(F_lco_k[, j], X_cell[, k], p = p_lags, q = q_lags),
+      error = function(e) NULL
+    )
+    
+    if (!is.null(test)) {
+      results_j$F_stat[k] <- test$F_stat
+      results_j$p_value[k] <- test$p_value
+      results_j$delta_R2[k] <- test$delta_R2
+      results_j$beta_sum[k] <- test$beta_sum
+    }
+  }
+  
+  granger_results_lco[[j]] <- results_j
+}
+```
+
+### Multiple Testing Correction
+
+With $K \times r = `r K * r`$ hypothesis tests, we must control for multiple comparisons. We apply the **Benjamini-Hochberg (BH)** procedure to both baseline and LCO results for comparison.
+
+#### BH Procedure
+
+For ordered p-values $p_{(1)} \leq p_{(2)} \leq \cdots \leq p_{(m)}$ with $m = `r K * r`$ tests:
+\begin{equation}
+\text{Adjusted } p_i = \min\left\{ \min_{j \geq i} \left( \frac{m \cdot p_{(j)}}{j} \right), 1 \right\}
+\end{equation}
+
+This controls the **false discovery rate (FDR)** at level $\alpha = 0.05$.
+
+```{r multiple-testing-correction}
+# Apply BH Correction to BOTH Baseline (filtered) and LCO
+
+# Baseline correction
+all_pvalues_baseline <- data.frame(
+  factor = integer(),
+  cell_id = character(),
+  p_value = numeric(),
+  delta_R2 = numeric(),
+  beta_sum = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (j in 1:r) {
+  df_j <- granger_results_baseline_filtered[[j]]
+  all_pvalues_baseline <- rbind(all_pvalues_baseline, data.frame(
+    factor = j,
+    cell_id = df_j$cell_id,
+    p_value = df_j$p_value,
+    delta_R2 = df_j$delta_R2,
+    beta_sum = df_j$beta_sum,
+    stringsAsFactors = FALSE
+  ))
+}
+
+all_pvalues_baseline$p_adj_bh <- p.adjust(all_pvalues_baseline$p_value, method = "BH")
+all_pvalues_baseline$p_adj_bonf <- p.adjust(all_pvalues_baseline$p_value, method = "bonferroni")
+
+# Merge back to baseline_filtered results
+for (j in 1:r) {
+  idx <- all_pvalues_baseline$factor == j
+  granger_results_baseline_filtered[[j]]$p_adj_bh <- all_pvalues_baseline$p_adj_bh[idx]
+  granger_results_baseline_filtered[[j]]$p_adj_bonf <- all_pvalues_baseline$p_adj_bonf[idx]
+}
+
+# LCO correction
+all_pvalues_lco <- data.frame(
+  factor = integer(),
+  cell_id = character(),
+  p_value = numeric(),
+  delta_R2 = numeric(),
+  beta_sum = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (j in 1:r) {
+  df_j <- granger_results_lco[[j]]
+  all_pvalues_lco <- rbind(all_pvalues_lco, data.frame(
+    factor = j,
+    cell_id = df_j$cell_id,
+    p_value = df_j$p_value,
+    delta_R2 = df_j$delta_R2,
+    beta_sum = df_j$beta_sum,
+    stringsAsFactors = FALSE
+  ))
+}
+
+all_pvalues_lco$p_adj_bh <- p.adjust(all_pvalues_lco$p_value, method = "BH")
+all_pvalues_lco$p_adj_bonf <- p.adjust(all_pvalues_lco$p_value, method = "bonferroni")
+
+# Merge back to LCO results
+for (j in 1:r) {
+  idx <- all_pvalues_lco$factor == j
+  granger_results_lco[[j]]$p_adj_bh <- all_pvalues_lco$p_adj_bh[idx]
+  granger_results_lco[[j]]$p_adj_bonf <- all_pvalues_lco$p_adj_bonf[idx]
+}
+```
+
+\newpage
+
+## Results Comparison: Baseline vs Leave-Cell-Out
+
+```{r comparison-table}
+comparison_summary <- data.frame(
+  Factor = 1:r,
+  # Raw p-values (no correction)
+  Base_Raw = sapply(granger_results_baseline_filtered, function(x) sum(x$p_value < 0.05, na.rm = TRUE)),
+  LCO_Raw = sapply(granger_results_lco, function(x) sum(x$p_value < 0.05, na.rm = TRUE)),
+  # BH corrected
+  Base_BH = sapply(granger_results_baseline_filtered, function(x) sum(x$p_adj_bh < 0.05, na.rm = TRUE)),
+  LCO_BH = sapply(granger_results_lco, function(x) sum(x$p_adj_bh < 0.05, na.rm = TRUE)),
+  # Bonferroni corrected
+  Base_Bonf = sapply(granger_results_baseline_filtered, function(x) sum(x$p_adj_bonf < 0.05, na.rm = TRUE)),
+  LCO_Bonf = sapply(granger_results_lco, function(x) sum(x$p_adj_bonf < 0.05, na.rm = TRUE))
+)
+
+# Calculate changes
+comparison_summary <- comparison_summary |>
+  mutate(
+    Change_Raw = LCO_Raw - Base_Raw,
+    Change_BH = LCO_BH - Base_BH,
+    Pct_Retained_BH = round(100 * LCO_BH / pmax(Base_BH, 1), 1)
+  )
+
+kable(
+  comparison_summary,
+  col.names = c("Factor", "Base Raw", "LCO Raw", "Base BH", "LCO BH", 
+                "Base Bonf", "LCO Bonf", "Δ Raw", "Δ BH", "% Retained"),
+  caption = "Significant Indicators: Baseline vs Leave-Cell-Out",
+  align = "c",
+  row.names = FALSE  
+) |>
+  kable_styling(bootstrap_options = "striped", full_width = FALSE) |>
+  add_header_above(c(" " = 1, "Raw (p<0.05)" = 2, "BH Corrected" = 2, 
+                     "Bonferroni" = 2, "LCO - Base" = 2, " " = 1))
+```
+
+```{r summary-statistics}
+cat("=== Summary Statistics ===\n")
+cat("Total tests per method:", K * r, "\n\n")
+
+cat("Baseline Filtered (BH-corrected):\n")
+cat("  Total significant:", sum(comparison_summary$Base_BH), "\n")
+cat("  Per factor:", paste(comparison_summary$Base_BH, collapse = ", "), "\n\n")
+
+cat("LCO Cross-Fitting (BH-corrected):\n")
+cat("  Total significant:", sum(comparison_summary$LCO_BH), "\n")
+cat("  Per factor:", paste(comparison_summary$LCO_BH, collapse = ", "), "\n\n")
+
+total_base <- sum(comparison_summary$Base_BH)
+total_lco <- sum(comparison_summary$LCO_BH)
+if (total_base > 0) {
+  cat("Change due to LCO:\n")
+  cat("  Total:", sum(comparison_summary$Change_BH), 
+      "(", round(100 * sum(comparison_summary$Change_BH) / total_base, 1), "%)\n")
+}
+```
+
+### Interpretation of Results
+
+The leave-cell-out cross-fitting addresses the central identification concern: if cell $c$ contributes to factor construction, its lagged values $\bar{x}_{c,t-\ell}$ might appear predictive simply due to shared information. In that case, we would expect LCO to substantially reduce the number of significant indicators when excluding cell \(c\) from factor estimation.
+
+Comparing baseline filtered factors to their leave-cell-out counterparts reveals that the number of BH-corrected significant leading indicators remains essentially unchanged (305 vs.\ 304 in total), with factor-level counts displaying only marginal differences.
+This high retention indicates that mechanical overlap in factor construction is not the primary driver of the predictive relationships identified in Section 04.1.
+
+Why LCO Does Not Reduce Significance: \(\hat F^{(-c)}_t\) contains no information from cell \(c\) at any date, yet the predictive relationships largely persist. This indicates that the signals captured by leading cells precede and anticipate movements in the common factor, rather than merely reflecting how the factor is constructed.
+
+From an economic perspective, these indicators move *before* the aggregate component they predict. The LCO results therefore strengthen the interpretation of the identified cells as genuine sources of forward-looking information.
+
+
+
+### Top Leading Indicators (LCO + BH Corrected)
+
+```{r top-indicators-lco}
+top_lco_all <- lapply(1:r, function(j) {
+  df_filtered <- granger_results_lco[[j]] |>
+    filter(p_adj_bh < 0.05) |>
+    arrange(desc(delta_R2)) |>
+    slice_head(n = 5)
+  
+  if (nrow(df_filtered) == 0) return(NULL)
+  
+  df_filtered |>
+    mutate(
+      Factor = j,
+      Industry_Name = sapply(industry, function(ind) {
+        tryCatch(get_industry_name_en(ind), error = function(e) ind)
+      }),
+      Sign = ifelse(beta_sum > 0, "+", "−")
+    ) |>
+    dplyr::select(Factor, Industry_Name, block, delta_R2, p_adj_bh, beta_sum, Sign)
+})
+
+top_lco_df <- bind_rows(Filter(Negate(is.null), top_lco_all))
+
+if (nrow(top_lco_df) > 0) {
+  top_lco_df |>
+    mutate(
+      delta_R2 = paste0(round(delta_R2 * 100, 3), "%"),
+      p_adj_bh = format(p_adj_bh, digits = 2, scientific = TRUE),
+      beta_sum = round(beta_sum, 3)
+    ) |>
+    kable(
+      col.names = c("Factor", "Industry", "Block", "ΔR²", "p (BH)", "ΣB", "Sign"),
+      caption = "Top 5 Leading Indicators per Factor (LCO Cross-Fitting, BH-corrected p < 0.05)"
+    ) |>
+    kable_styling(bootstrap_options = "striped", font_size = 9)
+} else {
+  cat("No indicators remain significant after LCO + BH correction.\n")
+}
+```
+
+
+### Conclusions
+
+```{r interpretation}
+# Calculate summary metrics
+total_base_bh <- sum(comparison_summary$Base_BH)
+total_lco_bh <- sum(comparison_summary$LCO_BH)
+
+if (total_base_bh > 0) {
+  retention_rate <- round(100 * total_lco_bh / total_base_bh, 1)
+} else {
+  retention_rate <- NA
+}
+
+# Build scatter data for correlation calculation
+scatter_data <- data.frame()
+
+for (j in 1:r) {
+  df_base <- granger_results_baseline_filtered[[j]]
+  df_lco <- granger_results_lco[[j]]
+  
+  scatter_data <- rbind(scatter_data, data.frame(
+    factor = j,
+    cell_id = df_base$cell_id,
+    industry = df_base$industry,
+    block = df_base$block,
+    dR2_baseline = df_base$delta_R2,
+    dR2_lco = df_lco$delta_R2,
+    sig_base_bh = df_base$p_adj_bh < 0.05,
+    sig_lco_bh = df_lco$p_adj_bh < 0.05,
+    beta_sum_base = df_base$beta_sum,
+    beta_sum_lco = df_lco$beta_sum,
+    stringsAsFactors = FALSE
+  ))
+}
+
+# Compute correlations
+cor_by_factor <- scatter_data |>
+  group_by(factor) |>
+  summarise(
+    r = round(cor(dR2_baseline, dR2_lco, use = "complete.obs"), 3),
+    .groups = "drop"
+  )
+
+mean_corr <- round(mean(cor_by_factor$r, na.rm = TRUE), 3)
+```
+
+1. **High $\Delta R^2$ Correlation** (r = `r mean_corr`): The relative ranking of cells’ incremental explanatory power is highly stable between baseline and the leave-cell-out specification. Cells with higher (lower) incremental explanatory power in the baseline continue to rank higher (lower) under leave-cell-out estimation.
+
+2. **Retention Rate** (`r retention_rate`%):   After applying both LCO cross-fitting and BH correction, `r total_lco_bh` out of `r total_base_bh` baseline significant indicators remain significant. This high retention implies that the majority of leading relationships are not driven by mechanical overlap in factor construction.
+
+3. **Robustness Confirmed**: Taken together, the stability in both significance counts and $\Delta R^2$ rankings indicates that the baseline results reflect genuine lead–lag information rather than artifacts of the factor extraction procedure.
+
+
+### Discussion of $\Delta R^2$
+
+$\Delta R^2$ captures marginal predictive content conditional on a strong baseline. The Granger regressions include lagged factors as controls, which already absorb a substantial share of predictable variation due to the high persistence of latent economic components. In this context, any additional predictor can only explain residual movements around an already informative benchmark. Consequently, even genuinely informative leading indicators will mechanically deliver modest incremental gains in $\Delta R^2$.
+
+The interpretation of $\Delta R^2$ here is fundamentally diagnostic rather than forecasting-oriented. The objective of the analysis is not to achieve large improvements in predictive accuracy, but to identify which survey blocks and industries systematically lead the common factor. From this perspective, the relative ranking of indicators and the stability of their predictive contribution across specifications are more informative than the absolute magnitude of $R^2$ gains.
+ 
+
+\newpage
+ 
+## Appendix 
+### Lag Order Selection and robustness
+
+The autoregressive order $p = 2$ is consistent with the BIC-selected VAR order for factor dynamics established in Section 02. For the candidate predictor lags, we set $q = 5$ based on two considerations:
+
+1. **Empirical autocorrelation structure**: Industry-level survey responses exhibit significant autocorrelation up to approximately 5 months (follows the previous project report).
+
+2. **Economic rationale**: A 5-month distributed lag window captures both immediate responses and medium-term anticipation effects that are characteristic of business cycle leading indicators.
+
+To validate this specification, we conducted a grid search over $p \in \{1, 2, 3,4\}$ and $q \in \{1, 2, \ldots, 6\}$ using BIC averaged across top-performing cells. 
+
+```{r lag-selection-comprehensive, fig.width=12, fig.height=10, include=FALSE}
+# For each (p, q) combination, we evaluate:
+#   1. BIC (model fit with parsimony penalty)
+#   2. Mean ΔR² (average incremental predictive power)
+#   3. Significant count (BH-corrected, p < 0.05)
+
+# Grid: p ∈ {1, 2, 3, 4}, q ∈ {1, 2, 3, 4, 5, 6}
+p_grid <- 1:4
+q_grid <- 1:6
+
+granger_test_full <- function(F_j, x_c, p, q) {
+  T_full <- length(F_j)
+  max_lag <- max(p, q)
+  T_eff <- T_full - max_lag
+  
+  if (T_eff < (p + q + 20)) {
+    return(list(p_value = NA, delta_R2 = NA, bic = NA))
+  }
+  
+  y <- F_j[(max_lag + 1):T_full]
+  
+  # Factor lags
+  F_lags <- matrix(NA_real_, nrow = T_eff, ncol = p)
+  for (k in 1:p) F_lags[, k] <- F_j[(max_lag + 1 - k):(T_full - k)]
+  
+  # Predictor lags  
+  x_lags <- matrix(NA_real_, nrow = T_eff, ncol = q)
+  for (ell in 1:q) x_lags[, ell] <- x_c[(max_lag + 1 - ell):(T_full - ell)]
+  
+  # Restricted model
+  fit_R <- lm(y ~ ., data = data.frame(y = y, F_lags))
+  
+  # Unrestricted model
+  fit_U <- lm(y ~ ., data = data.frame(y = y, F_lags, x_lags))
+  
+  SSE_R <- sum(residuals(fit_R)^2)
+  SSE_U <- sum(residuals(fit_U)^2)
+  SST <- sum((y - mean(y))^2)
+  
+  # F-test
+  df1 <- q
+  df2 <- T_eff - p - q - 1
+  if (df2 <= 0) return(list(p_value = NA, delta_R2 = NA, bic = NA))
+  
+  F_stat <- ((SSE_R - SSE_U) / df1) / (SSE_U / df2)
+  p_value <- pf(F_stat, df1, df2, lower.tail = FALSE)
+  
+  # ΔR²
+  delta_R2 <- (SSE_R - SSE_U) / SST
+  
+  # BIC for unrestricted model
+  k_params <- p + q + 1
+  bic <- T_eff * log(SSE_U / T_eff) + k_params * log(T_eff)
+  
+  list(p_value = p_value, delta_R2 = delta_R2, bic = bic)
+}
+
+
+# Run full analysis for each (p, q)
+run_full_analysis <- function(F_mat, X_cell, p, q) {
+  r <- ncol(F_mat)
+  K <- ncol(X_cell)
+  
+  results <- data.frame(
+    factor = integer(),
+    cell = character(),
+    p_value = numeric(),
+    delta_R2 = numeric(),
+    bic = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  for (j in 1:r) {
+    for (k in 1:K) {
+      test <- granger_test_full(F_mat[, j], X_cell[, k], p, q)
+      
+      results <- rbind(results, data.frame(
+        factor = j,
+        cell = colnames(X_cell)[k],
+        p_value = test$p_value,
+        delta_R2 = test$delta_R2,
+        bic = test$bic,
+        stringsAsFactors = FALSE
+      ))
+    }
+  }
+  
+  # BH correction
+  results$p_adj_bh <- p.adjust(results$p_value, method = "BH")
+  
+  return(results)
+}
+
+# Compute metrics for all (p, q) combinations
+metrics_list <- list()
+
+for (p_val in p_grid) {
+  for (q_val in q_grid) {
+    res <- run_full_analysis(F_smooth, X_cell, p_val, q_val)
+    
+    # Compute summary metrics
+    sig_mask <- !is.na(res$p_adj_bh) & res$p_adj_bh < 0.05
+    
+    metrics_list[[paste0("p", p_val, "_q", q_val)]] <- data.frame(
+      p = p_val,
+      q = q_val,
+      # 1. Mean BIC (lower = better fit with parsimony)
+      mean_bic = mean(res$bic, na.rm = TRUE),
+      # 2. Significant count (higher = more predictors identified)
+      n_significant = sum(sig_mask),
+      # 3. Mean ΔR² across all tests (higher = stronger average signal)
+      mean_dR2_all = mean(res$delta_R2, na.rm = TRUE) * 100,
+      # 4. Mean ΔR² among significant only (quality of identified indicators)
+      mean_dR2_sig = ifelse(sum(sig_mask) > 0, 
+                            mean(res$delta_R2[sig_mask], na.rm = TRUE) * 100, 
+                            NA),
+      # 5. Median ΔR² among significant (robust central tendency)
+      median_dR2_sig = ifelse(sum(sig_mask) > 0,
+                              median(res$delta_R2[sig_mask], na.rm = TRUE) * 100,
+                              NA),
+      # 6. Max ΔR² (best single predictor)
+      max_dR2 = max(res$delta_R2, na.rm = TRUE) * 100,
+      stringsAsFactors = FALSE
+    )
+    
+  }
+}
+
+metrics_df <- bind_rows(metrics_list)
+
+metrics_display <- metrics_df |>
+  mutate(
+    mean_bic = round(mean_bic, 1),
+    mean_dR2_all = round(mean_dR2_all, 3),
+    mean_dR2_sig = round(mean_dR2_sig, 3),
+    median_dR2_sig = round(median_dR2_sig, 3),
+    max_dR2 = round(max_dR2, 2)
+  )
+
+kable(
+  metrics_display,
+  col.names = c("p", "q", "Mean BIC", "# Sig.", "Mean ΔR² (%)", 
+                "Mean ΔR² Sig. (%)", "Median ΔR² Sig. (%)", "Max ΔR² (%)"),
+  caption = "Lag Selection Metrics Across (p, q) Grid",
+  align = "c"
+) |>
+  kable_styling(bootstrap_options = c("striped", "condensed"), font_size = 10)
+
+# Identify Optimal by Different Criteria
+optimal_bic <- metrics_df[which.min(metrics_df$mean_bic), c("p", "q")]
+optimal_nsig <- metrics_df[which.max(metrics_df$n_significant), c("p", "q")]
+optimal_dR2 <- metrics_df[which.max(metrics_df$mean_dR2_sig), c("p", "q")]
+
+#cat("\nOptimal by criterion:\n")
+#cat("  Min BIC:           p =", optimal_bic$p, ", q =", optimal_bic$q, "\n")
+#cat("  Max # Significant: p =", optimal_nsig$p, ", q =", optimal_nsig$q, "\n")
+#cat("  Max Mean ΔR² (sig):p =", optimal_dR2$p, ", q =", optimal_dR2$q, "\n")
+#cat("  Baseline:          p = 2, q = 5\n")
+```
+
+
+```{r, fig.width=14, fig.height=6, out.width = "100%"}
+# Visualization: Multi-panel Heatmaps
+
+# Normalize metrics for comparison (0-1 scale, higher = better)
+metrics_norm <- metrics_df |>
+  mutate(
+    # BIC: lower is better, so invert
+    bic_score = 1 - (mean_bic - min(mean_bic)) / (max(mean_bic) - min(mean_bic)),
+    # Others: higher is better
+    nsig_score = (n_significant - min(n_significant)) / (max(n_significant) - min(n_significant)),
+    dR2_score = (mean_dR2_sig - min(mean_dR2_sig, na.rm=T)) / 
+                (max(mean_dR2_sig, na.rm=T) - min(mean_dR2_sig, na.rm=T)),
+    # Composite score (equal weights)
+    composite = (bic_score + nsig_score + replace_na(dR2_score, 0)) / 3
+  )
+
+optimal_composite <- metrics_norm[which.max(metrics_norm$composite), c("p", "q")]
+# cat("  Best Composite:    p =", optimal_composite$p, ", q =", optimal_composite$q, "\n")
+
+# Create 4-panel plot
+p1 <- ggplot(metrics_df, aes(x = factor(q), y = factor(p), fill = mean_bic)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(mean_bic, 0)), size = 3) +
+  scale_fill_gradient(low = "#F3E5F5", high = "#6A1B9A", name = "BIC") +
+  geom_tile(data = filter(metrics_df, p == 2, q == 5), 
+            color = "blue", linewidth = 1.5, fill = NA, linetype = "dashed") +
+  geom_tile(data = filter(metrics_df, p == optimal_bic$p, q == optimal_bic$q),
+            color = "black", linewidth = 1.5, fill = NA) +
+  labs(title = "A. Mean BIC (lower = better)", x = "q", y = "p") +
+  theme_minimal() +
+  theme(panel.grid = element_blank())
+
+p2 <- ggplot(metrics_df, aes(x = factor(q), y = factor(p), fill = n_significant)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = n_significant), size = 3) +
+  scale_fill_gradient(low = "#FADBD8", high = "#943126", name = "Count") +
+  geom_tile(data = filter(metrics_df, p == 2, q == 5), 
+            color = "blue", linewidth = 1.5, fill = NA, linetype = "dashed") +
+  geom_tile(data = filter(metrics_df, p == optimal_nsig$p, q == optimal_nsig$q),
+            color = "black", linewidth = 1.5, fill = NA) +
+  labs(title = "B. BH-Significant Count (higher = better)", x = "q", y = "p") +
+  theme_minimal() +
+  theme(panel.grid = element_blank())
+
+p3 <- ggplot(metrics_df, aes(x = factor(q), y = factor(p), fill = mean_dR2_sig)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(mean_dR2_sig, 2)), size = 3) +
+  scale_fill_gradient(low = "lightyellow", high = "darkgreen", name = "ΔR² (%)") +
+  geom_tile(data = filter(metrics_df, p == 2, q == 5), 
+            color = "blue", linewidth = 1.5, fill = NA, linetype = "dashed") +
+  geom_tile(data = filter(metrics_df, p == optimal_dR2$p, q == optimal_dR2$q),
+            color = "black", linewidth = 1.5, fill = NA) +
+  labs(title = "C. Mean ΔR² among Significant (%)", x = "q", y = "p") +
+  theme_minimal() +
+  theme(panel.grid = element_blank())
+
+
+combined_plot <- (p1 | p2 | p3) + 
+  plot_layout(guides = 'collect') & 
+  theme(legend.position = "right") &
+  plot_annotation(
+    title = "Lag Order Selection: Multi-Criteria Evaluation",
+    subtitle = "Black box = optimal for criterion | Blue dashed = baseline (p=2, q=5)",
+    theme = theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+                  plot.subtitle = element_text(hjust = 0.5, size = 12))
+  )
+
+
+combined_plot
+
+# The results confirm that $(p=2, q=5)$ is near-optimal, with BIC differences 
+# within 2 units of the minimum—indicating no strong evidence against the baseline specification.
+```
+
+
+The grid search reveals a trade-off between parsimony and predictive identification. While short-lag specifications such as \((p=3,q=1)\) prioritizes parsimony and restrict the dynamic structure, they identify a substantially smaller set of leading indicators, and the corresponding incremental explanatory power is also limited, with relatively small average \(\Delta R^2\) among the detected relationships.
+
+On the other side, extended lag specifications such as $(p=1, q=6)$ maximize the number of significant relationships and average $\Delta R^2$, but at the cost of substantially higher BIC values, indicating potential overfitting and reduced out-of-sample generalizability.
+
+The baseline specification \((p=2,q=5)\) represents a disciplined compromise between these extremes. It preserves consistency with the VAR(2) factor dynamics established in Section 02, captures the majority of robust predictive relationships identified by more expansive lag structures, and avoids introducing additional long-horizon lags whose marginal contribution is comparatively small.
+
+
+## Composite Leading Indicators (LCO-Based)
+
+Using the leave-cell-out validated results, we construct composite leading indicators for each factor based on the top 10 predictors ranked by $\Delta R^2$ (BH-corrected $p < 0.05$).
+
+```{r composite-lco-setup}
+top_k <- 10
+alpha_sig <- 0.05
+
+leading_indicator_lco <- vector("list", length = r)
+names(leading_indicator_lco) <- paste0("Factor_", 1:r)
+
+top_predictors_lco <- vector("list", length = r)
+names(top_predictors_lco) <- paste0("Factor_", 1:r)
+
+for (j in 1:r) {
+  key <- paste0("Factor_", j)
+  
+  # Use LCO Granger results with BH correction
+  dfj <- granger_results_lco[[j]] |>
+    filter(p_adj_bh < alpha_sig) |>
+    arrange(desc(delta_R2)) |>
+    slice_head(n = top_k)
+  
+  top_predictors_lco[[key]] <- dfj
+  
+  if (nrow(dfj) >= 1) {
+    # Weights by delta_R2
+    weights <- dfj$delta_R2 / sum(dfj$delta_R2)
+    
+    # Sign adjustment: ensure increases in composite predict factor increases
+    signs <- sign(dfj$beta_sum)
+    signs[signs == 0] <- 1
+    
+    z <- rep(0, T_obs)
+    
+    for (i in seq_len(nrow(dfj))) {
+      k <- which(cells == dfj$cell_id[i])
+      if (length(k) != 1) next
+      z <- z + weights[i] * signs[i] * X_cell[, k]
+    }
+    
+    leading_indicator_lco[[key]] <- scale(z)[, 1]
+    
+    cat("\n## Composite Leading Indicator Components for ", key, " (LCO-validated):\n", sep = "")
+    for (i in seq_len(nrow(dfj))) {
+      ind_name <- tryCatch(
+        get_industry_name_en(dfj$industry[i]),
+        error = function(e) dfj$industry[i]
+      )
+      sign_str <- ifelse(signs[i] > 0, "+", "-")
+      cat("  ", sign_str, " ", ind_name, " (", dfj$block[i], "): ",
+          round(weights[i] * 100, 1), "%\n", sep = "")
+    }
+    
+  } else {
+    leading_indicator_lco[[key]] <- rep(NA_real_, T_obs)
+    cat("\n## ", key, ": no significant predictors after LCO + BH correction\n", sep = "")
+  }
+}
+```
+
+```{r plot-composite-lco, fig.height=9, out.width="100%"}
+# Event markers
+event_dates <- as.Date(c("2008-09-15", "2011-08-01", "2020-03-01"))
+event_labels <- c("2008", "2011", "2020")
+
+plot_one_factor_lco <- function(factor_j,
+                                F_baseline, dates,
+                                leading_indicator_lco,
+                                event_dates, event_labels) {
+  
+  key <- paste0("Factor_", factor_j)
+  
+  z <- leading_indicator_lco[[key]]
+  
+  if (is.null(z) || all(is.na(z))) {
+    message("Skip ", key, ": leading indicator not found or all NA.")
+    return(NULL)
+  }
+  
+  plot_df <- data.frame(
+    date = dates,
+    Factor = scale(F_baseline[, factor_j])[, 1],
+    Leading_Indicator = as.numeric(z)
+  ) |>
+    pivot_longer(cols = -date, names_to = "series", values_to = "value")
+  
+  ggplot(plot_df, aes(x = date, y = value, color = series)) +
+    geom_line(linewidth = 1, alpha = 0.85) +
+    geom_hline(yintercept = 0, linetype = 3, color = "gray50") +
+    geom_vline(xintercept = event_dates, linetype = "dashed",
+               color = "red", linewidth = 0.6) +
+    annotate(
+      "text",
+      x = event_dates,
+      y = max(plot_df$value, na.rm = TRUE),
+      label = event_labels,
+      angle = 90,
+      vjust = -0.3,
+      hjust = 0,
+      color = "red",
+      size = 3
+    ) +
+    coord_cartesian(clip = "off") +
+    theme(plot.margin = margin(5.5, 20, 5.5, 5.5)) +
+    scale_color_manual(
+      values = c("Factor" = "steelblue", "Leading_Indicator" = "darkorange"),
+      labels = c(paste0("Factor ", factor_j), "Composite Leading Indicator")
+    ) +
+    labs(
+      title = paste0("Factor ", factor_j, " vs Composite Leading Indicator (LCO-validated)"),
+      x = NULL, y = "Standardized value", color = NULL
+    ) +
+    theme(legend.position = "bottom")
+}
+
+# Generate plots for all factors
+plots_lco <- lapply(1:r, function(j) {
+  plot_one_factor_lco(
+    factor_j = j,
+    F_baseline = F_baseline,
+    dates = dates,
+    leading_indicator_lco = leading_indicator_lco,
+    event_dates = event_dates,
+    event_labels = event_labels
+  )
+})
+
+# Drop NULLs
+plots_lco <- Filter(Negate(is.null), plots_lco)
+
+if (length(plots_lco) > 0) {
+  wrap_plots(plots_lco, ncol = 2)
+} else {
+  cat("No composite indicators available for plotting.\n")
+}
+```
+
+The LCO-validated composite indicators provide a cleaner measure of leading information, as they are constructed from predictors whose significance has been confirmed after removing potential circularity bias. These indicators are suitable for driving time-varying transition probabilities in regime-switching models.
+
+We will therefore adopt the LCO-based composite indicators for the subsequent regime-switching analysis in Section 05. 
+
+The transition probability specification follows:
+\begin{equation*}
+P(s_t = 1 \mid s_{t-1}, z_{t-1}) = \Phi(\gamma_0 + \gamma_1 z_{t-1})
+\end{equation*}
+
+where $z_{t-1}$ is the LCO-validated composite leading indicator constructed from the top 10 predictors (ranked by $\Delta R^2$, BH-corrected $p < 0.05$). When leading indicators deteriorate, the probability of transitioning into recession increases.
+
+```{r save-results, include=FALSE}
+# Save Results
+
+robustness_results <- list(
+  created_at = Sys.time(),
+  method = "Leave-Cell-Out Cross-Fitting with KFAS (Filtered Factors)",
+  
+  # LCO factors
+  F_lco_list = F_lco_list,
+  F_baseline_filtered = F_baseline,
+  lco_diagnostics = lco_diagnostics,
+  stability_summary = stability_summary,
+  
+  # Granger results
+  granger_results_baseline_filtered = granger_results_baseline_filtered,
+  granger_results_lco = granger_results_lco,
+  
+  # Comparison
+  comparison_summary = comparison_summary,
+  scatter_data = scatter_data,
+  cor_by_factor = cor_by_factor,
+  
+  # Top indicators
+  top_indicators_lco = top_lco_df,
+  
+  # Composite leading indicators (LCO-validated)
+  leading_indicator_lco = leading_indicator_lco,
+  top_predictors_lco = top_predictors_lco,
+  
+  # Parameters
+  p_lags = p_lags,
+  q_lags = q_lags,
+  alpha = 0.05
+)
+
+saveRDS(robustness_results, file = "output/robustness_lco_0402.rds")
+```
+
