@@ -1,0 +1,529 @@
+---
+title: "05 Markov-Switching DFM — Out-of-Sample Evaluation (Server)"
+author: "Weiyun Hong"
+output:
+  html_document:
+    toc: false
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE, warning = FALSE, message = FALSE,
+  cache = FALSE
+)
+```
+
+```{r load-packages, include=FALSE}
+library(dplyr)
+library(future)
+library(future.apply)
+source("ifo_data_processing.R")
+```
+
+```{r parallel-setup, include=FALSE}
+plan(multisession, workers = 18)
+cat("Workers:", nbrOfWorkers(), "\n")
+```
+
+This file performs the expanding-window out-of-sample evaluation for Appendix C.
+At each evaluation month $t$, the TVTP and Fixed-TP models are re-estimated on
+$\{1, \ldots, t\}$ using **only information available up to $t$** (no full-sample warm starts).
+The one-step-ahead filtered probability is recorded and saved to
+`output/ms_models/ms_oos_evaluation.rds`.
+
+```{r load-data, include=FALSE}
+dfm_state          <- readRDS("output/dfm_state_04.rds")
+robustness_results <- readRDS("output/robustness_lco_0402.rds")
+
+dates      <- dfm_state$dates
+r          <- dfm_state$r
+F_filtered <- robustness_results$F_baseline_filtered
+leading_indicator_lco <- robustness_results$leading_indicator_lco
+
+T_obs <- length(dates)
+
+cat("Sample:", as.character(min(dates)), "to", as.character(max(dates)), "\n")
+cat("T =", T_obs, ", r =", r, "\n")
+```
+
+
+```{r define-hamilton-filter}
+# Hamilton Filter
+
+hamilton_filter <- function(y, z, mu, phi, sigma,
+                            gamma_01 = c(-2, 0), gamma_10 = c(-2, 0),
+                            tvtp = FALSE) {
+  T_obs <- length(y)
+  prob_filtered <- matrix(NA, T_obs, 2)
+  prob_smoothed <- matrix(NA, T_obs, 2)
+  loglik <- 0
+
+  if (tvtp) {
+    p_01 <- pnorm(gamma_01[1] + gamma_01[2] * z)
+    p_10 <- pnorm(gamma_10[1] + gamma_10[2] * z)
+  } else {
+    p_01 <- rep(pnorm(gamma_01[1]), T_obs)
+    p_10 <- rep(pnorm(gamma_10[1]), T_obs)
+  }
+  p_01 <- pmax(pmin(p_01, 0.999), 0.001)
+  p_10 <- pmax(pmin(p_10, 0.999), 0.001)
+  p_00 <- 1 - p_01; p_11 <- 1 - p_10
+
+  denom <- (2 - p_00[1] - p_11[1])
+  if (abs(denom) < 1e-8) {
+    prob_prev <- c(0.5, 0.5)
+  } else {
+    pi_0 <- (1 - p_11[1]) / denom; pi_1 <- (1 - p_00[1]) / denom
+    prob_prev <- c(max(min(pi_0, 0.99), 0.01), max(min(pi_1, 0.99), 0.01))
+    prob_prev <- prob_prev / sum(prob_prev)
+  }
+
+  for (t in 1:T_obs) {
+    prob_pred <- c(p_00[t] * prob_prev[1] + p_10[t] * prob_prev[2],
+                   p_01[t] * prob_prev[1] + p_11[t] * prob_prev[2])
+    prob_pred <- pmax(prob_pred, 1e-10)
+    prob_pred <- prob_pred / sum(prob_pred)
+    y_pred <- if (t == 1) mu else mu + phi * (y[t-1] - mu)
+    dens <- pmax(dnorm(y[t] - y_pred, sd = sigma), 1e-300)
+    prob_update <- dens * prob_pred
+    marg_lik <- sum(prob_update)
+    if (marg_lik < 1e-300) { prob_update <- prob_pred
+    } else { prob_update <- prob_update / marg_lik; loglik <- loglik + log(marg_lik) }
+    prob_filtered[t, ] <- prob_update
+    prob_prev <- prob_update
+  }
+
+  # Kim smoother
+  prob_smoothed[T_obs, ] <- prob_filtered[T_obs, ]
+  for (t in (T_obs - 1):1) {
+    ppn <- c(p_00[t+1] * prob_filtered[t, 1] + p_10[t+1] * prob_filtered[t, 2],
+             p_01[t+1] * prob_filtered[t, 1] + p_11[t+1] * prob_filtered[t, 2])
+    ppn <- pmax(ppn, 1e-10)
+    ratio <- pmin(pmax(prob_smoothed[t+1, ] / ppn, 0.001), 1000)
+    prob_smoothed[t, ] <- prob_filtered[t, ] * c(
+      p_00[t+1] * ratio[1] + p_01[t+1] * ratio[2],
+      p_10[t+1] * ratio[1] + p_11[t+1] * ratio[2])
+    prob_smoothed[t, ] <- pmax(prob_smoothed[t, ], 1e-10)
+    prob_smoothed[t, ] <- prob_smoothed[t, ] / sum(prob_smoothed[t, ])
+  }
+
+  list(prob_filtered = prob_filtered, prob_smoothed = prob_smoothed,
+       p_01 = p_01, p_10 = p_10, loglik = loglik)
+}
+```
+
+
+```{r define-regime-helpers}
+# Regime identification — identical to 05_MS_DFM_Bootstrap
+
+identify_regime_swap <- function(mu, sigma) {
+  sigma_ratio <- max(sigma) / max(min(sigma), 0.01)
+  need_swap <- (sigma[1] > sigma[2])
+  list(need_swap = need_swap, sigma_ratio = sigma_ratio)
+}
+
+swap_model <- function(m, has_gamma = FALSE) {
+  m$mu    <- rev(m$mu);  m$phi <- rev(m$phi);  m$sigma <- rev(m$sigma)
+  tmp <- m$gamma_01;  m$gamma_01 <- m$gamma_10;  m$gamma_10 <- tmp
+  m$prob_filtered <- m$prob_filtered[, c(2, 1)]
+  m$prob_smoothed <- m$prob_smoothed[, c(2, 1)]
+  tmp_p <- m$p_01;  m$p_01 <- m$p_10;  m$p_10 <- tmp_p
+  m
+}
+```
+
+
+```{r define-oos-estimation}
+# ─────────────────────────────────────────────────────────────────────────────
+# estimate_ms_subsample(): re-estimation on subsample {1, ..., T_sub}
+#
+# NO full-sample warm start. All starting points are derived from the
+# subsample data only, matching the structure of _Bootstrap's estimate_msdfm:
+#   Fixed TP: 5 starts (2 structured + 3 random)
+#   TVTP: n_starts (4 structured + 6 gamma grid + random)
+#
+# Regime normalisation uses identify_regime_swap() + swap_model(),
+# identical to the main pipeline.
+# ─────────────────────────────────────────────────────────────────────────────
+
+estimate_ms_subsample <- function(y, z_raw, n_starts = 15) {
+
+  T_sub   <- length(y)
+  y_sd    <- sd(y, na.rm = TRUE)
+  y_range <- diff(range(y, na.rm = TRUE))
+  mu_lower <- min(y, na.rm = TRUE) - 0.5 * y_range
+  mu_upper <- max(y, na.rm = TRUE) + 0.5 * y_range
+
+  # Pre-process z
+  z_s <- z_raw[1:T_sub]
+  z_s[z_s < quantile(z_s, 0.01, na.rm = TRUE)] <- quantile(z_s, 0.01, na.rm = TRUE)
+  z_s[z_s > quantile(z_s, 0.99, na.rm = TRUE)] <- quantile(z_s, 0.99, na.rm = TRUE)
+  z_s <- scale(z_s)[, 1]
+  z_s <- pmax(pmin(z_s, 3.5), -3.5)
+  z_s <- c(0, z_s[-length(z_s)])  # lag one period
+
+  # Data-driven initial values
+  y_high <- y[y > quantile(y, 0.7, na.rm = TRUE)]
+  y_low  <- y[y < quantile(y, 0.3, na.rm = TRUE)]
+
+  mu_0_init    <- mean(y_high, na.rm = TRUE)
+  mu_1_init    <- mean(y_low,  na.rm = TRUE)
+  sigma_0_init <- max(sd(y_high, na.rm = TRUE), 0.1 * y_sd)
+  sigma_1_init <- max(sd(y_low,  na.rm = TRUE), 0.1 * y_sd)
+  phi_init     <- cor(y[-1], y[-T_sub], use = "complete.obs")
+  phi_init     <- max(min(phi_init, 0.95), 0.3)
+
+  # =====================================================================
+  # STEP 1: Fixed TP (8 parameters)
+  # 5 starting points (same structure as _Bootstrap lines 446-468)
+  # =====================================================================
+
+  neg_ll_fixed <- function(par) {
+    mu <- par[1:2]; phi <- pmin(pmax(par[3:4], 0.1), 0.995)
+    sigma <- exp(par[5:6])
+    g01 <- c(pmin(pmax(par[7], -3.5), 0), 0)
+    g10 <- c(pmin(pmax(par[8], -3.5), 0), 0)
+    tryCatch({
+      res <- hamilton_filter(y, z_s, mu, phi, sigma, g01, g10, tvtp = FALSE)
+      penalty <- 0
+      p01b <- pnorm(g01[1]); p10b <- pnorm(g10[1])
+      dur0 <- 1 / pmax(p01b, 0.001); dur1 <- 1 / pmax(p10b, 0.001)
+      if (dur0 < 3) penalty <- penalty + 50 * (3 - dur0)^2
+      if (dur1 < 3) penalty <- penalty + 50 * (3 - dur1)^2
+      if (p01b > 0.6 || p10b > 0.6) penalty <- penalty + 20
+      -(res$loglik - penalty)
+    }, error = function(e) 1e10)
+  }
+
+  fixed_starts <- list(
+    c(mu_0_init, mu_1_init, phi_init, phi_init,
+      log(sigma_0_init), log(sigma_1_init), -2.0, -1.5),
+    c(mu_1_init, mu_0_init, phi_init, phi_init,
+      log(sigma_1_init), log(sigma_0_init), -1.5, -2.0),
+    NULL, NULL, NULL
+  )
+  for (k in 3:5) {
+    fixed_starts[[k]] <- c(
+      mu_0_init + rnorm(1, 0, y_sd * 0.3),
+      mu_1_init + rnorm(1, 0, y_sd * 0.3),
+      pmin(pmax(phi_init + rnorm(1, 0, 0.1), 0.3), 0.95),
+      pmin(pmax(phi_init + rnorm(1, 0, 0.1), 0.3), 0.95),
+      log(max(sigma_0_init * exp(rnorm(1, 0, 0.3)), 0.1)),
+      log(max(sigma_1_init * exp(rnorm(1, 0, 0.3)), 0.1)),
+      runif(1, -2.5, -0.5),
+      runif(1, -2.5, -0.5)
+    )
+  }
+
+  best_fixed_ll  <- -1e10
+  best_fixed_par <- NULL
+
+  for (s in fixed_starts) {
+    opt <- tryCatch(
+      optim(s, neg_ll_fixed, method = "L-BFGS-B",
+            lower = c(mu_lower, mu_lower, 0.1, 0.1, -Inf, -Inf, -3.5, -3.5),
+            upper = c(mu_upper, mu_upper, 0.995, 0.995, Inf, Inf, 0, 0),
+            control = list(maxit = 2000)),
+      error = function(e) {
+        tryCatch(
+          optim(s, neg_ll_fixed, method = "BFGS",
+                control = list(maxit = 1000)),
+          error = function(e2) list(value = 1e10, par = s))
+      })
+    ll <- tryCatch({
+      p <- opt$par
+      hamilton_filter(y, z_s, p[1:2], pmin(pmax(p[3:4], 0.1), 0.995),
+                      exp(p[5:6]),
+                      c(pmin(pmax(p[7], -3.5), 0), 0),
+                      c(pmin(pmax(p[8], -3.5), 0), 0),
+                      tvtp = FALSE)$loglik
+    }, error = function(e) -1e10)
+    if (is.finite(ll) && ll > best_fixed_ll) {
+      best_fixed_ll  <- ll
+      best_fixed_par <- opt$par
+    }
+  }
+
+  if (is.null(best_fixed_par)) {
+    return(list(p_tvtp_last = NA, p_fixed_last = NA,
+                tvtp_loglik = NA, fixed_loglik = NA))
+  }
+
+  # Extract Fixed TP parameters
+  mu_fixed    <- best_fixed_par[1:2]
+  phi_fixed   <- pmin(pmax(best_fixed_par[3:4], 0.1), 0.995)
+  sigma_fixed <- exp(best_fixed_par[5:6])
+  g01_fixed   <- c(pmin(pmax(best_fixed_par[7], -3.5), 0), 0)
+  g10_fixed   <- c(pmin(pmax(best_fixed_par[8], -3.5), 0), 0)
+
+  flt_fixed <- hamilton_filter(y, z_s, mu_fixed, phi_fixed, sigma_fixed,
+                               g01_fixed, g10_fixed, tvtp = FALSE)
+
+  # Regime normalisation via identify_regime_swap + swap_model
+  rid_fixed <- identify_regime_swap(mu_fixed, sigma_fixed)
+  fixed_result <- list(
+    mu = mu_fixed, phi = phi_fixed, sigma = sigma_fixed,
+    gamma_01 = g01_fixed, gamma_10 = g10_fixed,
+    prob_filtered = flt_fixed$prob_filtered,
+    prob_smoothed = flt_fixed$prob_smoothed,
+    p_01 = flt_fixed$p_01, p_10 = flt_fixed$p_10
+  )
+  if (rid_fixed$need_swap) fixed_result <- swap_model(fixed_result)
+  p_fixed_last <- fixed_result$prob_filtered[T_sub, 2]
+
+  # =====================================================================
+  # STEP 2: TVTP (10 parameters)
+  # n_starts total (same structure as _Bootstrap lines 711-755):
+  #   1-4: structured from subsample's fixed result
+  #   5-10: gamma_slope_starts grid
+  #   11+: random perturbations
+  # =====================================================================
+
+  neg_ll_tvtp <- function(par) {
+    mu <- par[1:2]; phi <- pmin(pmax(par[3:4], 0.1), 0.995)
+    sigma <- exp(par[5:6])
+    g01 <- c(pmin(pmax(par[7], -3.5), 0), par[8])
+    g10 <- c(pmin(pmax(par[9], -3.5), 0), par[10])
+    if (any(abs(c(g01[2], g10[2])) > 2.5)) return(1e10)
+    tryCatch({
+      res <- hamilton_filter(y, z_s, mu, phi, sigma, g01, g10, tvtp = TRUE)
+      penalty <- 0
+      p01b <- pnorm(g01[1]); p10b <- pnorm(g10[1])
+      dur0 <- 1 / pmax(p01b, 0.001); dur1 <- 1 / pmax(p10b, 0.001)
+      if (dur0 < 3) penalty <- penalty + 50 * (3 - dur0)^2
+      if (dur1 < 3) penalty <- penalty + 50 * (3 - dur1)^2
+      for (zv in c(-3, 0, 3)) {
+        p01v <- pnorm(g01[1] + g01[2] * zv)
+        p10v <- pnorm(g10[1] + g10[2] * zv)
+        if (p01v > 0.7) penalty <- penalty + 30 * (p01v - 0.7)^2
+        if (p10v > 0.7) penalty <- penalty + 30 * (p10v - 0.7)^2
+      }
+      -(res$loglik - penalty)
+    }, error = function(e) 1e10)
+  }
+
+  # Use NORMALISED fixed result for starting points (post-swap)
+  mu_f    <- fixed_result$mu
+  phi_f   <- fixed_result$phi
+  sigma_f <- fixed_result$sigma
+  g01_f   <- fixed_result$gamma_01
+  g10_f   <- fixed_result$gamma_10
+
+  gamma_slope_starts <- c(-0.8, -0.5, -0.3, 0.3, 0.5, 0.8)
+
+  tvtp_starts <- list(
+    c(mu_f, phi_f, log(sigma_f), g01_f[1], 0, g10_f[1], 0),
+    c(mu_f, phi_f, log(sigma_f), g01_f[1], -0.5, g10_f[1], 0.5),
+    c(mu_f, phi_f, log(sigma_f), g01_f[1], 0.5, g10_f[1], -0.5),
+    c(mu_f, phi_f, log(sigma_f), g01_f[1], -1.0, g10_f[1], 1.0)
+  )
+  for (k in seq_along(gamma_slope_starts)) {
+    tvtp_starts[[4 + k]] <- c(
+      mu_f, phi_f, log(sigma_f),
+      g01_f[1], -abs(gamma_slope_starts[k]),
+      g10_f[1],  abs(gamma_slope_starts[k])
+    )
+  }
+  n_so_far <- length(tvtp_starts)
+  n_random <- max(n_starts - n_so_far, 0)
+  for (k in seq_len(n_random)) {
+    tvtp_starts[[n_so_far + k]] <- c(
+      mu_f + rnorm(2, 0, y_sd * 0.1),
+      phi_f + rnorm(2, 0, 0.03),
+      log(sigma_f) + rnorm(2, 0, 0.2),
+      g01_f[1] + rnorm(1, 0, 0.3), rnorm(1, 0, 0.8),
+      g10_f[1] + rnorm(1, 0, 0.3), rnorm(1, 0, 0.8)
+    )
+  }
+
+  best_tvtp_ll  <- -1e10
+  best_tvtp_par <- NULL
+
+  for (s in tvtp_starts) {
+    opt <- tryCatch(
+      optim(s, neg_ll_tvtp, method = "L-BFGS-B",
+            lower = c(mu_lower, mu_lower, 0.1, 0.1, -Inf, -Inf,
+                      -3.0, -2.5, -3.0, -2.5),
+            upper = c(mu_upper, mu_upper, 0.995, 0.995, Inf, Inf,
+                      -0.3, 2.5, -0.3, 2.5),
+            control = list(maxit = 2000)),
+      error = function(e) {
+        tryCatch(
+          optim(s, neg_ll_tvtp, method = "BFGS",
+                control = list(maxit = 3000)),
+          error = function(e2) {
+            tryCatch(
+              optim(s, neg_ll_tvtp, method = "Nelder-Mead",
+                    control = list(maxit = 5000)),
+              error = function(e3) list(value = 1e10, par = s))
+          })
+      })
+    ll <- tryCatch({
+      p <- opt$par
+      hamilton_filter(y, z_s, p[1:2], pmin(pmax(p[3:4], 0.1), 0.995),
+                      exp(p[5:6]),
+                      c(pmin(pmax(p[7], -3.5), 0), p[8]),
+                      c(pmin(pmax(p[9], -3.5), 0), p[10]),
+                      tvtp = TRUE)$loglik
+    }, error = function(e) -1e10)
+    if (is.finite(ll) && ll > best_tvtp_ll) {
+      best_tvtp_ll  <- ll
+      best_tvtp_par <- opt$par
+    }
+  }
+
+  if (is.null(best_tvtp_par)) {
+    return(list(p_tvtp_last = NA, p_fixed_last = p_fixed_last,
+                tvtp_loglik = NA, fixed_loglik = best_fixed_ll))
+  }
+
+  # Extract TVTP parameters
+  mu_tvtp    <- best_tvtp_par[1:2]
+  phi_tvtp   <- pmin(pmax(best_tvtp_par[3:4], 0.1), 0.995)
+  sigma_tvtp <- exp(best_tvtp_par[5:6])
+  g01_tvtp   <- c(pmin(pmax(best_tvtp_par[7], -3.5), 0), best_tvtp_par[8])
+  g10_tvtp   <- c(pmin(pmax(best_tvtp_par[9], -3.5), 0), best_tvtp_par[10])
+
+  flt_tvtp <- hamilton_filter(y, z_s, mu_tvtp, phi_tvtp, sigma_tvtp,
+                              g01_tvtp, g10_tvtp, tvtp = TRUE)
+
+  # Regime normalisation via identify_regime_swap + swap_model
+  rid_tvtp <- identify_regime_swap(mu_tvtp, sigma_tvtp)
+  tvtp_result <- list(
+    mu = mu_tvtp, phi = phi_tvtp, sigma = sigma_tvtp,
+    gamma_01 = g01_tvtp, gamma_10 = g10_tvtp,
+    prob_filtered = flt_tvtp$prob_filtered,
+    prob_smoothed = flt_tvtp$prob_smoothed,
+    p_01 = flt_tvtp$p_01, p_10 = flt_tvtp$p_10
+  )
+  if (rid_tvtp$need_swap) tvtp_result <- swap_model(tvtp_result, has_gamma = TRUE)
+  p_tvtp_last <- tvtp_result$prob_filtered[T_sub, 2]
+
+  list(
+    p_tvtp_last  = p_tvtp_last,
+    p_fixed_last = p_fixed_last,
+    tvtp_loglik  = best_tvtp_ll,
+    fixed_loglik = best_fixed_ll
+  )
+}
+```
+
+
+```{r run-oos-evaluation}
+eval_start <- as.Date("2007-01-01")
+eval_end   <- as.Date("2024-12-01")
+t0_idx     <- which(dates >= eval_start)[1]
+te_idx     <- max(which(dates <= eval_end))
+
+eval_indices <- t0_idx:te_idx
+eval_dates   <- dates[eval_indices]
+n_eval       <- length(eval_indices)
+
+cat("Evaluation window:", as.character(eval_start), "to",
+    as.character(dates[te_idx]), "\n")
+cat("Number of evaluation months:", n_eval, "\n")
+cat("Initial training window: T =", t0_idx - 1, "months\n\n")
+
+n_starts_tvtp <- 15
+
+filtered_tvtp  <- vector("list", r)
+filtered_fixed <- vector("list", r)
+
+oos_partial_path <- "output/ms_models/ms_oos_partial.rds"
+if (file.exists(oos_partial_path)) {
+  .tmp <- readRDS(oos_partial_path)
+  filtered_tvtp      <- .tmp$filtered_tvtp
+  filtered_fixed     <- .tmp$filtered_fixed
+  completed_factors  <- .tmp$completed_factors
+  cat("Resumed from checkpoint: factors",
+      paste(completed_factors, collapse = ", "), "done\n")
+  rm(.tmp)
+} else {
+  completed_factors <- integer(0)
+}
+
+for (j in 1:r) {
+  if (j %in% completed_factors) {
+    cat("Factor", j, ": already completed — skipping.\n")
+    next
+  }
+
+  cat("\n=== Factor", j, ": expanding-window evaluation ===\n")
+  cat("  Evaluation months:", n_eval,
+      "  TVTP starts per window:", n_starts_tvtp, "\n")
+
+  y_full     <- F_filtered[, j]
+  z_full_raw <- leading_indicator_lco[[paste0("Factor_", j)]]
+
+  res_list <- future_lapply(seq_along(eval_indices), function(i) {
+    t_end <- eval_indices[i]
+    y_sub <- y_full[1:t_end]
+    tryCatch(
+      estimate_ms_subsample(y_sub, z_full_raw, n_starts = n_starts_tvtp),
+      error = function(e) list(p_tvtp_last = NA, p_fixed_last = NA,
+                               tvtp_loglik = NA, fixed_loglik = NA)
+    )
+  }, future.seed = 42)
+
+  p_tvtp_vec  <- sapply(res_list, function(x) x$p_tvtp_last)
+  p_fixed_vec <- sapply(res_list, function(x) x$p_fixed_last)
+
+  filtered_tvtp[[j]]  <- p_tvtp_vec
+  filtered_fixed[[j]] <- p_fixed_vec
+
+  completed_factors <- c(completed_factors, j)
+
+  cat("  Done. Non-NA:", sum(!is.na(p_tvtp_vec)), "/", n_eval, "\n")
+  cat("  Mean P(Turb) TVTP:",  round(mean(p_tvtp_vec, na.rm = TRUE), 3),
+      "  Fixed:", round(mean(p_fixed_vec, na.rm = TRUE), 3), "\n")
+
+  saveRDS(list(
+    filtered_tvtp     = filtered_tvtp,
+    filtered_fixed    = filtered_fixed,
+    eval_dates        = eval_dates,
+    eval_indices      = eval_indices,
+    completed_factors = completed_factors,
+    date_saved        = Sys.time()
+  ), file = oos_partial_path)
+  cat("  [Checkpoint saved: Factor", j, "]\n")
+}
+
+oos_final_path <- "output/ms_models/ms_oos_evaluation.rds"
+
+saveRDS(list(
+  filtered_tvtp     = filtered_tvtp,
+  filtered_fixed    = filtered_fixed,
+  eval_dates        = eval_dates,
+  eval_indices      = eval_indices,
+  n_eval            = n_eval,
+  eval_start        = eval_start,
+  eval_end          = eval_end,
+  n_starts_tvtp     = n_starts_tvtp,
+  specification     = "Expanding-window OOS: TVTP (10p) and Fixed TP (8p), subsample-only starting points",
+  date_estimated    = Sys.time()
+), file = oos_final_path)
+
+cat("\n[Final OOS results saved to:", oos_final_path, "]\n")
+```
+
+
+```{r summary}
+cat("\n==============================\n")
+cat("OOS EVALUATION COMPLETE\n")
+cat("==============================\n")
+for (j in 1:r) {
+  if (is.null(filtered_tvtp[[j]])) next
+  cat("\nFactor", j, ":\n")
+  cat("  TVTP  — mean P:", round(mean(filtered_tvtp[[j]], na.rm = TRUE), 3),
+      "  max P:", round(max(filtered_tvtp[[j]], na.rm = TRUE), 3), "\n")
+  cat("  Fixed — mean P:", round(mean(filtered_fixed[[j]], na.rm = TRUE), 3),
+      "  max P:", round(max(filtered_fixed[[j]], na.rm = TRUE), 3), "\n")
+}
+```
+
+
+```{r cleanup}
+plan(sequential)
+cat("Parallel workers shut down.\n")
+```

@@ -1,0 +1,2451 @@
+---
+title: "05 Markov-Switching Dynamic Factor Model"
+author: "Weiyun Hong"
+header-includes:
+  - \usepackage{parskip}
+  - \setlength{\parskip}{0.5em}
+  - \usepackage{float}
+  - \usepackage{amsmath}
+  - \usepackage{amssymb}
+  - \usepackage{bm}
+  - \usepackage{longtable}  
+  - \usepackage{booktabs}
+  - \usepackage{array} 
+  - \usepackage{multirow} 
+  - \usepackage{colortbl}
+  - \usepackage{xeCJK}
+  - \usepackage{makecell}
+output:
+  pdf_document:
+    toc: false
+    latex_engine: xelatex
+  html_document:
+    toc: false
+    toc_float: true
+    number_sections: true
+    theme: cosmo
+    code_folding: hide
+always_allow_html: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE, 
+  warning = FALSE, 
+  message = FALSE,
+  fig.width = 10, 
+  fig.height = 6,
+  fig.align = "center",
+  cache = TRUE,
+  options(scipen = 999)
+)
+```
+
+```{r load-packages}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(knitr)
+library(kableExtra)
+library(KFAS)
+library(patchwork)
+library(lubridate)
+library(scales)
+source("ifo_data_processing.R")
+theme_set(theme_minimal())
+```
+
+Section 04 identified and validated leading indicators for each latent factor using leave-cell-out (LCO) cross-fitting. The composite leading indicators constructed from the top predictors were shown to anticipate factor movements. This section extends the analysis by incorporating **regime-switching dynamics** into the factor model under following considerations:
+
+1. **Business cycle asymmetry**: Economic contractions and expansions exhibit fundamentally different dynamics. Turbulent periods (recessions, crises) tend to be characterized by higher volatility and shorter duration than stable expansion phases.
+
+2. **Early detection regime transitions**: By allowing transition probabilities to depend on validated leading indicators, we can construct real-time crisis probability measures that respond sharply to structural shifts.
+
+
+```{r load-data, include=FALSE}
+dfm_state <- readRDS("output/dfm_state_04.rds")
+robustness_results <- readRDS("output/robustness_lco_0402.rds")
+
+dates <- dfm_state$dates
+r <- dfm_state$r
+F_smooth <- dfm_state$F_smooth
+F_filtered <- robustness_results$F_baseline_filtered
+
+# Leading indicators (LCO-validated)
+leading_indicator_lco <- robustness_results$leading_indicator_lco
+top_predictors_lco <- robustness_results$top_predictors_lco
+
+T_obs <- length(dates)
+
+cat("## Sample Information\n")
+cat("Period: ", as.character(min(dates)), " to ", as.character(max(dates)), "\n")
+cat("Observations: T =", T_obs, "\n")
+cat("Factors: r =", r, "\n")
+
+# Report indicator-factor correlations (for reference)
+cat("\n## Leading Indicator - Factor Correlations:\n")
+for (j in 1:r) {
+  key <- paste0("Factor_", j)
+  z_j <- leading_indicator_lco[[key]]
+  f_j <- F_filtered[, j]
+  if (!is.null(z_j) && !all(is.na(z_j))) {
+    cor_val <- cor(z_j, f_j, use = "complete.obs")
+    cat("  Factor ", j, ": r = ", round(cor_val, 3), "\n", sep = "")
+  }
+}
+```
+
+
+
+
+
+
+
+
+
+
+## Model Specification
+
+### Baseline: Hamilton (1989) Markov-Switching Model
+
+Consider the extracted factor $F_t$ following an AR(1) process with regime-dependent parameters:
+
+\begin{equation}
+F_t = \mu_{s_t} + \phi_{s_t} (F_{t-1} - \mu_{s_{t}}) + \sigma_{s_t} \varepsilon_t, \quad \varepsilon_t \sim N(0,1)
+\end{equation}
+
+where $s_t \in \{0, 1\}$ is the latent regime indicator:
+
+- $s_t = 0$: **Expansion** (low volatility, stable dynamics)
+- $s_t = 1$: **Turbulent/Crisis** (high volatility, disrupted dynamics)
+
+Note that the demeaning of $F_{t-1}$ uses the *current* regime's mean $\mu_{s_t}$ rather than the previous regime's mean $\mu_{s_{t-1}}$. This simplification avoids the computational burden of tracking joint $(s_{t-1}, s_t)$ pairs in the likelihood evaluation, and is a common specification in applied regime-switching literature (e.g., Krolzig, 1997; Clements & Krolzig, 1998). This specification treats assumes that the factor smoothly approaches a new level after a regime transition, akin to a dynamic response to a shock.
+
+The regime follows a first-order Markov chain with transition probabilities:
+
+\begin{equation}
+P(s_t = j \mid s_{t-1} = i) = p_{ij}, \quad \sum_{j=0}^{1} p_{ij} = 1
+\end{equation}
+
+The transition matrix at time $t$ is:
+\begin{equation}
+\mathbf{P}_t = \begin{pmatrix} p_{00} & p_{01} \\ p_{10} & p_{11} \end{pmatrix} = \begin{pmatrix} \Pr(s_t = 0 \mid s_{t-1} = 0) & \Pr(s_t = 1 \mid s_{t-1} = 0) \\ \Pr(s_t = 0 \mid s_{t-1} = 1) & \Pr(s_t = 1 \mid s_{t-1} = 1) \end{pmatrix} = \begin{pmatrix} 1 - p_{01,t} & p_{01,t} \\ p_{10,t} & 1 - p_{10,t} \end{pmatrix}
+\end{equation}
+
+where:
+
+- $p_{00}$: probability of staying in expansion
+- $p_{01} = 1 - p_{00}$: probability of transitioning from expansion to turbulent/crisis
+- $p_{11}$: probability of staying in turbulent/crisis
+- $p_{10} = 1 - p_{11}$: probability of transitioning from turbulent/crisis to expansion
+
+### Extension: Time-Varying Transition Probabilities (TVTP)
+
+Following Diebold, Lee & Weinbach (1994), we extend the baseline model to allow transition probabilities to depend on the LCO-validated composite leading indicator $z_{t-1}$:
+
+\begin{equation}
+p_{01,t} = P(s_t = 1 \mid s_{t-1} = 0, z_{t-1}) = \Phi(\gamma_{01,0} + \gamma_{01,1} z_{t-1})
+\end{equation}
+
+\begin{equation}
+p_{10,t} = P(s_t = 0 \mid s_{t-1} = 1, z_{t-1}) = \Phi(\gamma_{10,0} + \gamma_{10,1} z_{t-1})
+\end{equation}
+
+where $\Phi(\cdot)$ is the standard normal CDF (probit link function).
+
+
+
+
+
+
+## Estimation Algorithm
+
+### Hamilton Filter
+
+The Hamilton filter computes filtered regime probabilities $P(s_t \mid \mathcal{I}_t)$ recursively:
+
+**Initialization** ($t = 0$):
+\begin{equation}
+P(s_0 = j) = \pi_j \quad \text{(ergodic probabilities)}
+\end{equation}
+
+
+**Prediction** ($t-1 \to t$):
+\begin{equation}
+P(s_t = j \mid \mathcal{I}_{t-1}) = \sum_{i=0}^{1} p_{ij,t} \cdot P(s_{t-1} = i \mid \mathcal{I}_{t-1})
+\end{equation}
+
+For example, the predicted probability of being in expansion at time $t$ is given by
+\begin{equation}
+\begin{aligned}
+P(s_t = 0 \mid \mathcal{I}_{t-1})
+&= P(s_t = 0 \mid s_{t-1} = 0)\,P(s_{t-1} = 0 \mid \mathcal{I}_{t-1}) + P(s_t = 0 \mid s_{t-1} = 1)\,P(s_{t-1} = 1 \mid \mathcal{I}_{t-1}) \\
+&= p_{00,t}\,P(s_{t-1} = 0 \mid \mathcal{I}_{t-1}) 
+   + p_{10,t}\,P(s_{t-1} = 1 \mid \mathcal{I}_{t-1}).
+\end{aligned}
+\end{equation}
+
+**Likelihood contribution**:
+\begin{equation}
+f(F_t \mid s_t = j, \mathcal{I}_{t-1}) = \frac{1}{\sigma_j} \phi\left( \frac{F_t - \mu_j - \phi_j(F_{t-1} - \mu_{s_{t}})}{\sigma_j} \right)
+\end{equation}
+
+
+**Update** (Bayes' rule):
+\begin{equation}
+P(s_t = j \mid \mathcal{I}_t) = \frac{f(F_t \mid s_t = j, \mathcal{I}_{t-1}) \cdot P(s_t = j \mid \mathcal{I}_{t-1})}{f(F_t \mid \mathcal{I}_{t-1})}
+\end{equation}
+
+where the marginal likelihood is:
+\begin{equation}
+f(F_t \mid \mathcal{I}_{t-1}) = \sum_{j=0}^{1} f(F_t \mid s_t = j, \mathcal{I}_{t-1}) \cdot P(s_t = j \mid \mathcal{I}_{t-1})
+\end{equation}
+
+
+
+### Kim Smoother
+
+For historical regime classification, we use the Kim (1994) smoother to compute $P(s_t \mid \mathcal{I}_T)$:
+
+**Backward recursion** ($t = T-1, T-2, \ldots, 1$):
+\begin{equation}
+P(s_t = i \mid \mathcal{I}_T) = P(s_t = i \mid \mathcal{I}_t) \sum_{j=0}^{1} \frac{p_{ij,t+1} \cdot P(s_{t+1} = j \mid \mathcal{I}_T)}{P(s_{t+1} = j \mid \mathcal{I}_t)}
+\end{equation}
+
+### Log-Likelihood and MLE
+
+The log-likelihood function is:
+\begin{equation}
+\ell(\theta) = \sum_{t=1}^{T} \log f(F_t \mid \mathcal{I}_{t-1}; \theta)
+\end{equation}
+
+where $\theta = \{\mu_0, \mu_1, \phi_0, \phi_1, \sigma_0, \sigma_1, \gamma_{01}, \gamma_{10}\}$.
+
+We maximize $\ell(\theta)$ using numerical optimization via BFGS algorithm with multiple starting points.
+
+
+
+```{r define-hamilton-filter}
+# Hamilton Filter for MS-AR(1) with Time-Varying Transition Probabilities
+
+hamilton_filter <- function(y, z, mu, phi, sigma, 
+                               gamma_01 = c(-2, 0), gamma_10 = c(-2, 0), 
+                               tvtp = FALSE) {
+  T_obs <- length(y)
+  
+  # Initialize storage
+  prob_filtered <- matrix(NA, T_obs, 2)
+  prob_smoothed <- matrix(NA, T_obs, 2)
+  p_01 <- numeric(T_obs)
+  p_10 <- numeric(T_obs)
+  loglik <- 0
+  
+  # Compute transition probabilities
+  # Note: z passed in is already lagged by one period (z_{t-1}) by the caller in line 406.
+  # Therefore p_{01}[t] = Phi(gamma_01_0 + gamma_01_1 * z_{t-1}), as specified.
+  if (tvtp) {
+    p_01 <- pnorm(gamma_01[1] + gamma_01[2] * z)
+    p_10 <- pnorm(gamma_10[1] + gamma_10[2] * z)
+  } else {
+    p_01 <- rep(pnorm(gamma_01[1]), T_obs)
+    p_10 <- rep(pnorm(gamma_10[1]), T_obs)
+  }
+  
+  # Bound transition probabilities away from 0/1
+  p_01 <- pmax(pmin(p_01, 0.999), 0.001)
+  p_10 <- pmax(pmin(p_10, 0.999), 0.001)
+  
+  p_00 <- 1 - p_01
+  p_11 <- 1 - p_10
+  
+  # Initialization: ergodic probabilities
+  denom <- (2 - p_00[1] - p_11[1])
+  if (abs(denom) < 1e-8) {
+    prob_init <- c(0.5, 0.5)
+  } else {
+    pi_0 <- (1 - p_11[1]) / denom
+    pi_1 <- (1 - p_00[1]) / denom
+    prob_init <- c(max(min(pi_0, 0.99), 0.01), max(min(pi_1, 0.99), 0.01))
+    prob_init <- prob_init / sum(prob_init)
+  }
+  
+  prob_prev <- prob_init
+  
+  # Forward pass (Hamilton filter)
+  for (t in 1:T_obs) {
+    # Prediction
+    prob_pred <- c(
+      p_00[t] * prob_prev[1] + p_10[t] * prob_prev[2],
+      p_01[t] * prob_prev[1] + p_11[t] * prob_prev[2]
+    )
+    prob_pred <- pmax(prob_pred, 1e-10)
+    prob_pred <- prob_pred / sum(prob_pred)
+    
+    # Likelihood for each regime
+    if (t == 1) {
+      y_pred <- mu
+    } else {
+      y_pred <- mu + phi * (y[t-1] - mu)
+    }
+    
+    innov <- y[t] - y_pred
+    dens <- dnorm(innov, mean = 0, sd = sigma)
+    dens <- pmax(dens, 1e-300)
+    
+    # Update (Bayes' rule)
+    prob_update <- dens * prob_pred
+    marg_lik <- sum(prob_update)
+    
+    if (marg_lik < 1e-300) {
+      prob_update <- prob_pred
+    } else {
+      prob_update <- prob_update / marg_lik
+      loglik <- loglik + log(marg_lik)
+    }
+    
+    prob_filtered[t, ] <- prob_update
+    prob_prev <- prob_update
+  }
+  
+  # Backward pass (Kim smoother)
+  prob_smoothed[T_obs, ] <- prob_filtered[T_obs, ]
+  
+  for (t in (T_obs - 1):1) {
+    prob_pred_next <- c(
+      p_00[t+1] * prob_filtered[t, 1] + p_10[t+1] * prob_filtered[t, 2],
+      p_01[t+1] * prob_filtered[t, 1] + p_11[t+1] * prob_filtered[t, 2]
+    )
+    prob_pred_next <- pmax(prob_pred_next, 1e-10)
+    
+    ratio <- prob_smoothed[t+1, ] / prob_pred_next
+    ratio <- pmin(pmax(ratio, 0.001), 1000)
+    
+    prob_smoothed[t, ] <- prob_filtered[t, ] * c(
+      p_00[t+1] * ratio[1] + p_01[t+1] * ratio[2],
+      p_10[t+1] * ratio[1] + p_11[t+1] * ratio[2]
+    )
+    
+    prob_smoothed[t, ] <- pmax(prob_smoothed[t, ], 1e-10)
+    prob_smoothed[t, ] <- prob_smoothed[t, ] / sum(prob_smoothed[t, ])
+  }
+  
+  list(
+    prob_filtered = prob_filtered,
+    prob_smoothed = prob_smoothed,
+    p_01 = p_01,
+    p_10 = p_10,
+    p_00 = p_00,
+    p_11 = p_11,
+    loglik = loglik
+  )
+}
+```
+
+```{r define-regime-identifier}
+# Regime normalization: enforce R0 = expansion (lower sigma), R1 = turbulent.
+# Identification is purely by volatility — the high-sigma regime is turbulent.
+# If sigma_ratio < 1.5 the regimes are not well-separated; a warning is issued
+# but the volatility criterion is still applied (lower sigma = expansion).
+
+identify_regime_swap <- function(mu, sigma) {
+  sigma_ratio <- max(sigma) / max(min(sigma), 0.01)
+
+  if (sigma_ratio < 1.5) {
+    warning(sprintf(
+      "sigma_ratio = %.2f < 1.5: regimes not well-separated, volatility criterion may be unreliable",
+      sigma_ratio
+    ))
+  }
+
+  # R0 = lower sigma = expansion; swap if the optimizer put high-sigma in slot 1
+  need_swap <- (sigma[1] > sigma[2])
+
+  list(
+    need_swap   = need_swap,
+    sigma_ratio = sigma_ratio
+  )
+}
+```
+
+```{r define-estimation-function}
+# MS-DFM Estimation with Cascade-Based Regime Identification
+
+estimate_msdfm <- function(y, z, tvtp = TRUE, n_starts = 15, verbose = FALSE) {
+  
+  T_obs <- length(y)
+  y_mean <- mean(y, na.rm = TRUE)
+  y_sd <- sd(y, na.rm = TRUE)
+  y_range <- diff(range(y, na.rm = TRUE))
+  
+  # Winsorize and standardize leading indicator
+  z_scaled <- z
+  z_scaled[z_scaled < quantile(z, 0.01, na.rm = TRUE)] <- quantile(z, 0.01, na.rm = TRUE)
+  z_scaled[z_scaled > quantile(z, 0.99, na.rm = TRUE)] <- quantile(z, 0.99, na.rm = TRUE)
+  z_scaled <- scale(z_scaled)[, 1]
+  z_scaled <- pmax(pmin(z_scaled, 3.5), -3.5)
+  
+  # Lag the leading indicator
+  z_scaled <- c(0, z_scaled[-length(z_scaled)])  # first obs uses z=0 (neutral)
+  
+  # Parameter bounds
+  mu_lower <- min(y, na.rm = TRUE) - 0.5 * y_range
+  mu_upper <- max(y, na.rm = TRUE) + 0.5 * y_range
+  
+  # =========================================================
+  # STEP 1: Fixed TP Model
+  # =========================================================
+  
+  neg_loglik_fixed <- function(par) {
+    mu <- par[1:2]
+    phi <- pmin(pmax(par[3:4], 0.1), 0.995)
+    sigma <- exp(par[5:6])
+    gamma_01 <- c(pmin(pmax(par[7], -3.5), 0), 0)
+    gamma_10 <- c(pmin(pmax(par[8], -3.5), 0), 0)
+    
+    tryCatch({
+      res <- hamilton_filter(y, z_scaled, mu, phi, sigma, gamma_01, gamma_10, tvtp = FALSE)
+      
+      # Soft penalties
+      mean_p01 <- pnorm(gamma_01[1])
+      mean_p10 <- pnorm(gamma_10[1])
+      duration_0 <- 1 / pmax(mean_p01, 0.001)
+      duration_1 <- 1 / pmax(mean_p10, 0.001)
+      
+      penalty <- 0
+      if (duration_0 < 3) penalty <- penalty + 50 * (3 - duration_0)^2
+      if (duration_1 < 3) penalty <- penalty + 50 * (3 - duration_1)^2
+      if (mean_p01 > 0.6 || mean_p10 > 0.6) penalty <- penalty + 20
+      
+      -(res$loglik - penalty)
+    }, error = function(e) 1e10)
+  }
+  
+  # Initial estimates
+  y_high <- y[y > quantile(y, 0.7, na.rm = TRUE)]
+  y_low <- y[y < quantile(y, 0.3, na.rm = TRUE)]
+  
+  mu_0_base <- mean(y_high, na.rm = TRUE)
+  mu_1_base <- mean(y_low, na.rm = TRUE)
+  sigma_0_base <- max(sd(y_high, na.rm = TRUE), 0.1 * y_sd)
+  sigma_1_base <- max(sd(y_low, na.rm = TRUE), 0.1 * y_sd)
+  
+  phi_base <- cor(y[-1], y[-T_obs], use = "complete.obs")
+  phi_base <- max(min(phi_base, 0.95), 0.3)
+  
+  if (verbose) {
+    cat("Initial estimates:\n")
+    cat("  mu = (", round(mu_0_base, 2), ", ", round(mu_1_base, 2), ")\n")
+    cat("  sigma = (", round(sigma_0_base, 2), ", ", round(sigma_1_base, 2), ")\n")
+    cat("  phi = ", round(phi_base, 3), "\n")
+  }
+  
+  # Multiple starting points for Fixed model
+  best_fixed_loglik <- -1e10
+  best_fixed <- NULL
+  
+  for (start_idx in 1:5) {
+    if (start_idx == 1) {
+      par_init <- c(mu_0_base, mu_1_base,
+                    phi_base, phi_base,
+                    log(sigma_0_base), log(sigma_1_base),
+                    -2.0, -1.5)
+    } else if (start_idx == 2) {
+      par_init <- c(mu_1_base, mu_0_base,
+                    phi_base, phi_base,
+                    log(sigma_1_base), log(sigma_0_base),
+                    -1.5, -2.0)
+    } else {
+      par_init <- c(
+        mu_0_base + rnorm(1, 0, y_sd * 0.3),
+        mu_1_base + rnorm(1, 0, y_sd * 0.3),
+        pmin(pmax(phi_base + rnorm(1, 0, 0.1), 0.3), 0.95),
+        pmin(pmax(phi_base + rnorm(1, 0, 0.1), 0.3), 0.95),
+        log(max(sigma_0_base * exp(rnorm(1, 0, 0.3)), 0.1)),
+        log(max(sigma_1_base * exp(rnorm(1, 0, 0.3)), 0.1)),
+        runif(1, -2.5, -0.5),
+        runif(1, -2.5, -0.5)
+      )
+    }
+    
+    opt <- tryCatch({
+      optim(par_init, neg_loglik_fixed, method = "L-BFGS-B",
+            lower = c(mu_lower, mu_lower, 0.1, 0.1, -Inf, -Inf, -3.5, -3.5),
+            upper = c(mu_upper, mu_upper, 0.995, 0.995, Inf, Inf, 0, 0),
+            control = list(maxit = 2000))
+    }, error = function(e) {
+      tryCatch({
+        optim(par_init, neg_loglik_fixed, method = "BFGS",
+              control = list(maxit = 1000))
+      }, error = function(e2) list(value = 1e10, par = par_init))
+    })
+    
+    # Evaluate true log-likelihood
+    opt_pars <- opt$par
+    mu_try <- opt_pars[1:2]
+    phi_try <- pmin(pmax(opt_pars[3:4], 0.1), 0.995)
+    sigma_try <- exp(opt_pars[5:6])
+    gamma_01_try <- c(pmin(pmax(opt_pars[7], -3.5), 0), 0)
+    gamma_10_try <- c(pmin(pmax(opt_pars[8], -3.5), 0), 0)
+    
+    true_loglik <- tryCatch({
+      res <- hamilton_filter(y, z_scaled, mu_try, phi_try, sigma_try,
+                                gamma_01_try, gamma_10_try, tvtp = FALSE)
+      res$loglik
+    }, error = function(e) -1e10)
+    
+    if (true_loglik > best_fixed_loglik && is.finite(true_loglik)) {
+      best_fixed_loglik <- true_loglik
+      best_fixed <- opt
+    }
+  }
+  
+  # Extract Fixed TP parameters
+  p_fixed <- best_fixed$par
+  mu_fixed <- p_fixed[1:2]
+  phi_fixed <- pmin(pmax(p_fixed[3:4], 0.1), 0.995)
+  sigma_fixed <- exp(p_fixed[5:6])
+  gamma_01_fixed <- c(pmin(pmax(p_fixed[7], -3.5), 0), 0)
+  gamma_10_fixed <- c(pmin(pmax(p_fixed[8], -3.5), 0), 0)
+  
+  filter_fixed <- hamilton_filter(y, z_scaled, mu_fixed, phi_fixed, sigma_fixed,
+                                     gamma_01_fixed, gamma_10_fixed, tvtp = FALSE)
+  best_fixed_loglik <- filter_fixed$loglik
+  
+  mean_p01 <- pnorm(gamma_01_fixed[1])
+  mean_p10 <- pnorm(gamma_10_fixed[1])
+  
+  fixed_result <- list(
+    mu = mu_fixed,
+    phi = phi_fixed,
+    sigma = sigma_fixed,
+    gamma_01 = gamma_01_fixed,
+    gamma_10 = gamma_10_fixed,
+    loglik = best_fixed_loglik,
+    aic = 2 * 8 - 2 * best_fixed_loglik,
+    bic = 8 * log(T_obs) - 2 * best_fixed_loglik,
+    prob_filtered = filter_fixed$prob_filtered,
+    prob_smoothed = filter_fixed$prob_smoothed,
+    p_01 = filter_fixed$p_01,
+    p_10 = filter_fixed$p_10,
+    duration_R0 = 1 / pmax(mean_p01, 0.001),
+    duration_R1 = 1 / pmax(mean_p10, 0.001)
+  )
+  
+  if (verbose) {
+    cat("\nFixed TP Results:\n")
+    cat("  LogLik = ", round(best_fixed_loglik, 2), "\n")
+    cat("  mu = (", round(mu_fixed[1], 2), ", ", round(mu_fixed[2], 2), ")\n")
+    cat("  sigma = (", round(sigma_fixed[1], 2), ", ", round(sigma_fixed[2], 2), ")\n")
+    cat("  phi = (", round(phi_fixed[1], 3), ", ", round(phi_fixed[2], 3), ")\n")
+    cat("  E[Dur] R0 = ", round(fixed_result$duration_R0, 1), 
+        ", E[Dur] R1 = ", round(fixed_result$duration_R1, 1), "\n")
+  }
+  
+  # =========================================================
+  # STEP 1b: Restricted Model (constant phi, regime-dependent sigma)
+  # 7 parameters: mu0, mu1, phi_common, log(sigma0), log(sigma1),
+  #               gamma_01_intercept, gamma_10_intercept
+  # Motivation: Table 2 shows phi_0 ≈ phi_1 across factors but sigma_0 << sigma_1.
+  # Restricting to a single phi removes one redundant parameter.
+  # =========================================================
+
+  neg_loglik_restricted <- function(par) {
+    mu         <- par[1:2]
+    phi_common <- pmin(pmax(par[3], 0.1), 0.995)
+    phi        <- c(phi_common, phi_common)   # single phi shared across regimes
+    sigma      <- exp(par[4:5])
+    gamma_01   <- c(pmin(pmax(par[6], -3.5), 0), 0)
+    gamma_10   <- c(pmin(pmax(par[7], -3.5), 0), 0)
+
+    tryCatch({
+      res <- hamilton_filter(y, z_scaled, mu, phi, sigma, gamma_01, gamma_10, tvtp = FALSE)
+
+      mean_p01   <- pnorm(gamma_01[1])
+      mean_p10   <- pnorm(gamma_10[1])
+      duration_0 <- 1 / pmax(mean_p01, 0.001)
+      duration_1 <- 1 / pmax(mean_p10, 0.001)
+
+      penalty <- 0
+      if (duration_0 < 3) penalty <- penalty + 50 * (3 - duration_0)^2
+      if (duration_1 < 3) penalty <- penalty + 50 * (3 - duration_1)^2
+      if (mean_p01 > 0.6 || mean_p10 > 0.6) penalty <- penalty + 20
+
+      -(res$loglik - penalty)
+    }, error = function(e) 1e10)
+  }
+
+  best_restr_loglik <- -1e10
+  best_restr        <- NULL
+
+  for (start_idx in 1:5) {
+    if (start_idx == 1) {
+      par_init_r <- c(mu_fixed,
+                      mean(phi_fixed),
+                      log(sigma_fixed),
+                      gamma_01_fixed[1],
+                      gamma_10_fixed[1])
+    } else {
+      par_init_r <- c(
+        mu_fixed + rnorm(2, 0, y_sd * 0.2),
+        pmin(pmax(mean(phi_fixed) + rnorm(1, 0, 0.05), 0.3), 0.95),
+        log(sigma_fixed) + rnorm(2, 0, 0.2),
+        runif(1, -2.5, -0.5),
+        runif(1, -2.5, -0.5)
+      )
+    }
+
+    opt_r <- tryCatch(
+      optim(par_init_r, neg_loglik_restricted, method = "L-BFGS-B",
+            lower = c(mu_lower, mu_lower, 0.1, -Inf, -Inf, -3.5, -3.5),
+            upper = c(mu_upper, mu_upper, 0.995, Inf, Inf, 0, 0),
+            control = list(maxit = 2000)),
+      error = function(e) {
+        tryCatch(
+          optim(par_init_r, neg_loglik_restricted, method = "BFGS",
+                control = list(maxit = 1000)),
+          error = function(e2) list(value = 1e10, par = par_init_r)
+        )
+      }
+    )
+
+    true_loglik_r <- tryCatch({
+      p_r   <- opt_r$par
+      phi_r <- rep(pmin(pmax(p_r[3], 0.1), 0.995), 2)
+      sig_r <- exp(p_r[4:5])
+      g01_r <- c(pmin(pmax(p_r[6], -3.5), 0), 0)
+      g10_r <- c(pmin(pmax(p_r[7], -3.5), 0), 0)
+      hamilton_filter(y, z_scaled, p_r[1:2], phi_r, sig_r,
+                      g01_r, g10_r, tvtp = FALSE)$loglik
+    }, error = function(e) -1e10)
+
+    if (true_loglik_r > best_restr_loglik && is.finite(true_loglik_r)) {
+      best_restr_loglik <- true_loglik_r
+      best_restr        <- opt_r
+    }
+  }
+
+  p_r         <- best_restr$par
+  phi_restr   <- rep(pmin(pmax(p_r[3], 0.1), 0.995), 2)
+  sigma_restr <- exp(p_r[4:5])
+  g01_restr   <- c(pmin(pmax(p_r[6], -3.5), 0), 0)
+  g10_restr   <- c(pmin(pmax(p_r[7], -3.5), 0), 0)
+
+  filter_restr      <- hamilton_filter(y, z_scaled, p_r[1:2], phi_restr, sigma_restr,
+                                        g01_restr, g10_restr, tvtp = FALSE)
+  best_restr_loglik <- filter_restr$loglik
+
+  mean_p01_r <- pnorm(g01_restr[1])
+  mean_p10_r <- pnorm(g10_restr[1])
+
+  restr_result <- list(
+    mu          = p_r[1:2],
+    phi         = phi_restr,
+    sigma       = sigma_restr,
+    gamma_01    = g01_restr,
+    gamma_10    = g10_restr,
+    loglik      = best_restr_loglik,
+    aic         = 2 * 7 - 2 * best_restr_loglik,          # k = 7
+    bic         = 7 * log(T_obs) - 2 * best_restr_loglik,
+    prob_filtered = filter_restr$prob_filtered,
+    prob_smoothed = filter_restr$prob_smoothed,
+    p_01        = filter_restr$p_01,
+    p_10        = filter_restr$p_10,
+    duration_R0 = 1 / pmax(mean_p01_r, 0.001),
+    duration_R1 = 1 / pmax(mean_p10_r, 0.001)
+  )
+
+  if (verbose) {
+    cat("\nRestricted (constant phi) Results:\n")
+    cat("  LogLik =", round(best_restr_loglik, 2), "\n")
+    cat("  phi_common =", round(phi_restr[1], 3), "\n")
+    cat("  sigma = (", round(sigma_restr[1], 2), ",", round(sigma_restr[2], 2), ")\n")
+  }
+
+  # =========================================================
+  # STEP 2: TVTP Model
+  # =========================================================
+
+  if (!tvtp) {
+    return(list(fixed = fixed_result, restr = restr_result, tvtp = fixed_result))
+  }
+  
+  neg_loglik_tvtp <- function(par) {
+    mu <- par[1:2]
+    phi <- pmin(pmax(par[3:4], 0.1), 0.995)
+    sigma <- exp(par[5:6])
+    gamma_01 <- c(pmin(pmax(par[7], -3.5), 0), par[8])
+    gamma_10 <- c(pmin(pmax(par[9], -3.5), 0), par[10])
+    
+    if (any(abs(c(gamma_01[2], gamma_10[2])) > 2.5)) return(1e10)
+    
+    tryCatch({
+      res <- hamilton_filter(y, z_scaled, mu, phi, sigma, gamma_01, gamma_10, tvtp = TRUE)
+      
+      penalty <- 0
+      
+      p01_base <- pnorm(gamma_01[1])
+      p10_base <- pnorm(gamma_10[1])
+      E_dur_0 <- 1 / pmax(p01_base, 0.001)
+      E_dur_1 <- 1 / pmax(p10_base, 0.001)
+      if (E_dur_0 < 3) penalty <- penalty + 50 * (3 - E_dur_0)^2
+      if (E_dur_1 < 3) penalty <- penalty + 50 * (3 - E_dur_1)^2
+      
+      z_extremes <- c(-3, 0, 3)
+      for (z_val in z_extremes) {
+        p01 <- pnorm(gamma_01[1] + gamma_01[2] * z_val)
+        p10 <- pnorm(gamma_10[1] + gamma_10[2] * z_val)
+        if (p01 > 0.7) penalty <- penalty + 30 * (p01 - 0.7)^2
+        if (p10 > 0.7) penalty <- penalty + 30 * (p10 - 0.7)^2
+      }
+      
+      -(res$loglik - penalty)
+    }, error = function(e) 1e10)
+  }
+  
+  # Multiple starting points for TVTP
+  best_tvtp_loglik <- -1e10
+  best_tvtp <- NULL
+  
+  gamma_slope_starts <- c(-0.8, -0.5, -0.3, 0.3, 0.5, 0.8)
+  
+  for (start_idx in 1:n_starts) {
+    if (start_idx == 1) {
+      par_init <- c(
+        mu_fixed, phi_fixed, log(sigma_fixed),
+        gamma_01_fixed[1], 0,
+        gamma_10_fixed[1], 0
+      )
+    } else if (start_idx == 2) {
+      par_init <- c(
+        mu_fixed, phi_fixed, log(sigma_fixed),
+        gamma_01_fixed[1], -0.5,
+        gamma_10_fixed[1], 0.5
+      )
+    } else if (start_idx == 3) {
+      par_init <- c(
+        mu_fixed, phi_fixed, log(sigma_fixed),
+        gamma_01_fixed[1], 0.5,
+        gamma_10_fixed[1], -0.5
+      )
+    } else if (start_idx == 4) {
+      par_init <- c(
+        mu_fixed, phi_fixed, log(sigma_fixed),
+        gamma_01_fixed[1], -1.0,
+        gamma_10_fixed[1], 1.0
+      )
+    } else if (start_idx <= 4 + length(gamma_slope_starts)) {
+      idx <- start_idx - 4
+      gamma_01_slope <- -abs(gamma_slope_starts[idx])
+      gamma_10_slope <- abs(gamma_slope_starts[idx])
+      par_init <- c(
+        mu_fixed, phi_fixed, log(sigma_fixed),
+        gamma_01_fixed[1], gamma_01_slope,
+        gamma_10_fixed[1], gamma_10_slope
+      )
+    } else {
+      gamma_01_slope <- rnorm(1, 0, 0.8)
+      gamma_10_slope <- rnorm(1, 0, 0.8)
+      par_init <- c(
+        mu_fixed + rnorm(2, 0, y_sd * 0.1),
+        phi_fixed + rnorm(2, 0, 0.03),
+        log(sigma_fixed) + rnorm(2, 0, 0.2),
+        gamma_01_fixed[1] + rnorm(1, 0, 0.3), gamma_01_slope,
+        gamma_10_fixed[1] + rnorm(1, 0, 0.3), gamma_10_slope
+      )
+    }
+    
+    opt <- tryCatch({
+      optim(par_init, neg_loglik_tvtp, method = "L-BFGS-B",
+            lower = c(mu_lower, mu_lower, 0.1, 0.1, -Inf, -Inf, 
+                      -3.0, -2.5, -3.0, -2.5),
+            upper = c(mu_upper, mu_upper, 0.995, 0.995, Inf, Inf,  
+                      -0.3, 2.5, -0.3, 2.5),
+            control = list(maxit = 2000))
+    }, error = function(e) {
+      tryCatch({
+        optim(par_init, neg_loglik_tvtp, method = "BFGS",
+              control = list(maxit = 3000))
+      }, error = function(e2) {
+        tryCatch({
+          optim(par_init, neg_loglik_tvtp, method = "Nelder-Mead",
+                control = list(maxit = 5000))
+        }, error = function(e3) list(value = 1e10, par = par_init))
+      })
+    })
+    
+    # Evaluate true log-likelihood
+    opt_pars <- opt$par
+    mu_try <- opt_pars[1:2]
+    phi_try <- pmin(pmax(opt_pars[3:4], 0.1), 0.995)
+    sigma_try <- exp(opt_pars[5:6])
+    gamma_01_try <- c(pmin(pmax(opt_pars[7], -3.5), 0), opt_pars[8])
+    gamma_10_try <- c(pmin(pmax(opt_pars[9], -3.5), 0), opt_pars[10])
+    
+    true_loglik <- tryCatch({
+      res <- hamilton_filter(y, z_scaled, mu_try, phi_try, sigma_try,
+                                gamma_01_try, gamma_10_try, tvtp = TRUE)
+      res$loglik
+    }, error = function(e) -1e10)
+    
+    if (true_loglik > best_tvtp_loglik && is.finite(true_loglik)) {
+      best_tvtp_loglik <- true_loglik
+      best_tvtp <- opt
+    }
+  }
+  
+  # Check if TVTP actually improved
+  tvtp_improved <- (best_tvtp_loglik > best_fixed_loglik + 0.5)
+  
+  if (!tvtp_improved && verbose) {
+    cat("  TVTP did not significantly improve fit\n")
+  }
+  
+  # Extract TVTP parameters
+  p_tvtp <- best_tvtp$par
+  mu_tvtp <- p_tvtp[1:2]
+  phi_tvtp <- pmin(pmax(p_tvtp[3:4], 0.1), 0.995)
+  sigma_tvtp <- exp(p_tvtp[5:6])
+  gamma_01_tvtp <- c(pmin(pmax(p_tvtp[7], -3.5), 0), p_tvtp[8])
+  gamma_10_tvtp <- c(pmin(pmax(p_tvtp[9], -3.5), 0), p_tvtp[10])
+  
+  if (!tvtp_improved) {
+    mu_tvtp <- mu_fixed
+    phi_tvtp <- phi_fixed
+    sigma_tvtp <- sigma_fixed
+    gamma_01_tvtp <- gamma_01_fixed
+    gamma_10_tvtp <- gamma_10_fixed
+    best_tvtp_loglik <- best_fixed_loglik
+    if (verbose) cat("  Using Fixed TP parameters\n")
+  }
+  
+  # Run filter with TRUE estimated gamma (for regime probabilities)
+  filter_tvtp_real <- hamilton_filter(y, z_scaled, mu_tvtp, phi_tvtp, sigma_tvtp,
+                                         gamma_01_tvtp, gamma_10_tvtp, 
+                                         tvtp = tvtp_improved)
+  
+  # Use real estimated gammas for plots — no illustrative/hard-coded slopes
+  gamma_01_plot <- gamma_01_tvtp
+  gamma_10_plot <- gamma_10_tvtp
+  
+  # Compute mean transition probabilities
+  mean_p01 <- mean(filter_tvtp_real$p_01[-1])
+  mean_p10 <- mean(filter_tvtp_real$p_10[-1])
+  
+  dur_R0 <- 1 / pmax(mean_p01, 0.001)
+  dur_R1 <- 1 / pmax(mean_p10, 0.001)
+  
+
+  tvtp_result <- list(
+    mu = mu_tvtp,
+    phi = phi_tvtp,
+    sigma = sigma_tvtp,
+    gamma_01 = gamma_01_tvtp,
+    gamma_10 = gamma_10_tvtp,
+    gamma_01_plot = gamma_01_plot,
+    gamma_10_plot = gamma_10_plot,
+    tvtp_improved = tvtp_improved,
+    loglik = best_tvtp_loglik,
+    aic = 2 * 10 - 2 * best_tvtp_loglik,
+    bic = 10 * log(T_obs) - 2 * best_tvtp_loglik,
+    prob_filtered = filter_tvtp_real$prob_filtered,
+    prob_smoothed = filter_tvtp_real$prob_smoothed,
+    p_01 = filter_tvtp_real$p_01,
+    p_10 = filter_tvtp_real$p_10,
+    duration_R0 = dur_R0,
+    duration_R1 = dur_R1,
+    z_used = z_scaled
+  )
+  
+  if (verbose) {
+    cat("\nTVTP Results:\n")
+    cat("  LogLik = ", round(best_tvtp_loglik, 2), "\n")
+    cat("  gamma_01 = (", round(gamma_01_tvtp[1], 2), ", ", round(gamma_01_tvtp[2], 3), ")\n")
+    cat("  gamma_10 = (", round(gamma_10_tvtp[1], 2), ", ", round(gamma_10_tvtp[2], 3), ")\n")
+    cat("  LR stat = ", round(max(2 * (best_tvtp_loglik - best_fixed_loglik), 0), 2), "\n")
+    cat("  R0: mu =", round(mu_tvtp[1], 2), ", sigma =", round(sigma_tvtp[1], 2), "\n")
+    cat("  R1: mu =", round(mu_tvtp[2], 2), ", sigma =", round(sigma_tvtp[2], 2), "\n")
+  }
+  
+  return(list(fixed = fixed_result, restr = restr_result, tvtp = tvtp_result))
+}
+```
+
+\vspace{2em}
+
+
+# Results
+
+## Model Estimation
+
+```{r estimate-models, include=FALSE}
+set.seed(42)
+
+# Reference recession periods for Germany
+german_recessions <- data.frame(
+  start = as.Date(c("2001-01-01", "2008-01-01", "2012-01-01", "2020-01-01")),
+  end = as.Date(c("2001-12-01", "2009-06-01", "2013-03-01", "2020-06-01"))
+)
+
+# =========================================================
+# Load pre-computed results from server run
+# =========================================================
+core_path <- "output/ms_models/ms_results_core.rds"
+boot_path <- "output/ms_models/ms_results_with_bootstrap.rds"
+
+if (file.exists(core_path)) {
+  cat("Loading core estimation results from:", core_path, "\n")
+  .tmp <- readRDS(core_path)
+  # Handle wrapped structure: list(ms_results=..., ms_comparison=...)
+  if ("ms_results" %in% names(.tmp)) {
+    ms_results <- .tmp$ms_results
+  } else {
+    ms_results <- .tmp
+  }
+  rm(.tmp)
+} else if (file.exists(boot_path)) {
+  cat("Loading results (with bootstrap) from:", boot_path, "\n")
+  .tmp <- readRDS(boot_path)
+  if ("ms_results" %in% names(.tmp)) {
+    ms_results <- .tmp$ms_results
+  } else {
+    ms_results <- .tmp
+  }
+  rm(.tmp)
+} else {
+  stop("No saved results found. Run estimation on server first.")
+}
+
+# Merge bootstrap CIs if available separately
+if (file.exists(boot_path) && file.exists(core_path)) {
+  .tmp_boot <- readRDS(boot_path)
+  ms_boot <- if ("ms_results" %in% names(.tmp_boot)) .tmp_boot$ms_results else .tmp_boot
+  rm(.tmp_boot)
+  for (j in 1:r) {
+    if (!is.null(ms_boot[[j]]) && !is.null(ms_boot[[j]]$tvtp$boot_ci)) {
+      ms_results[[j]]$tvtp$boot_ci <- ms_boot[[j]]$tvtp$boot_ci
+      cat("  Loaded bootstrap CI for Factor", j,
+          "(n_success =", ms_boot[[j]]$tvtp$boot_ci$n_success, ")\n")
+    }
+  }
+  rm(ms_boot)
+}
+
+# Rebuild ms_comparison from loaded results
+ms_comparison <- data.frame(
+  Factor       = 1:r,
+  LogLik_Fixed = NA_real_,
+  LogLik_Restr = NA_real_,
+  LogLik_TVTP  = NA_real_,
+  AIC_Fixed    = NA_real_,
+  AIC_Restr    = NA_real_,
+  AIC_TVTP     = NA_real_,
+  BIC_Fixed    = NA_real_,
+  BIC_Restr    = NA_real_,
+  BIC_TVTP     = NA_real_,
+  LR_stat      = NA_real_,
+  LR_pval      = NA_real_,
+  LR_restr_stat = NA_real_,
+  LR_restr_pval = NA_real_
+)
+
+for (j in 1:r) {
+  if (is.null(ms_results[[j]])) next
+  result <- ms_results[[j]]
+  
+  ms_comparison$LogLik_Fixed[j] <- result$fixed$loglik
+  ms_comparison$LogLik_Restr[j] <- result$restr$loglik
+  ms_comparison$LogLik_TVTP[j]  <- result$tvtp$loglik
+  ms_comparison$AIC_Fixed[j]    <- result$fixed$aic
+  ms_comparison$AIC_Restr[j]    <- result$restr$aic
+  ms_comparison$AIC_TVTP[j]     <- result$tvtp$aic
+  ms_comparison$BIC_Fixed[j]    <- result$fixed$bic
+  ms_comparison$BIC_Restr[j]    <- result$restr$bic
+  ms_comparison$BIC_TVTP[j]     <- result$tvtp$bic
+  
+  lr_stat <- 2 * (result$tvtp$loglik - result$fixed$loglik)
+  ms_comparison$LR_stat[j] <- max(lr_stat, 0)
+  ms_comparison$LR_pval[j] <- pchisq(max(lr_stat, 0), df = 2, lower.tail = FALSE)
+  
+  lr_restr <- 2 * (result$fixed$loglik - result$restr$loglik)
+  ms_comparison$LR_restr_stat[j] <- max(lr_restr, 0)
+  ms_comparison$LR_restr_pval[j] <- pchisq(max(lr_restr, 0), df = 1, lower.tail = FALSE)
+  
+  cat("Factor", j, ": LogLik TVTP =", round(result$tvtp$loglik, 2),
+      ", sigma_ratio =", round(max(result$tvtp$sigma)/min(result$tvtp$sigma), 2), "\n")
+}
+```
+
+```{r model-comparison-table}
+ms_comparison |>
+  mutate(
+    across(starts_with("LogLik"), ~round(., 1)),
+    across(starts_with("AIC"),    ~round(., 1)),
+    across(starts_with("BIC"),    ~round(., 1))
+  ) |>
+  select(Factor,
+         LogLik_Fixed, LogLik_TVTP,
+         AIC_Fixed,    AIC_TVTP,
+         BIC_Fixed,    BIC_TVTP) |>
+  kable(
+    format    = "latex",
+    booktabs  = TRUE,
+    col.names = c("Factor",
+                  "LogLik (Fixed)", "LogLik (TVTP)",
+                  "AIC (Fixed)",    "AIC (TVTP)",
+                  "BIC (Fixed)",    "BIC (TVTP)"),
+    caption   = "Model Comparison: Fixed Transition Probabilities vs.\\ TVTP",
+    align     = "c"
+  ) |>
+  kable_styling(
+    latex_options = c("striped", "hold_position"),
+    full_width    = FALSE
+  )
+```
+
+Table 1 compares fixed and time-varying transition probability specifications. The inclusion of leading indicators improves the log-likelihood across all five factors, indicating that the indicators capture information about regime dynamics. The two information criteria lead to different conclusions. AIC, which penalises additional parameters less heavily ($2k$), favors the TVTP specification for Factors 2--5. BIC, which imposes a stronger penalty ($k \log T$), favors the fixed-transition model for all five factors. Given the small effective sample of crisis observations per factor (3--4 major episodes in 28 years) and the already-penalised estimation, BIC's heavier penalty may be more appropriate in this setting.
+
+Under AIC, Factors 2 and 4 show the clearest improvement from TVTP. Factor 2, which is heavily loaded on intermediate goods (Chemicals, Rubber, Plastics) and business expectations, sits at the upstream end of the supply chain and is among the first to adjust to shifts in sentiment. Factor 4 (Global Industrial Demand) is driven by Basic Metals and Export Expectations; since export orders are the primary channel through which global shocks transmit domestically, the cyclical turning points in these demand signals are well-anticipated by leading indicators.
+
+
+The full model allows regime-dependent persistence ($\phi_0, \phi_1$), but the estimates are nearly identical across regimes ($\hat{\phi}_0 \approx \hat{\phi}_1 \approx 0.9$ for most factors), whereas volatility differs substantially ($\sigma_1 / \sigma_0$ ranges from 2.0 to 3.6). A restricted specification with constant persistence and regime-dependent volatility is examined in Appendix~A and yields essentially identical results, confirming that regime separation is driven primarily by the volatility contrast. The subsequent analysis is based on the full TVTP specification (10 parameters) to maintain comparability with the standard Diebold--Lee--Weinbach framework.
+
+
+
+## Parameter Estimates
+
+
+```{r}
+param_rows <- list()
+
+fmt_val <- function(val) {
+  if (is.na(val)) return("")
+  return(sprintf("%.3f", val))
+}
+
+fmt_boot_ci <- function(lo, hi) {
+  if (is.na(lo) || is.na(hi)) return("—")
+  paste0("[", sprintf("%.3f", lo), ", ", sprintf("%.3f", hi), "]")
+}
+
+for (j in 1:r) {
+  if (is.null(ms_results[[j]])) next
+  model    <- ms_results[[j]]$tvtp
+  boot_ci  <- model$boot_ci
+  
+  factor_label <- paste("Factor", j)
+  
+  # Helper: extract lo/hi safely
+  ci_lo <- function(param, idx) {
+    if (is.null(boot_ci)) return(NA)
+    boot_ci[[param]]$lo[idx]
+  }
+  ci_hi <- function(param, idx) {
+    if (is.null(boot_ci)) return(NA)
+    boot_ci[[param]]$hi[idx]
+  }
+  
+  # 1. Persistence (phi) - Expansion
+  param_rows[[length(param_rows) + 1]] <- data.frame(
+    Factor    = factor_label,
+    Parameter = "Persistence ($\\phi$)",
+    Regime    = "Expansion",
+    Estimate  = fmt_val(model$phi[1]),
+    CI        = fmt_boot_ci(ci_lo("phi",1), ci_hi("phi",1))
+  )
+  # 2. Persistence (phi) - Turbulent
+  param_rows[[length(param_rows) + 1]] <- data.frame(
+    Factor    = factor_label,
+    Parameter = "Persistence ($\\phi$)",
+    Regime    = "Turbulent",
+    Estimate  = fmt_val(model$phi[2]),
+    CI        = fmt_boot_ci(ci_lo("phi",2), ci_hi("phi",2))
+  )
+  # 3. Volatility (sigma) - Expansion
+  param_rows[[length(param_rows) + 1]] <- data.frame(
+    Factor    = factor_label,
+    Parameter = "Volatility ($\\sigma$)",
+    Regime    = "Expansion",
+    Estimate  = fmt_val(model$sigma[1]),
+    CI        = fmt_boot_ci(ci_lo("sigma",1), ci_hi("sigma",1))
+  )
+  # 4. Volatility (sigma) - Turbulent
+  param_rows[[length(param_rows) + 1]] <- data.frame(
+    Factor    = factor_label,
+    Parameter = "Volatility ($\\sigma$)",
+    Regime    = "Turbulent",
+    Estimate  = fmt_val(model$sigma[2]),
+    CI        = fmt_boot_ci(ci_lo("sigma",2), ci_hi("sigma",2))
+  )
+}
+
+param_df <- bind_rows(param_rows)
+
+param_df |>
+  kable(caption = "Regime-Dependent Parameter Estimates with 95\\% Parametric Bootstrap CIs",
+        col.names = c("Factor", "Parameter", "Regime", "Estimate",
+                      "95\\% Bootstrap CI"),
+        escape = FALSE,
+        align  = "cllrr",
+        booktabs = TRUE,
+        format = "latex") |>
+  kable_styling(latex_options = c("H"), full_width = FALSE) |>
+  collapse_rows(columns = 1:2, valign = "middle", latex_hline = "major")
+```
+
+
+Table 2 presents the maximum likelihood estimates for the regime-dependent parameters ($\phi$, $\sigma$) of the TVTP model. Confidence intervals are obtained via parametric bootstrap ($B = 200$): for each replication, a synthetic time series is simulated from the estimated model, re-estimated with the same optimizer and penalty constraints, and regime labels are normalized by the volatility criterion. The 2.5th and 97.5th percentiles of the resulting distribution form the 95\% CI. This avoids the invalid inference that would result from inverting the penalized Hessian.
+
+\newpage
+
+## TVTP Parameters
+
+\vspace{-0.5em}
+
+```{r tvtp-parameters, results='asis'}
+tvtp_params <- data.frame(
+  Factor = 1:r,
+  gamma_01_0 = NA_character_, 
+  gamma_01_1 = NA_character_,
+  gamma_10_0 = NA_character_,
+  gamma_10_1 = NA_character_,
+  Dur_Expansion = NA_real_,
+  Dur_Turbulent = NA_real_
+)
+
+for (j in 1:r) {
+  if (!is.null(ms_results[[j]])) {
+    model   <- ms_results[[j]]$tvtp
+    boot_ci <- model$boot_ci
+    
+    # Format: estimate [bootstrap 95% CI lo, hi]
+    fmt_boot <- function(est, param, idx) {
+      if (is.null(boot_ci) || is.na(boot_ci[[param]]$lo[idx])) {
+        return(as.character(round(est, 3)))
+      }
+      lo <- boot_ci[[param]]$lo[idx]
+      hi <- boot_ci[[param]]$hi[idx]
+      paste0(round(est, 3), " [", sprintf("%.3f", lo), ", ", sprintf("%.3f", hi), "]")
+    }
+    
+    tvtp_params$gamma_01_0[j] <- fmt_boot(model$gamma_01[1], "gamma_01", 1)
+    tvtp_params$gamma_01_1[j] <- fmt_boot(model$gamma_01[2], "gamma_01", 2)
+    tvtp_params$gamma_10_0[j] <- fmt_boot(model$gamma_10[1], "gamma_10", 1)
+    tvtp_params$gamma_10_1[j] <- fmt_boot(model$gamma_10[2], "gamma_10", 2)
+    
+    tvtp_params$Dur_Expansion[j] <- round(model$duration_expansion, 1)
+    tvtp_params$Dur_Turbulent[j] <- round(model$duration_turbulent, 1)
+  }
+}
+
+tvtp_params |>
+  kable(
+    format = "latex",
+    booktabs = TRUE,
+    row.names = FALSE,  
+    col.names = c("Factor", "$\\gamma_{01,0}$", "$\\gamma_{01,1}$", 
+                 "$\\gamma_{10,0}$", "$\\gamma_{10,1}$", 
+                 "$E[\\text{Dur}]$ Expansion",
+                 "$E[\\text{Dur}]$ Turbulent"),
+    caption = "TVTP Parameters with 95\\% Bootstrap CIs and Expected Regime Durations (months)",
+    escape = FALSE,
+    align = "c"
+  ) |>
+  kable_styling(latex_options = c("H", "scale_down"), 
+                full_width = FALSE)
+
+```
+
+
+
+The estimated TVTP coefficients in Table 3 are shown with 95\% parametric bootstrap confidence intervals in brackets. The expected regime durations $E[\text{Dur}]$ are computed as $1/\bar{p}_{01,t}$ and $1/\bar{p}_{10,t}$ respectively, where the bar denotes the time-series mean of the estimated transition probabilities. This is an approximation to the true expected spell length under time-varying hazards, which would require integrating over the full time-varying transition matrix.
+
+The sign of $\gamma_{01,1}$ depends on the correlation between the leading indicator and the factor. For Factors 1, 3, and 4, the leading indicators are positively correlated with the factor: a decrease in the indicator value (worsening sentiment) corresponds to $z_{t-1} < 0$, and since $\gamma_{01,1} < 0$, the product $\gamma_{01,1} z_{t-1} > 0$ raises crisis entry probability $p_{01,t}$. For Factors 2 and 5, the leading indicators are inversely related to the underlying factor, so $\gamma_{01,1} > 0$ implies that higher indicator values (which correspond to deteriorating factor conditions) raise entry risk.
+
+Across factors (with the exception of Factor 1), the sensitivity of the ``Turbulent $\to$ Expansion'' transition ($\gamma_{10,1}$) is generally lower in magnitude than the crisis entry parameter ($\gamma_{01,1}$). This suggests that leading indicators are more effective at providing early warnings for entering a turbulent regime (sharp probability spikes) but are less decisive in predicting the exact timing of the recovery. Economically, this reflects that crises typically occur with synchronized, pronounced warning signs, whereas recoveries tend to be gradual and sector-specific, making them inherently harder to forecast with the same set of signals.
+
+For Factor 1 (Capital Goods), both the crisis entry ($\gamma_{01,1}$) and recovery ($\gamma_{10,1}$) slope parameters are small in magnitude and statistically imprecise based on the bootstrap CIs, indicating that the chosen leading indicator adds limited information for timing either entry or recovery in capital goods.
+
+Factor 4 (Global Industrial Demand) exhibits the sharpest contrast between entry and exit dynamics. The crisis entry parameter $\gamma_{01,1} = -1.182$ is marginally significant based on the bootstrap interval, suggesting the leading indicator provides some signal about the onset of demand shocks. In contrast, the recovery parameter $\gamma_{10,1}$ is close to zero, indicating that the recovery phase is largely self-driven rather than indicator-responsive.
+
+
+
+
+\newpage
+
+## Regime Probabilities
+
+The regime probability plots provide a summary of how the model’s inferred turbulent state lines up with major stress episodes in German manufacturing. The smoothed probabilities (dark red line) provide cleaner historical regime classification, and the filtered probabilities (blue line) show the real-time information available at each point.
+
+```{r plot-regime-probs, fig.height=12, out.width="100%"}
+plot_regime_prob <- function(j, ms_results, dates, german_recessions) {
+  if (is.null(ms_results[[j]])) return(NULL)
+  
+  model <- ms_results[[j]]$tvtp
+  rid <- model$regime_id
+  
+  # R1 is always turbulent after normalization
+  p_turbulent <- model$prob_filtered[, 2]
+  p_turbulent_smooth <- model$prob_smoothed[, 2]
+  
+#  subtitle_note <- paste0(
+#    "(Identified via ", rid$criterion,
+#    "; cor_R0=", round(rid$cor_R0, 2),
+#    ", cor_R1=", round(rid$cor_R1, 2), 
+#    if(rid$need_swap) "; params swapped" else "",
+#    ")"
+#  )
+  
+  df <- data.frame(
+    date = dates,
+    Filtered = p_turbulent,
+    Smoothed = p_turbulent_smooth
+  ) |>
+    pivot_longer(-date, names_to = "Type", values_to = "Probability")
+  
+  plot_title <- paste0("Factor ", j, ": P(Turbulent/Crisis)")
+  
+  ggplot(df, aes(x = date, y = Probability, color = Type)) +
+    geom_rect(data = german_recessions,
+              aes(xmin = start, xmax = end, ymin = -Inf, ymax = Inf),
+              fill = "gray80", alpha = 0.5, inherit.aes = FALSE) +
+    geom_line(linewidth = 0.8) +
+    geom_hline(yintercept = 0.5, linetype = "dashed", color = "gray50") +
+    scale_y_continuous(limits = c(0, 1), labels = percent_format()) +
+    scale_color_manual(
+      values = c("Filtered" = "steelblue", "Smoothed" = "darkred")
+    ) +
+    labs(
+      title = plot_title,
+      subtitle = paste0("Gray shading = reference recession periods "),
+      x = NULL, y = "Probability", color = NULL
+    ) +
+    theme(legend.position = "bottom")
+}
+
+plots <- lapply(1:r, function(j) plot_regime_prob(j, ms_results, dates, german_recessions))
+plots <- Filter(Negate(is.null), plots)
+
+if (length(plots) > 0) {
+  wrap_plots(plots, ncol = 1)
+}
+# The regime probability plots illustrate how the model classifies 
+# turbulent episodes across the five factors.
+```
+
+
+
+For all factors, turbulent probabilities increase sharply during the 2008–2009 financial crisis and the 2020 COVID-19 shock. The gray shaded areas mark reference recession periods, and the alignment between high probabilities and these periods is consistent with the model's regime identification. 
+However, Factor 3 shows more frequent regime switches throughout the sample, with multiple turbulent episodes even outside known recession periods. This pattern indicate weaker separation between regimes for this factor, leading to noisier state classification outside major recessions.
+
+Factor 2 exhibits elevated turbulent probability around 2001–2003. A plausible interpretation is prolonged adjustment in intermediate-goods / supply-chain segments following the early-2000s downturn, though this episode is not shared by all factors
+
+Factors 2 and 3 display persistently elevated turbulent probabilities after 2020. This pattern likely reflects the compound disruptions affecting supply-chain conditions and demand sentiment, including pandemic supply-chain frictions, the 2022 energy shock following the Russia–Ukraine conflict, and continued structural uncertainty. Compared with the more concentrated 2008–2009 episode, these post-2020 shocks appear more prolonged and uneven, which may help explain the sustained turbulence in these factors.
+
+The prolonged high-volatility regime observed post-2020 may also reflect statistical limitations. The post-2020 period is relatively short and marked by structural disruptions, providing limited information for the model to calibrate a clear return-to-stability pattern. As the sensitivity of the "Turbulent → Expansion" transition parameter $\gamma_{10,1}$ is lower in magnitude, without a synchronized improvement in the indicators to drive the transition probability $p_{10}(t)$ upward jointly, the model may assign continued high probability to the turbulent regime due to insufficient signal strength to overcome regime persistence.
+
+
+
+\newpage
+## Time-Varying Transition Probabilities
+
+- **$p_{01,t}$** (Expansion → Turbulent): When leading indicators deteriorate, this probability rises, signaling increased risk of entering a crisis regime. 
+- **$p_{10,t}$** (Turbulent → Expansion): When leading indicators improve during crises, this probability rises, signaling potential recovery. 
+
+
+```{r plot-tvtp, fig.height=12, out.width="100%"}
+plot_tvtp <- function(j, ms_results, dates) {
+  if (is.null(ms_results[[j]])) return(NULL)
+  
+  model <- ms_results[[j]]$tvtp
+  
+  # After normalization, p_01 is always Expansion→Turbulent
+  p_exp_to_turb <- model$p_01
+  p_turb_to_exp <- model$p_10
+  
+  df <- data.frame(
+    date = dates,
+    p_01 = p_exp_to_turb,
+    p_10 = p_turb_to_exp
+  ) |>
+    pivot_longer(-date, names_to = "Transition", values_to = "Probability")
+  
+  subtitle_text <- "Estimated time-varying transition probabilities"
+  
+  ggplot(df, aes(x = date, y = Probability, color = Transition)) +
+    geom_rect(data = german_recessions,
+              aes(xmin = start, xmax = end, ymin = -Inf, ymax = Inf),
+              fill = "gray80", alpha = 0.5, inherit.aes = FALSE) +
+    geom_hline(yintercept = 0.5, linetype = "dashed", color = "gray50") +
+    geom_line(linewidth = 0.8) +
+    scale_y_continuous(limits = c(0, 1), labels = percent_format()) +
+    scale_color_manual(
+      values = c("p_01" = "darkred", "p_10" = "darkgreen"),
+      labels = c(paste0("p_01: Expansion → Turbulent"), 
+                paste0("p_10: Turbulent → Expansion"))
+    ) +
+    labs(
+      title = paste0("Factor ", j, ": Time-Varying Transition Probabilities"),
+      subtitle = subtitle_text,
+      x = NULL, y = "Transition Probability", color = NULL
+    ) +
+    theme(legend.position = "bottom")
+}
+
+plots_tvtp <- lapply(1:r, function(j) plot_tvtp(j, ms_results, dates))
+plots_tvtp <- Filter(Negate(is.null), plots_tvtp)
+
+if (length(plots_tvtp) > 0) {
+  wrap_plots(plots_tvtp, ncol = 1)
+}
+```
+
+
+
+The TVTP plots show how regime transition probabilities respond to leading indicators. In Factors 2 and 4, the entry probability $p_{01,t}$ exhibits sharp spikes around major stress episodes, indicating that the indicator is particularly informative about \textbf{crisis entry} in these components. For the remaining factors, entry probabilities move more moderately, consistent with a weaker incremental role of TVTP in overall fit.
+
+In contrast, $p_{10,t}$ tends to vary less over time across factors, reflecting that the exit slope $\gamma_{10,1}$ is generally small and imprecisely estimated. Factor 4 nevertheless implies a relatively high baseline exit probability (and hence a short expected turbulent duration). 
+
+The timing of the largest $p_{01,t}$ spikes is consistent with reference recession periods (gray shading), serving as a diagnostic check. Crucially, by conditioning transition probabilities on evolving economic signals, the TVTP framework captures real-time risk dynamics, avoiding the limitations of imposing fixed or arbitrary switching assumptions.
+
+
+
+
+
+```{r summary-stats, include=FALSE}
+# Summary
+
+summary_stats <- data.frame(
+  Metric = c(
+    "Sample period",
+    "Number of observations",
+    "Number of factors",
+    "TVTP improvement (avg LR stat)",
+    "Factors with significant TVTP (p < 0.05)",
+    "Average Expansion duration (months)",
+    "Average Turbulent duration (months)"
+  ),
+  Value = c(
+    paste(format(min(dates), "%Y-%m"), "to", format(max(dates), "%Y-%m")),
+    T_obs,
+    r,
+    round(mean(ms_comparison$LR_stat, na.rm = TRUE), 2),
+    sum(as.numeric(ms_comparison$LR_pval) < 0.05, na.rm = TRUE),
+    round(mean(sapply(ms_results, function(x) if(!is.null(x)) x$tvtp$duration_expansion else NA), na.rm = TRUE), 1),
+    round(mean(sapply(ms_results, function(x) if(!is.null(x)) x$tvtp$duration_turbulent else NA), na.rm = TRUE), 1)
+  )
+)
+
+kable(summary_stats, col.names = c("Metric", "Value"),
+      caption = "MS-DFM Summary Statistics") |>
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+
+#The MS-DFM estimation reveals that German manufacturing regimes are driven by asymmetric transition dynamics. Average #expansion lasts 27 months, while turbulent/crisis periods average 11 months.
+
+#The TVTP specification demonstrates that leading indicators are effective real-time signals of crisis outbreaks, as #reflected in sharp increases in transition probabilities. However, they are less decisive in signaling 
+#the precise timing of recovery.
+
+```
+
+
+
+
+## Discussion
+
+The regime separation in this framework is driven primarily by volatility shifts. Across factors, the turbulent state exhibits substantially higher variance, whereas autoregressive persistence remains close to unity in both regimes. Therefore, the inferred turbulent regime should be interpreted as a stress/uncertainty state. This is particularly relevant after 2020, where persistent turbulent probabilities may reflect both prolonged disruptions and weaker identification of the exit mechanism in a short, structurally changing subsample. 
+
+The current specification estimates five independent Markov-switching models. The result shows that Factors 2 and 4 provide the most usable monitoring signals.  With separate regime processes, sector-specific stress episodes, such as the sharp supply-chain shocks captured by Factor 2, can be detected without waiting for deterioration to spread across all components. A fully shared-regime model requires synchronized turning points across sectors, a strong assumption for German manufacturing where stress tends to be uneven. Such constraint could potentially reduce the sensitivity to early adjustments in components that often move ahead of the broader cycle.
+
+Furthermore, the TVTP specification is motivated by real-time crisis detection, which would ideally be evaluated out of sample. In practice, designing such an evaluation is challenging in this setting. As regime transitions are rare events, the sample contains only 3-4 major crisis episodes per factor, meaning any hold-out test set would contain at most 1-2 transitions, providing insufficient statistical power to discriminate between models. 
+
+A more rigorous evaluation could adopt an expanding-window design, where both the parameters and the filtered probabilities are re-estimated at each time step using only data available up to that point. The model could be estimated using data up to a cutoff date, then updated sequentially month by month, recording the filtered crisis probability at each step. 
+Performance could be assessed using formal scoring rules such as the Brier score or the area under the ROC curve, evaluated against NBER/CEPR recession dates, across all available crisis episodes.
+
+Taken together, the filtered probabilities $P(s_t = \text{turbulent} \mid \mathcal{I}_t)$ provide a continuously updated summary of whether sector-specific dynamics have shifted into a distributional pattern historically associated with stress, rather than a precise forecast of turning points. The difficulty of achieving sharp identification is itself informative. The bootstrap confidence intervals on turbulent-regime parameters reflect regime sparsity rather than model misspecification, and the sensitivity of TVTP estimates to the choice of leading indicator suggests that regime transitions in German manufacturing are not cleanly anticipated by any single composite signal. 
+
+
+
+
+## Next Step
+
+
+#### Two-Stage Factor-Augmented VAR (FAVAR) for Forecasting Factor Impacts
+
+To quantify how the extracted 5 factors drive overall manufacturing business climate index.
+
+```{r save-results, include=FALSE}
+msdfm_results <- list(
+  created_at = Sys.time(),
+  method = "MS-AR(1) with TVTP and Cascade Regime Identification",
+  ms_results = ms_results,
+  ms_comparison = ms_comparison,
+  dates = dates,
+  german_recessions = german_recessions,
+  r = r,
+  T_obs = T_obs
+)
+
+saveRDS(msdfm_results, file = "output/msdfm_results_05.rds")
+```
+
+
+
+# References
+
+- Hamilton, J.D. (1989). A new approach to the economic analysis of nonstationary time series and the business cycle. *Econometrica*, 57(2), 357-384.
+
+- Filardo, A.J. (1994). Business-cycle phases and their transitional dynamics. *Journal of Business & Economic Statistics*, 12(3), 299-308.
+
+- Diebold, F.X., Lee, J.H. & Weinbach, G.C. (1994). Regime switching with time-varying transition probabilities. In *Nonstationary Time Series Analysis and Cointegration*, 283-302.
+
+- Kim, C.J. (1994). Dynamic linear models with Markov-switching. *Journal of Econometrics*, 60(1-2), 1-22.
+
+- Krolzig, H.-M. (1997). Markov-Switching Vector Autoregressions: Modelling, Statistical Inference, and Application to Business Cycle Analysis. Springer.
+
+
+
+
+
+
+
+
+
+# Appendix
+
+## A. Persistence Restriction and Model Selection
+
+The main text reports the full TVTP specification with 10 parameters: regime-dependent means ($\mu_0, \mu_1$), persistence ($\phi_0, \phi_1$), volatilities ($\sigma_0, \sigma_1$), and TVTP slopes ($\gamma_{01,0}, \gamma_{01,1}, \gamma_{10,0}, \gamma_{10,1}$). Two observations motivate a closer look at parsimony. First, the persistence estimates are nearly identical across regimes ($\hat{\phi}_0 \approx \hat{\phi}_1$ for most factors; see Table~2 in the main text), suggesting that one of the 10 parameters may be redundant. Second, BIC favors the fixed-TP model over TVTP for all factors (Table~1), raising the question of whether the TVTP extension is justified once parameter cost is taken into account.
+
+To address both points, we compare four nested specifications along two dimensions: whether persistence is regime-dependent, and whether transition probabilities depend on the leading indicator.
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+& Fixed TP & TVTP \\
+\midrule
+Common $\phi$ (Restricted)  & 7 params & 9 params \\
+Regime $\phi_0, \phi_1$ (Full)  & 8 params & 10 params \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+```{r load-restr-tvtp, include=FALSE}
+# Load Restricted TVTP results from 05_MS_DFM_4
+
+restr_tvtp_path <- "output/ms_models/ms_results_restr_tvtp.rds"
+has_restr_tvtp  <- file.exists(restr_tvtp_path)
+
+if (has_restr_tvtp) {
+  .tmp_rt <- readRDS(restr_tvtp_path)
+  restr_tvtp_results <- .tmp_rt$restr_tvtp_results
+  rm(.tmp_rt)
+  cat("Loaded Restricted TVTP results from:", restr_tvtp_path, "\n")
+} else {
+  cat("Restricted TVTP results not found at", restr_tvtp_path,
+      "— run 05_MS_DFM_4.Rmd on server first.\n")
+}
+```
+
+
+```{r four-model-ic-table, results='asis', eval=has_restr_tvtp}
+# Table: 4-model AIC / BIC comparison
+
+four_ic <- data.frame(Factor = 1:r)
+
+for (j in 1:r) {
+  if (is.null(ms_results[[j]]) || is.null(restr_tvtp_results[[j]])) next
+
+  four_ic$AIC_Restr[j]     <- round(ms_results[[j]]$restr$aic, 1)
+  four_ic$AIC_Full[j]      <- round(ms_results[[j]]$fixed$aic, 1)
+  four_ic$AIC_RestrTVTP[j] <- round(restr_tvtp_results[[j]]$aic, 1)
+  four_ic$AIC_FullTVTP[j]  <- round(ms_results[[j]]$tvtp$aic, 1)
+
+  four_ic$BIC_Restr[j]     <- round(ms_results[[j]]$restr$bic, 1)
+  four_ic$BIC_Full[j]      <- round(ms_results[[j]]$fixed$bic, 1)
+  four_ic$BIC_RestrTVTP[j] <- round(restr_tvtp_results[[j]]$bic, 1)
+  four_ic$BIC_FullTVTP[j]  <- round(ms_results[[j]]$tvtp$bic, 1)
+}
+
+four_ic |>
+  select(Factor, starts_with("AIC"), starts_with("BIC")) |>
+  kable(
+    format    = "latex",
+    booktabs  = TRUE,
+    col.names = c("Factor",
+                  "Restr.", "Full", "Restr.+TVTP", "Full+TVTP",
+                  "Restr.", "Full", "Restr.+TVTP", "Full+TVTP"),
+    caption   = paste0(
+      "Information Criteria across Four Nested Specifications. ",
+      "Restr.\\ = common $\\phi$ (7/9 params); ",
+      "Full = regime-dependent $\\phi$ (8/10 params)."
+    ),
+    escape    = FALSE,
+    align     = "ccccccccc"
+  ) |>
+  add_header_above(c(" " = 1, "AIC" = 4, "BIC" = 4)) |>
+  kable_styling(latex_options = c("H", "scale_down"), full_width = FALSE)
+```
+
+
+```{r four-model-loglik-table, results='asis', eval=has_restr_tvtp}
+# Table: 4-model Log-Likelihood comparison
+
+four_ll <- data.frame(Factor = 1:r)
+
+for (j in 1:r) {
+  if (is.null(ms_results[[j]]) || is.null(restr_tvtp_results[[j]])) next
+
+  four_ll$LL_Restr[j]     <- round(ms_results[[j]]$restr$loglik, 1)
+  four_ll$LL_Full[j]      <- round(ms_results[[j]]$fixed$loglik, 1)
+  four_ll$LL_RestrTVTP[j] <- round(restr_tvtp_results[[j]]$loglik, 1)
+  four_ll$LL_FullTVTP[j]  <- round(ms_results[[j]]$tvtp$loglik, 1)
+}
+
+four_ll |>
+  kable(
+    format    = "latex",
+    booktabs  = TRUE,
+    col.names = c("Factor",
+                  "Restr.", "Full", "Restr.+TVTP", "Full+TVTP"),
+    caption   = "Log-Likelihood across Four Nested Specifications.",
+    escape    = FALSE,
+    align     = "ccccc"
+  ) |>
+  add_header_above(c(" " = 1, "Log-Likelihood" = 4)) |>
+  kable_styling(latex_options = c("H"), full_width = FALSE)
+```
+
+The comparison reveals a clear ordering along both dimensions.
+
+\medskip
+\noindent\textit{Persistence restriction costs nothing.}
+Within both the fixed-TP and TVTP families, imposing a common $\phi$ incurs negligible loss in log-likelihood. BIC consistently favors the restricted specification. This is expected given that the estimated $\hat{\phi}_0$ and $\hat{\phi}_1$ are nearly identical for all factors (Table~2): regime separation is driven by the volatility contrast $\sigma_1 \gg \sigma_0$, not by differences in temporal dependence.
+
+\medskip
+\noindent\textit{TVTP improves fit selectively.}
+Adding leading-indicator slopes improves log-likelihood for all factors and improves AIC for most. However, BIC --- which imposes a heavier penalty ($k\log T$ vs.\ $2k$) appropriate given the small effective sample of regime transitions (3--4 crisis episodes in 28 years) --- favors the fixed-TP specification for most factors. The clearest AIC improvements appear for Factors~2 and~4, consistent with the main text finding that these factors benefit most from indicator-dependent transitions.
+
+\medskip
+\noindent\textit{The restricted TVTP specification offers the best parsimony--fit trade-off.}
+Across factors, the restricted TVTP model (common $\phi$ + TVTP, 9 parameters) achieves nearly identical log-likelihood to the full TVTP (10 parameters) while saving one parameter. Where TVTP is warranted (Factors~2 and~4 under AIC), the restricted version dominates the full version on both criteria. This confirms the conjecture that constant persistence combined with regime-dependent volatility and time-varying transition probabilities captures the relevant dynamics without redundant parameters.
+
+The main text retains the full TVTP specification (10 parameters) for comparability with the standard Diebold--Lee--Weinbach framework. The qualitative conclusions --- in particular the identification of Factors~2 and~4 as the most informative monitoring signals --- are unchanged under the persistence restriction.
+
+
+```{r restr-tvtp-param-table, results='asis', eval=has_restr_tvtp}
+# ─────────────────────────────────────────────────────────────────────────────
+# Table: Parameter comparison — Full TVTP (10p) vs Restricted TVTP (9p)
+# ─────────────────────────────────────────────────────────────────────────────
+
+param_rt <- data.frame(Factor = integer(), stringsAsFactors = FALSE)
+
+for (j in 1:r) {
+  if (is.null(ms_results[[j]]) || is.null(restr_tvtp_results[[j]])) next
+  full <- ms_results[[j]]$tvtp
+  rest <- restr_tvtp_results[[j]]
+
+  param_rt <- rbind(param_rt, data.frame(
+    Factor       = j,
+    phi0_full    = round(full$phi[1], 3),
+    phi1_full    = round(full$phi[2], 3),
+    phi_restr    = round(rest$phi[1], 3),
+    sig0_full    = round(full$sigma[1], 3),
+    sig0_restr   = round(rest$sigma[1], 3),
+    sig1_full    = round(full$sigma[2], 3),
+    sig1_restr   = round(rest$sigma[2], 3),
+    sigR_full    = round(max(full$sigma) / min(full$sigma), 2),
+    sigR_restr   = round(max(rest$sigma) / min(rest$sigma), 2),
+    stringsAsFactors = FALSE
+  ))
+}
+
+param_rt |>
+  kable(
+    format    = "latex",
+    booktabs  = TRUE,
+    col.names = c("Factor",
+                  "$\\hat{\\phi}_0$", "$\\hat{\\phi}_1$",
+                  "$\\hat{\\phi}_{\\text{c}}$",
+                  "Full", "Restr.",
+                  "Full", "Restr.",
+                  "Full", "Restr."),
+    caption   = paste0(
+      "Persistence and Volatility: Full TVTP (10p) vs.\\ Restricted TVTP (9p). ",
+      "$\\hat{\\phi}_{\\text{c}}$ = common persistence under restriction."
+    ),
+    escape    = FALSE,
+    align     = "cccccccccc"
+  ) |>
+  add_header_above(c(" " = 1,
+                      "Full TVTP" = 2, "Restr." = 1,
+                      "$\\\\hat{\\\\sigma}_0$" = 2,
+                      "$\\\\hat{\\\\sigma}_1$" = 2,
+                      "$\\\\sigma_1 / \\\\sigma_0$" = 2),
+                   escape = FALSE) |>
+  kable_styling(latex_options = c("H", "scale_down"), full_width = FALSE)
+```
+
+
+```{r restr-tvtp-gamma-table, results='asis', eval=has_restr_tvtp}
+# ─────────────────────────────────────────────────────────────────────────────
+# Table: TVTP slopes and expected durations
+# ─────────────────────────────────────────────────────────────────────────────
+
+gamma_rt <- data.frame(Factor = integer(), stringsAsFactors = FALSE)
+
+for (j in 1:r) {
+  if (is.null(ms_results[[j]]) || is.null(restr_tvtp_results[[j]])) next
+  full <- ms_results[[j]]$tvtp
+  rest <- restr_tvtp_results[[j]]
+
+  gamma_rt <- rbind(gamma_rt, data.frame(
+    Factor       = j,
+    g01_1_full   = round(full$gamma_01[2], 3),
+    g01_1_restr  = round(rest$gamma_01[2], 3),
+    g10_1_full   = round(full$gamma_10[2], 3),
+    g10_1_restr  = round(rest$gamma_10[2], 3),
+    dur_e_full   = round(full$duration_expansion, 1),
+    dur_e_restr  = round(rest$duration_expansion, 1),
+    dur_t_full   = round(full$duration_turbulent, 1),
+    dur_t_restr  = round(rest$duration_turbulent, 1),
+    stringsAsFactors = FALSE
+  ))
+}
+
+gamma_rt |>
+  kable(
+    format    = "latex",
+    booktabs  = TRUE,
+    col.names = c("Factor",
+                  "Full", "Restr.",
+                  "Full", "Restr.",
+                  "Full", "Restr.",
+                  "Full", "Restr."),
+    caption   = paste0(
+      "TVTP Slopes and Expected Durations: Full TVTP (10p) vs.\\ Restricted TVTP (9p). ",
+      "$\\gamma_{01,1}$: crisis entry slope; $\\gamma_{10,1}$: recovery slope; ",
+      "$E[\\text{Dur}]$: expected duration in months."
+    ),
+    escape    = FALSE,
+    align     = "ccccccccc"
+  ) |>
+  add_header_above(c(" " = 1,
+                      "$\\\\gamma_{01,1}$" = 2,
+                      "$\\\\gamma_{10,1}$" = 2,
+                      "$E[\\\\text{Dur}]$ Exp." = 2,
+                      "$E[\\\\text{Dur}]$ Turb." = 2),
+                   escape = FALSE) |>
+  kable_styling(latex_options = c("H", "scale_down"), full_width = FALSE)
+```
+
+The TVTP slope parameters $\gamma_{01,1}$ and $\gamma_{10,1}$ are virtually unchanged between the full and restricted specifications, confirming that leading-indicator sensitivity does not interact with the persistence parameterisation. The common $\hat{\phi}$ falls between the two regime-specific estimates, as expected when the true persistence difference is negligible. Volatility estimates and expected regime durations are likewise stable, indicating that the persistence restriction does not distort regime identification.
+
+
+```{r restr-tvtp-smoothed-cor, results='asis', eval=has_restr_tvtp}
+# ─────────────────────────────────────────────────────────────────────────────
+# Table: Correlation of smoothed probabilities
+# ─────────────────────────────────────────────────────────────────────────────
+
+cor_rt <- data.frame(Factor = integer(), stringsAsFactors = FALSE)
+
+for (j in 1:r) {
+  if (is.null(ms_results[[j]]) || is.null(restr_tvtp_results[[j]])) next
+  p_full  <- ms_results[[j]]$tvtp$prob_smoothed[, 2]
+  p_restr <- restr_tvtp_results[[j]]$prob_smoothed[, 2]
+  valid   <- complete.cases(p_full, p_restr) & (seq_along(p_full) > 1)
+
+  cor_rt <- rbind(cor_rt, data.frame(
+    Factor       = j,
+    Cor_Smoothed = round(cor(p_full[valid], p_restr[valid]), 4),
+    MaxAbsDiff   = round(max(abs(p_full[valid] - p_restr[valid])), 4),
+    stringsAsFactors = FALSE
+  ))
+}
+
+cor_rt |>
+  kable(
+    format    = "latex",
+    booktabs  = TRUE,
+    col.names = c("Factor", "Cor(Smoothed $P$)", "Max $|\\Delta P|$"),
+    caption   = paste0(
+      "Agreement of Smoothed Regime Probabilities: ",
+      "Full TVTP (10p) vs.\\ Restricted TVTP (9p)."
+    ),
+    escape    = FALSE,
+    align     = "ccc"
+  ) |>
+  kable_styling(latex_options = c("H"), full_width = FALSE)
+```
+
+
+```{r restr-tvtp-overlay-plots, fig.height=12, out.width="100%", eval=has_restr_tvtp}
+# ─────────────────────────────────────────────────────────────────────────────
+# Overlay plots: smoothed P(Turbulent) — Full TVTP vs Restricted TVTP
+# ─────────────────────────────────────────────────────────────────────────────
+
+german_recessions <- data.frame(
+  start = as.Date(c("2001-01-01", "2008-01-01", "2012-01-01", "2020-01-01")),
+  end   = as.Date(c("2001-12-01", "2009-06-01", "2013-03-01", "2020-06-01"))
+)
+
+overlay_rt <- lapply(1:r, function(j) {
+  if (is.null(ms_results[[j]]) || is.null(restr_tvtp_results[[j]])) return(NULL)
+
+  df <- data.frame(
+    date       = dates,
+    `Full TVTP`  = ms_results[[j]]$tvtp$prob_smoothed[, 2],
+    `Restr TVTP` = restr_tvtp_results[[j]]$prob_smoothed[, 2],
+    check.names = FALSE
+  ) |>
+    pivot_longer(-date, names_to = "Specification", values_to = "P_turbulent")
+
+  ggplot(df, aes(x = date, y = P_turbulent, color = Specification)) +
+    geom_rect(data = german_recessions,
+              aes(xmin = start, xmax = end, ymin = -Inf, ymax = Inf),
+              fill = "gray85", alpha = 0.4, inherit.aes = FALSE) +
+    geom_line(linewidth = 0.7, alpha = 0.85) +
+    scale_y_continuous(limits = c(0, 1), labels = percent_format()) +
+    scale_color_manual(
+      values = c("Full TVTP" = "steelblue", "Restr TVTP" = "darkred")
+    ) +
+    labs(
+      title = paste0("Factor ", j, ": Smoothed P(Turbulent)"),
+      subtitle = "Full TVTP (10p) vs. Restricted TVTP (9p, common \u03d5)",
+      x = NULL, y = "P(Turbulent)", color = NULL
+    ) +
+    theme(legend.position = "bottom")
+})
+
+overlay_rt <- Filter(Negate(is.null), overlay_rt)
+if (length(overlay_rt) > 0) wrap_plots(overlay_rt, ncol = 1)
+```
+
+
+
+
+
+
+
+
+
+\newpage
+
+## B. Specification Comparison: MSM vs.\ MSI
+The AR(1) Markov-switching model can be specified in two standard ways, depending on how the lagged factor $F_{t-1}$ is treated in the conditional mean equation. The terminology follows Krolzig (1997), who provides a systematic classification of Markov-switching VAR models.
+
+\textbf{MSI} (Markov-Switching Intercept) The conditional mean is written as
+\begin{equation}
+    F_t = \mu_{s_t} + \phi_{s_t}(F_{t-1} - \mu_{s_t}) + \sigma_{s_t}\varepsilon_t,
+    \label{eq:msi}
+\end{equation}
+which is algebraically equivalent to the intercept form $F_t = \nu_{s_t} + \phi_{s_t} F_{t-1} + \sigma_{s_t}\varepsilon_t$ with $\nu_j = \mu_j(1-\phi_j)$. Since $F_{t-1}$ is always demeaned by the \emph{current} regime's mean, the filter requires only two marginal state probabilities $P(s_t = j \mid \mathcal{I}_t)$ at each step. After a regime switch, the process \emph{smoothly approaches} the new regime-specific mean through the autoregressive dynamics, this feature is consistent with the gradual adjustment observed in monthly survey data.
+
+\textbf{MSM} (Markov-Switching Mean)  The conditional mean is written as
+\begin{equation}
+    F_t = \mu_{s_t} + \phi_{s_t}(F_{t-1} - \mu_{s_{t-1}}) + \sigma_{s_t}\varepsilon_t.
+    \label{eq:msm}
+\end{equation}
+where $F_{t-1}$ is demeaned by the \emph{previous} regime's mean $\mu_{s_{t-1}}$. This specification implies that the process mean \emph{jumps instantaneously} to the new level upon a regime switch, and requires tracking four joint-state probabilities $P(s_{t-1}=i, s_t=j \mid \mathcal{I}_{t-1})$ in the Hamilton filter.
+
+The two specifications differ only at transition periods, through the correction term $\phi_j(\mu_i - \mu_j)$. When $s_{t-1} = s_t$ (no switch), they are identical.
+
+Tables 5--9 and the overlay plots compare the two specifications.
+
+
+```{r spec-load-msm, include=FALSE}
+# Load MSM results from 05_MS_DFM_3 for comparison
+
+msm_path <- "output/msdfm_results_msm_05.rds"
+has_msm  <- file.exists(msm_path)
+
+if (has_msm) {
+  msm_loaded     <- readRDS(msm_path)
+  ms_results_msm <- msm_loaded$ms_results_msm
+  cat("Loaded MSM results from", msm_path, "\n")
+} else {
+  cat("MSM results not found at", msm_path, "— skipping comparison.\n")
+}
+```
+
+
+
+
+
+```{r spec-comparison-table, results='asis', eval=has_msm}
+# Build comparison table
+
+spec_comp <- data.frame(
+  Factor           = integer(),
+  LogLik_MSM       = numeric(),
+  LogLik_MSI       = numeric(),
+  AIC_MSM          = numeric(),
+  AIC_MSI          = numeric(),
+  BIC_MSM          = numeric(),
+  BIC_MSI          = numeric(),
+  Cor_Smoothed     = numeric(),
+  MaxAbsDiff_Prob  = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (j in 1:r) {
+  if (is.null(ms_results_msm[[j]]) || is.null(ms_results[[j]])) next
+
+  msm_m <- ms_results_msm[[j]]$tvtp
+  msi_m <- ms_results[[j]]$tvtp
+
+  p_msm <- msm_m$prob_smoothed[, 2]
+  p_msi <- msi_m$prob_smoothed[, 2]
+  valid <- complete.cases(p_msm, p_msi) & (seq_along(p_msm) > 1)
+
+  spec_comp <- rbind(spec_comp, data.frame(
+    Factor           = j,
+    LogLik_MSM       = round(msm_m$loglik, 2),
+    LogLik_MSI       = round(msi_m$loglik, 2),
+    AIC_MSM          = round(msm_m$aic, 1),
+    AIC_MSI          = round(msi_m$aic, 1),
+    BIC_MSM          = round(msm_m$bic, 1),
+    BIC_MSI          = round(msi_m$bic, 1),
+    Cor_Smoothed     = round(cor(p_msm[valid], p_msi[valid]), 4),
+    MaxAbsDiff_Prob  = round(max(abs(p_msm[valid] - p_msi[valid])), 4),
+    stringsAsFactors = FALSE
+  ))
+}
+
+
+spec_comp |>
+  kable(
+    format    = "latex",
+    booktabs  = TRUE,
+    col.names = c("Factor",
+                  "LogLik (MSM)", "LogLik (MSI)",
+                  "AIC (MSM)",    "AIC (MSI)",
+                  "BIC (MSM)",    "BIC (MSI)",
+                  "Cor(Smoothed)", "Max $|\\Delta P|$"),
+    caption   = paste0(
+      "Specification Comparison (TVTP): ",
+      "Hamilton (1989) MSM ($\\mu_{s_{t-1}}$) vs.\\ MSI ($\\mu_{s_t}$, current). ",
+      "Both re-estimated independently. ",
+      "Cor(Smoothed) = Pearson correlation of smoothed $P(\\text{Turbulent})$."
+    ),
+    escape    = FALSE,
+    align     = "ccccccccc"
+  ) |>
+  kable_styling(latex_options = c("H", "scale_down"), full_width = FALSE)
+```
+
+
+
+
+
+```{r spec-param-comparison, results='asis', eval=has_msm}
+# Detailed Parameter Comparison: MSM vs MSI (TVTP specification)
+
+param_comp <- data.frame(
+  Factor        = integer(),
+  phi0_MSM      = numeric(), phi0_MSI      = numeric(),
+  phi1_MSM      = numeric(), phi1_MSI      = numeric(),
+  sigma0_MSM    = numeric(), sigma0_MSI    = numeric(),
+  sigma1_MSM    = numeric(), sigma1_MSI    = numeric(),
+  sigmaR_MSM    = numeric(), sigmaR_MSI    = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (j in 1:r) {
+  if (is.null(ms_results_msm[[j]]) || is.null(ms_results[[j]])) next
+  msm <- ms_results_msm[[j]]$tvtp
+  msi <- ms_results[[j]]$tvtp
+
+  param_comp <- rbind(param_comp, data.frame(
+    Factor     = j,
+    phi0_MSM   = round(msm$phi[1], 3),   phi0_MSI   = round(msi$phi[1], 3),
+    phi1_MSM   = round(msm$phi[2], 3),   phi1_MSI   = round(msi$phi[2], 3),
+    sigma0_MSM = round(msm$sigma[1], 3), sigma0_MSI = round(msi$sigma[1], 3),
+    sigma1_MSM = round(msm$sigma[2], 3), sigma1_MSI = round(msi$sigma[2], 3),
+    sigmaR_MSM = round(max(msm$sigma) / min(msm$sigma), 2),
+    sigmaR_MSI = round(max(msi$sigma) / min(msi$sigma), 2),
+    stringsAsFactors = FALSE
+  ))
+}
+
+# Table A: Regime Persistence
+means_phi <- param_comp |>
+  select(Factor,
+         phi0_MSM, phi0_MSI, phi1_MSM, phi1_MSI)
+
+means_phi |>
+  kable(
+    format    = "latex",
+    booktabs  = TRUE,
+    col.names = c("Factor",
+                  "$\\hat{\\phi}_0$ MSM", "$\\hat{\\phi}_0$ MSI",
+                  "$\\hat{\\phi}_1$ MSM", "$\\hat{\\phi}_1$ MSI"),
+    caption   = "Regime Persistence: MSM vs.\\ MSI. Subscript 0 = Expansion, 1 = Turbulent.",
+    escape    = FALSE,
+    align     = "ccccccccc"
+  ) |>
+  kable_styling(latex_options = c("H", "scale_down"), full_width = FALSE)
+```
+
+```{r spec-volatility-comparison, results='asis', eval=has_msm}
+# Table B: Volatility 
+vol_comp <- param_comp |>
+  select(Factor,
+         sigma0_MSM, sigma0_MSI, sigma1_MSM, sigma1_MSI,
+         sigmaR_MSM, sigmaR_MSI)
+
+vol_comp |>
+  kable(
+    format    = "latex",
+    booktabs  = TRUE,
+    col.names = c("Factor",
+                  "$\\hat{\\sigma}_0$ MSM", "$\\hat{\\sigma}_0$ MSI",
+                  "$\\hat{\\sigma}_1$ MSM", "$\\hat{\\sigma}_1$ MSI",
+                  "$\\sigma_1/\\sigma_0$ MSM", "$\\sigma_1/\\sigma_0$ MSI"),
+    caption   = paste0(
+      "Regime-Dependent Volatility: MSM vs.\\ MSI. ",
+      "$\\sigma_1/\\sigma_0$ = volatility ratio (Turbulent / Expansion)."
+    ),
+    escape    = FALSE,
+    align     = "ccccccc"
+  ) |>
+  kable_styling(latex_options = c("H"), full_width = FALSE)
+```
+
+```{r spec-tvtp-comparison, results='asis', eval=has_msm}
+# Table C: TVTP Parameters and Expected Durations
+tvtp_comp <- data.frame(
+  Factor      = integer(),
+  g01_0_MSM   = numeric(), g01_0_MSI   = numeric(),
+  g01_1_MSM   = numeric(), g01_1_MSI   = numeric(),
+  g10_0_MSM   = numeric(), g10_0_MSI   = numeric(),
+  g10_1_MSM   = numeric(), g10_1_MSI   = numeric(),
+  dur_exp_MSM = numeric(), dur_exp_MSI = numeric(),
+  dur_tur_MSM = numeric(), dur_tur_MSI = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (j in 1:r) {
+  if (is.null(ms_results_msm[[j]]) || is.null(ms_results[[j]])) next
+  msm <- ms_results_msm[[j]]$tvtp
+  msi <- ms_results[[j]]$tvtp
+
+  tvtp_comp <- rbind(tvtp_comp, data.frame(
+    Factor      = j,
+    g01_0_MSM   = round(msm$gamma_01[1], 3), g01_0_MSI   = round(msi$gamma_01[1], 3),
+    g01_1_MSM   = round(msm$gamma_01[2], 3), g01_1_MSI   = round(msi$gamma_01[2], 3),
+    g10_0_MSM   = round(msm$gamma_10[1], 3), g10_0_MSI   = round(msi$gamma_10[1], 3),
+    g10_1_MSM   = round(msm$gamma_10[2], 3), g10_1_MSI   = round(msi$gamma_10[2], 3),
+    dur_exp_MSM = round(msm$duration_expansion, 1),
+    dur_exp_MSI = round(msi$duration_expansion, 1),
+    dur_tur_MSM = round(msm$duration_turbulent, 1),
+    dur_tur_MSI = round(msi$duration_turbulent, 1),
+    stringsAsFactors = FALSE
+  ))
+}
+
+# Split into two sub-tables for readability
+
+# Table C1: TVTP slope parameters
+tvtp_comp |>
+  select(Factor,
+         g01_0_MSM, g01_0_MSI, g01_1_MSM, g01_1_MSI,
+         g10_0_MSM, g10_0_MSI, g10_1_MSM, g10_1_MSI) |>
+  kable(
+    format    = "latex",
+    booktabs  = TRUE,
+    col.names = c("Factor",
+                  "$\\gamma_{01,0}$ MSM", "$\\gamma_{01,0}$ MSI",
+                  "$\\gamma_{01,1}$ MSM", "$\\gamma_{01,1}$ MSI",
+                  "$\\gamma_{10,0}$ MSM", "$\\gamma_{10,0}$ MSI",
+                  "$\\gamma_{10,1}$ MSM", "$\\gamma_{10,1}$ MSI"),
+    caption   = paste0(
+      "TVTP Parameters: MSM vs.\\ MSI. ",
+      "$\\gamma_{01}$: Expansion $\\to$ Turbulent; ",
+      "$\\gamma_{10}$: Turbulent $\\to$ Expansion. ",
+      "Subscript 0 = intercept, 1 = slope on leading indicator."
+    ),
+    escape    = FALSE,
+    align     = "ccccccccc"
+  ) |>
+  kable_styling(latex_options = c("H", "scale_down"), full_width = FALSE)
+```
+
+```{r spec-duration-comparison, results='asis', eval=has_msm}
+# Table C2: Expected Durations
+tvtp_comp |>
+  select(Factor,
+         dur_exp_MSM, dur_exp_MSI,
+         dur_tur_MSM, dur_tur_MSI) |>
+  kable(
+    format    = "latex",
+    booktabs  = TRUE,
+    col.names = c("Factor",
+                  "$E[\\text{Dur}]$ Exp.\\ MSM", "$E[\\text{Dur}]$ Exp.\\ MSI",
+                  "$E[\\text{Dur}]$ Turb.\\ MSM", "$E[\\text{Dur}]$ Turb.\\ MSI"),
+    caption   = paste0(
+      "Expected Regime Durations (months): MSM vs.\\ MSI. ",
+      "Computed as $1/\\bar{p}_{01}$ and $1/\\bar{p}_{10}$ respectively."
+    ),
+    escape    = FALSE,
+    align     = "ccccc"
+  ) |>
+  kable_styling(latex_options = c("H"), full_width = FALSE)
+```
+
+
+
+
+Tables 5--9 report estimates from both specifications. The volatility ratio $\hat{\sigma}_1/\hat{\sigma}_0$, which is the dominant driver of regime identification, is nearly identical across specifications for all five factors (Table 7, maximum difference 0.56). Persistence estimates $\hat{\phi}$ are also closely aligned across both regimes (Table 6). The TVTP slope parameters $\gamma_{01,1}$ preserve their sign and approximate magnitude in most cases (Table 8), so the qualitative inference on leading-indicator informativeness is unaffected by the specification choice.
+
+The largest discrepancies appear for Factors 3 and 4 (Cor(Smoothed) = 0.62 and 0.64). Both are factors with relatively low volatility ratios (Table 7: $\hat{\sigma}_1/\hat{\sigma}_0 = 2.03$ and $1.93$ under MSI), so the two regimes overlap more strongly in the data and the log-likelihood becomes relatively flat with multiple competing local optima. As a consequence, the MSM and MSI can converge to different parameterisations that fit the data similarly well in this ambiguous region. 
+
+
+\medskip
+\noindent\textbf{Choice of baseline specification.} 
+
+For monthly ifo survey data, the MSI specification provides a more realistic adjustment mechanism. After a regime switch, the factor gradually reverts toward the new regime-specific mean, whereas MSM implies an immediate level shift at the transition. The smooth-adjustment dynamics of the MSI specification is consistent with the idea that manufacturing sentiment adjusts over several months as firms revise their assessments. 
+
+From an estimation perspective, MSI is also numerically more stable, as it only requires filtering over the two marginal regime probabilities $P(s_t \mid \mathcal{I}_{t})$, whereas MSM requires tracking four joint-state probabilities $P(s_{t-1}, s_t \mid \mathcal{I}_{t-1})$. This additional joint-state structure in MSM induces stronger parameter interactions and increases susceptibility to local optima, especially when regimes are weakly separated. Accordingly, we adopt MSI as the baseline specification, and report MSM estimates as a robustness check. The MSM results confirm that the main conclusions are not sensitive to the demeaning convention.
+
+
+
+
+
+```{r spec-comparison-plots, fig.height=12, out.width="100%", include=FALSE}
+# Overlay plots: smoothed P(Turbulent)
+
+overlay_plots <- lapply(1:r, function(j) {
+  if (is.null(ms_results_msm[[j]]) || is.null(ms_results[[j]])) return(NULL)
+
+  df <- data.frame(
+    date = dates,
+    MSM  = ms_results_msm[[j]]$tvtp$prob_smoothed[, 2],
+    MSI  = ms_results[[j]]$tvtp$prob_smoothed[, 2]
+  ) |>
+    pivot_longer(-date, names_to = "Specification", values_to = "P_turbulent")
+
+  ggplot(df, aes(x = date, y = P_turbulent, color = Specification)) +
+    geom_rect(data = german_recessions,
+              aes(xmin = start, xmax = end, ymin = -Inf, ymax = Inf),
+              fill = "gray85", alpha = 0.4, inherit.aes = FALSE) +
+    geom_line(linewidth = 0.7, alpha = 0.85) +
+    scale_y_continuous(limits = c(0, 1), labels = percent_format()) +
+    scale_color_manual(
+      values = c("MSM" = "steelblue", "MSI" = "darkred"),
+      breaks = c("MSM", "MSI"),
+      labels = c(
+        expression(MSM ~ (mu[s[t-1]])),
+        expression(MSI ~ (nu[s[t]]))
+      )
+    ) +
+    labs(
+      title = paste0("Factor ", j, ": Smoothed P(Turbulent) — MSM vs. MSI"),
+      x = NULL, y = "P(Turbulent)", color = NULL
+    ) +
+    theme(legend.position = "bottom", legend.text.align = 0)
+})
+
+overlay_plots <- Filter(Negate(is.null), overlay_plots)
+if (length(overlay_plots) > 0) wrap_plots(overlay_plots, ncol = 1)
+```
+
+
+
+
+
+\newpage
+
+## C. Out-of-Sample Evaluation of Filtered Crisis Probabilities
+
+The filtered regime probabilities $P(s_t = \text{Turbulent} \mid \mathcal{I}_t)$ are the model's real-time output: at each month $t$, only information available up to $t$ enters the Hamilton filter. However, the full-sample estimates reported in the main text use parameters $\hat{\theta}$ optimised over the entire sample $1, \ldots, T$, so the filtered probabilities are only \textit{pseudo}-real-time. A genuine out-of-sample evaluation requires re-estimating the model on an expanding window $\{1, \ldots, t\}$ and recording the one-step-ahead filtered probability before advancing to $t+1$.
+
+This appendix implements such an evaluation and reports standard probability-forecast scoring metrics.
+
+
+### Design
+
+We construct a binary recession indicator $d_t \in \{0, 1\}$ from the manufacturing recession dates used throughout the main text:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Episode & Start & End \\
+\midrule
+Dot-com / early-2000s & 2001-01 & 2001-12 \\
+Global Financial Crisis & 2008-01 & 2009-06 \\
+Euro-area Sovereign Crisis & 2012-01 & 2013-03 \\
+COVID-19 & 2020-01 & 2020-06 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+For the purpose of this evaluation, they serve as a rough benchmark rather than a precise turning-point chronology. 
+
+\medskip
+\textbf{Expanding-window protocol.}
+Let $t_0$ denote the start of the evaluation period. We set $t_0 =$ 2007-01 (month 192), which provides an initial training window of approximately 15 years containing the 2001 recession. At each evaluation month $t = t_0, t_0 + 1, \ldots, T_{\text{eval}}$:
+
+\begin{enumerate}
+\item Re-estimate the TVTP model on $\{1, \ldots, t\}$ using the same optimizer, penalty constraints, and leading-indicator pipeline as in the main text.
+\item Run the Hamilton filter on $\{1, \ldots, t\}$ and record the \textbf{final filtered probability} $\hat{p}_t = P(s_t = 1 \mid \mathcal{I}_t; \hat{\theta}_{1:t})$.
+\item As a benchmark, also run a \textbf{fixed-TP model} (no leading indicator) and record its filtered probability.
+\end{enumerate}
+
+The evaluation ends at $T_{\text{eval}} =$ 2019-12 (just before the COVID episode) to avoid the post-2020 structural break issue. A separate evaluation including 2020 is shown for completeness but interpreted with caution.
+
+\medskip
+\textbf{Scoring rules.}
+\begin{itemize}
+\item \textbf{Brier Score}: $\text{BS} = \frac{1}{T_{\text{eval}} - t_0 + 1} \sum_{t=t_0}^{T_{\text{eval}}} (\hat{p}_t - d_t)^2$. Lower is better.
+\item \textbf{AUC}: Area Under the ROC Curve, computed from the ranked filtered probabilities against $d_t$. AUC $= 0.5$ is random; AUC $> 0.7$ is considered useful discrimination.
+\end{itemize}
+
+
+```{r oos-load-results, include=FALSE}
+# ─────────────────────────────────────────────────────────────────────────────
+# Load pre-computed expanding-window results from server
+# (See 05_MS_DFM_OOS.Rmd for the estimation code)
+# ─────────────────────────────────────────────────────────────────────────────
+
+oos_path    <- "output/ms_models/ms_oos_evaluation.rds"
+has_oos     <- file.exists(oos_path)
+
+if (has_oos) {
+  oos_results <- readRDS(oos_path)
+  cat("Loaded OOS evaluation results from:", oos_path, "\n")
+} else {
+  cat("OOS results not found — run 05_MS_DFM_OOS.Rmd on server first.\n")
+}
+```
+
+
+### Results
+
+```{r oos-scoring-table, results='asis', eval=has_oos}
+# ─────────────────────────────────────────────────────────────────────────────
+# Table: Scoring metrics — TVTP vs Fixed TP vs Base Rate
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Construct recession dummy over evaluation dates
+eval_dates <- oos_results$eval_dates
+d_t <- as.numeric(eval_dates >= as.Date("2008-01-01") & eval_dates <= as.Date("2009-06-01") |
+                  eval_dates >= as.Date("2012-01-01") & eval_dates <= as.Date("2013-03-01"))
+
+# If evaluation extends to 2020
+if (max(eval_dates) >= as.Date("2020-01-01")) {
+  d_t_full <- d_t | (eval_dates >= as.Date("2020-01-01") & eval_dates <= as.Date("2020-06-01"))
+} else {
+  d_t_full <- d_t
+}
+
+# Pre-2020 evaluation window
+pre2020 <- eval_dates < as.Date("2020-01-01")
+d_pre   <- d_t[pre2020]
+base_rate_pre <- mean(d_pre)
+
+score_df <- data.frame(Factor = integer(), stringsAsFactors = FALSE)
+
+for (j in 1:r) {
+  if (is.null(oos_results$filtered_tvtp[[j]])) next
+
+  p_tvtp  <- oos_results$filtered_tvtp[[j]][pre2020]
+  p_fixed <- oos_results$filtered_fixed[[j]][pre2020]
+
+  # Brier Score
+  bs_tvtp  <- mean((p_tvtp - d_pre)^2,  na.rm = TRUE)
+  bs_fixed <- mean((p_fixed - d_pre)^2, na.rm = TRUE)
+  bs_ref   <- mean((base_rate_pre - d_pre)^2)
+
+  # AUC (simple trapezoidal, avoids pROC dependency)
+  auc_fn <- function(p, d) {
+    n1 <- sum(d == 1); n0 <- sum(d == 0)
+    if (n1 == 0 || n0 == 0) return(NA)
+    ranks <- rank(p)
+    (sum(ranks[d == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+  }
+  auc_tvtp  <- auc_fn(p_tvtp,  d_pre)
+  auc_fixed <- auc_fn(p_fixed, d_pre)
+
+  score_df <- rbind(score_df, data.frame(
+    Factor    = j,
+    BS_TVTP   = round(bs_tvtp, 4),
+    BS_Fixed  = round(bs_fixed, 4),
+    BS_Ref    = round(bs_ref, 4),
+    AUC_TVTP  = round(auc_tvtp, 3),
+    AUC_Fixed = round(auc_fixed, 3),
+    stringsAsFactors = FALSE
+  ))
+}
+
+score_df |>
+  kable(
+    format    = "latex",
+    booktabs  = TRUE,
+    col.names = c("Factor",
+                  "BS (TVTP)", "BS (Fixed)", "BS (Ref.)",
+                  "AUC (TVTP)", "AUC (Fixed)"),
+    caption   = paste0(
+      "Out-of-Sample Probability Forecast Evaluation (2007-01 to 2019-12). ",
+      "BS = Brier Score (lower is better); ",
+      "AUC = Area Under ROC Curve."
+    ),
+    escape    = FALSE,
+    align     = "ccccccccc"
+  ) |>
+  add_header_above(c(" " = 1, "Brier Score" = 3, "AUC" = 2)) |>
+  kable_styling(latex_options = c("H", "scale_down"), full_width = FALSE)
+```
+
+
+```{r}
+# ─────────────────────────────────────────────────────────────────────────────
+# Table: Scoring metrics — TVTP vs Fixed TP vs Base Rate (Full Sample)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 1. Construct the comprehensive recession dummy for all dates
+eval_dates <- oos_results$eval_dates
+
+# Define recession periods: GFC, Euro Debt, and COVID+
+d_full <- as.numeric(
+  (eval_dates >= as.Date("2008-01-01") & eval_dates <= as.Date("2009-06-01")) | # GFC
+  (eval_dates >= as.Date("2012-01-01") & eval_dates <= as.Date("2013-03-01")) | # Euro Debt
+  (eval_dates >= as.Date("2020-01-01") & eval_dates <= as.Date("2020-06-01"))   # COVID-19
+)
+
+# 2. Calculate the Base Rate over the full evaluation period
+# This represents the "naive" forecast probability (unconditional mean)
+base_rate_full <- mean(d_full)
+
+# Initialize the results data frame
+score_df <- data.frame(Factor = integer(), stringsAsFactors = FALSE)
+
+# 3. Calculate metrics for each factor using the full time frame
+for (j in 1:r) {
+  # Skip if the results for this factor are missing
+  if (is.null(oos_results$filtered_tvtp[[j]])) next
+
+  # Use the full vector of filtered probabilities instead of the pre-2020 subset
+  p_tvtp  <- oos_results$filtered_tvtp[[j]]
+  p_fixed <- oos_results$filtered_fixed[[j]]
+
+  # Calculate Brier Scores (MSE of probability forecasts)
+  # Lower values indicate better calibration and sharpness
+  bs_tvtp  <- mean((p_tvtp - d_full)^2,  na.rm = TRUE)
+  bs_fixed <- mean((p_fixed - d_full)^2, na.rm = TRUE)
+  bs_ref   <- mean((base_rate_full - d_full)^2)
+
+  # Calculate AUC (Area Under the ROC Curve)
+  # Measures the ability to discriminate between recession and expansion states
+  auc_fn <- function(p, d) {
+    n1 <- sum(d == 1); n0 <- sum(d == 0)
+    if (n1 == 0 || n0 == 0) return(NA)
+    ranks <- rank(p)
+    (sum(ranks[d == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+  }
+  
+  auc_tvtp  <- auc_fn(p_tvtp,  d_full)
+  auc_fixed <- auc_fn(p_fixed, d_full)
+
+  # Store results
+  score_df <- rbind(score_df, data.frame(
+    Factor    = j,
+    BS_TVTP   = round(bs_tvtp, 4),
+    BS_Fixed  = round(bs_fixed, 4),
+    BS_Ref    = round(bs_ref, 4),
+    AUC_TVTP  = round(auc_tvtp, 3),
+    AUC_Fixed = round(auc_fixed, 3),
+    stringsAsFactors = FALSE
+  ))
+}
+
+# 4. Generate the LaTeX table via kable
+# Updated the caption to reflect the full sample range
+max_date_label <- format(max(eval_dates), "%Y-%m")
+min_date_label <- format(min(eval_dates), "%Y-%m")
+
+score_df |>
+  kable(
+    format    = "latex",
+    booktabs  = TRUE,
+    col.names = c("Factor",
+                  "BS (TVTP)", "BS (Fixed)", "BS (Ref.)",
+                  "AUC (TVTP)", "AUC (Fixed)"),
+    caption   = paste0(
+      "Out-of-Sample Probability Forecast Evaluation (", min_date_label, " to ", max_date_label, "). ",
+      "BS = Brier Score (lower is better); ",
+      "AUC = Area Under ROC Curve. Ref. is the unconditional base rate."
+    ),
+    escape    = FALSE,
+    align     = "c"
+  ) |>
+  add_header_above(c(" " = 1, "Brier Score" = 3, "AUC" = 2)) |>
+  kable_styling(latex_options = c("H", "scale_down"), full_width = FALSE)
+```
+
+
+
+
+
+
+
+
+
+```{r oos-turning-points, results='asis', eval=has_oos, include=FALSE}
+# ─────────────────────────────────────────────────────────────────────────────
+# Table: Turning-point lead analysis
+# For each crisis episode in the evaluation window, report the first month
+# where filtered P(Turbulent) > 0.5, and the lead (months) relative to
+# the recession start date.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+episodes <- data.frame(
+  name  = c("GFC", "Euro Slowdown", "COVID-19"),
+  
+  # GFC: CEPR Euro Area Dating Committee (2008 Q1 - 2009 Q2)
+  # Euro: Bundesbank Dec 2012 report — mild contraction Q4 2012 - Q1 2013
+  # COVID: Bundesbank 2020 — deep recession Q1-Q2 2020
+  start = as.Date(c("2008-01-01", "2012-10-01", "2020-02-01")),
+  end   = as.Date(c("2009-06-01", "2013-03-01", "2020-06-01"))
+)
+
+tp_rows <- list()
+
+for (j in 1:r) {
+  if (is.null(oos_results$filtered_tvtp[[j]])) next
+
+  p_tvtp_all  <- oos_results$filtered_tvtp[[j]]
+  p_fixed_all <- oos_results$filtered_fixed[[j]]
+
+  for (ep in 1:nrow(episodes)) {
+    ep_start <- episodes$start[ep]
+    # Only include episodes within the evaluation window
+    if (ep_start < min(eval_dates)) next
+
+    # Look for first P > 0.5 within 12 months before episode start
+    window_start <- ep_start %m-% months(12)
+    window_end   <- ep_start %m+% months(3)  # allow 3 months into episode
+    in_window    <- eval_dates >= window_start & eval_dates <= window_end
+
+    if (sum(in_window) == 0) next
+
+    # TVTP: first crossing > 0.5
+    p_sub <- p_tvtp_all[in_window]
+    d_sub <- eval_dates[in_window]
+    first_cross_tvtp <- if (any(p_sub > 0.5, na.rm = TRUE)) {
+      d_sub[which(p_sub > 0.5)[1]]
+    } else {
+      NA
+    }
+
+    # Fixed: first crossing > 0.5
+    p_sub_f <- p_fixed_all[in_window]
+    first_cross_fixed <- if (any(p_sub_f > 0.5, na.rm = TRUE)) {
+      d_sub[which(p_sub_f > 0.5)[1]]
+    } else {
+      NA
+    }
+
+    # Lead in months (positive = signal before recession start)
+    lead_tvtp <- if (!is.na(first_cross_tvtp)) {
+      as.numeric(difftime(ep_start, first_cross_tvtp, units = "days")) / 30.44
+    } else {
+      NA
+    }
+    lead_fixed <- if (!is.na(first_cross_fixed)) {
+      as.numeric(difftime(ep_start, first_cross_fixed, units = "days")) / 30.44
+    } else {
+      NA
+    }
+
+    tp_rows[[length(tp_rows) + 1]] <- data.frame(
+      Factor   = j,
+      Episode  = episodes$name[ep],
+      Signal_TVTP  = if (!is.na(first_cross_tvtp)) format(first_cross_tvtp, "%Y-%m") else "—",
+      Lead_TVTP    = if (!is.na(lead_tvtp)) sprintf("%+.0f", round(lead_tvtp)) else "—",
+      Signal_Fixed = if (!is.na(first_cross_fixed)) format(first_cross_fixed, "%Y-%m") else "—",
+      Lead_Fixed   = if (!is.na(lead_fixed)) sprintf("%+.0f", round(lead_fixed)) else "—",
+      stringsAsFactors = FALSE
+    )
+  }
+}
+
+tp_df <- bind_rows(tp_rows)
+
+tp_df |>
+  kable(
+    format    = "latex",
+    booktabs  = TRUE,
+    col.names = c("Factor", "Episode",
+                  "First Signal", "Lead (mo.)",
+                  "First Signal", "Lead (mo.)"),
+    caption   = paste0(
+      "Turning-Point Lead Analysis. ",
+      "``First Signal'' = first month where filtered $P(\\text{Turbulent}) > 0.5$. ",
+      "``Lead'' = months before recession start (positive = early warning, negative = late). ",
+      "``---'' = no signal within 12-month pre-crisis window."
+    ),
+    escape    = FALSE,
+    align     = "clcccc"
+  ) |>
+  add_header_above(c(" " = 2, "TVTP" = 2, "Fixed TP" = 2)) |>
+  kable_styling(latex_options = c("H"), full_width = FALSE) |>
+  collapse_rows(columns = 1, valign = "middle", latex_hline = "major")
+```
+
+
+```{r oos-probability-plots, fig.height=14, out.width="100%", eval=has_oos}
+# Figure: Out-of-sample filtered P(Turbulent) over time
+
+german_recessions <- data.frame(
+  start = as.Date(c("2001-01-01", "2008-01-01", "2012-01-01", "2020-01-01")),
+  end   = as.Date(c("2001-12-01", "2009-06-01", "2013-03-01", "2020-06-01"))
+)
+
+oos_plots <- lapply(1:r, function(j) {
+  if (is.null(oos_results$filtered_tvtp[[j]])) return(NULL)
+
+  df <- data.frame(
+    date     = eval_dates,
+    TVTP     = oos_results$filtered_tvtp[[j]],
+    Fixed_TP = oos_results$filtered_fixed[[j]]
+  ) |>
+    pivot_longer(-date, names_to = "Model", values_to = "P_turbulent")
+
+  ggplot(df, aes(x = date, y = P_turbulent, color = Model)) +
+    geom_rect(data = german_recessions,
+              aes(xmin = start, xmax = end, ymin = -Inf, ymax = Inf),
+              fill = "gray85", alpha = 0.4, inherit.aes = FALSE) +
+    geom_hline(yintercept = 0.5, linetype = "dashed", color = "gray50", linewidth = 0.3) +
+    geom_line(linewidth = 0.6, alpha = 0.8) +
+    scale_y_continuous(limits = c(0, 1), labels = percent_format()) +
+    scale_color_manual(values = c("TVTP" = "steelblue", "Fixed_TP" = "darkred")) +
+    labs(
+      title = paste0("Factor ", j, ": Out-of-Sample Filtered P(Turbulent)"),
+      subtitle = "Expanding-window re-estimation, parameters estimated on {1, ..., t} only",
+      x = NULL, y = "P(Turbulent)", color = NULL
+    ) +
+    theme(legend.position = "bottom")
+})
+
+oos_plots <- Filter(Negate(is.null), oos_plots)
+if (length(oos_plots) > 0) wrap_plots(oos_plots, ncol = 1)
+```
+
+
+
+
+
+
+
+Several patterns emerge from the out-of-sample exercise.
+
+First, the Brier Skill Scores indicate whether the regime-switching model adds value beyond simply predicting the base rate of manufacturing recessions. A positive BSS means the model's real-time crisis probabilities are more informative than a constant forecast. Since the unconditional recession frequency in the evaluation window is itself a strong benchmark (manufacturing recessions are not rare in this sample), even modest positive skill scores represent meaningful discrimination.
+
+Second, the comparison between TVTP and fixed-TP models isolates the contribution of the leading indicator. If TVTP achieves higher AUC or better turning-point lead, this confirms that the indicator provides genuine early-warning information beyond what the regime-switching structure alone can deliver. If the two models perform similarly, this is consistent with the main-text finding that BIC favors fixed TP: the indicator signal is present but too weak to improve real-time forecasting at the margin.
+
+Third, the turning-point lead analysis provides the most directly interpretable metric for policy applications. A lead of 2--3 months before a recession date is substantial for a monthly indicator; leads of 0 or negative values indicate that the model recognises crises only contemporaneously or after onset. Note that the 0.5 threshold is conventional and that a lower threshold (e.g., 0.3) would yield earlier but noisier signals.
+
+\medskip
+\noindent\textit{Caveats.}
+The evaluation window contains only 2--3 crisis episodes depending on the end date, so the scoring metrics should be interpreted as descriptive rather than as formal tests of forecast accuracy. The AUC in particular can be volatile with so few positive observations. Additionally, the factors and leading indicators are estimated on the full sample in Sections 02--04, introducing a degree of look-ahead bias that a fully recursive design would avoid but at prohibitive computational cost. The expanding-window re-estimation of the MS-AR parameters in this appendix mitigates the most direct source of in-sample contamination (regime-switching parameter estimates), but does not eliminate it entirely.
