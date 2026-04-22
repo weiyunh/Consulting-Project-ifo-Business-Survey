@@ -256,7 +256,6 @@ p2 <- ggplot(scree_df, aes(x = Factor, y = CumVar)) +
   geom_hline(yintercept = 80, linetype = "dashed", color = "red") +
   labs(title = "Cumulative Variance", y = "Cum Var (%)")
 
-p1 + p2
 ```
 The scree plot shows a clear “elbow”  at Factor 5: after the 5th factor, eigenvalues drop sharply and then level off. This suggests that the first 5 factors capture the most meaningful variance, while additional factors contribute relatively little. The marginal gain from additional factors is low relative to increased complexity.
 
@@ -334,6 +333,7 @@ for (j in 1:r) {
   ))
 }
 ```
+
 ```{r}
 factor_texts <- list(
   # Factor 1
