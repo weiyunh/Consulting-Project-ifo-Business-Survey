@@ -1,0 +1,609 @@
+---
+title: "01_supplement_static_DFM"
+author: "Yiming Zhao"
+date: "2026-02-04"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 10, fig.height = 6
+)
+
+library(tidyverse)
+library(ggplot2)
+library(zoo)
+library(knitr)
+library(kableExtra)
+
+source("ifo_data_processing.R")
+
+theme_set(theme_minimal())
+```
+
+
+```{r load_data}
+data_wide <- read_csv("data_b_wide.csv")
+data_b_long <- read_csv("data_b_long.csv", show_col_types = FALSE)
+
+dates <- data_wide$date
+var_names <- colnames(data_wide)[-1]
+
+cat("Raw Data dimensions:", nrow(data_wide), " x ", ncol(data_wide)-1, "\n")
+```
+
+```{r level_classification}
+# Extract industry and question code from variable name
+extract_industry_code <- function(var_name) {
+  strsplit(var_name, "_")[[1]][1]
+}
+
+extract_question_code <- function(var_name) {
+  strsplit(var_name, "_")[[1]][2]
+}
+
+# Create metadata
+var_metadata <- tibble(
+  var_name = var_names,
+  industry_code = sapply(var_names, extract_industry_code),
+  question_code = sapply(var_names, extract_question_code)
+) %>%
+  mutate(level = sapply(industry_code, get_level))
+```
+
+
+Filter: 
+
+\textbf{Extension 1: Level 2 only (plus quality gates)}
+
+Rationale: avoid mixing hierarchical levels; ensure a stable cross-section for PCA/DFM.
+
+# drop composite index KLD, drop structurally missing industries (pharma prefix C21* unless you want to shorten the sample), optionally drop industry codes with too few available questions (thin panels), optionally drop variables with extreme missingness
+
+```{r filter, comment=''}
+# Keep only levels 1-5
+# keep_vars <- var_metadata$level >= 1 & var_metadata$level <= 5
+
+# Keep only level 2
+keep_vars <- var_metadata$level == 2
+
+cat("Original:", sum(!is.na(var_metadata$level)), "variables\n")
+cat("Level 2 (keep):", sum(keep_vars, na.rm = TRUE), "variables\n")
+
+cat("\nFiltered data:", nrow(X_raw), " x ", ncol(X_raw), "\n")
+
+# Filter data
+X_raw <- as.matrix(data_wide[, c(FALSE, keep_vars)])
+var_names_filtered <- var_names[keep_vars]
+var_metadata_filtered <- var_metadata[keep_vars, ]
+
+# Exclude question KLD
+kld_vars <- grepl("_KLD$", var_names_filtered)
+
+X_raw <- X_raw[, !kld_vars]
+var_names_filtered <- var_names_filtered[!kld_vars]
+var_metadata_filtered <- var_metadata_filtered[!kld_vars, ]
+
+cat("After removing KLD:", ncol(X_raw), "variables\n")
+```
+The filtered dataset consists of 332 monthly observations (1997-07 to 2025-02) and 330 variables (N, 22 Level-1 industries × 15 survey questions).
+
+## Missingness check for level 2
+```{r Missingness check}
+current_ind_codes <- sapply(var_names_filtered, extract_industry_code)
+
+col_miss_rates <- apply(X_raw, 2, function(x) mean(is.na(x)))
+
+miss_summary <- data.frame(
+  Industry_Code = current_ind_codes,
+  Var_Name = var_names_filtered,
+  Miss_Rate = col_miss_rates
+) %>%
+  group_by(Industry_Code) %>%
+  summarise(
+    # Average of all missing rates for variables in this industry
+    Avg_Miss_Rate_Pct = mean(Miss_Rate) * 100, 
+    # The number of variables included in this industry
+    Num_Vars = n()
+  ) %>%
+  mutate(Industry_Name = sapply(Industry_Code, get_industry_name_en)) %>%
+  select(Industry_Code, Industry_Name, everything()) %>%
+  arrange(desc(Avg_Miss_Rate_Pct))
+
+print(as.data.frame(miss_summary), row.names = FALSE)
+
+# Exclude Manufacture of Steel Tubes (C2420000), Animal Feed (C1090000), Basic Chemicals (C2010000), Fish Processing (C1020000)
+
+drop_industries <- c("C2420000", "C1090000", "C2010000", "C1020000")
+
+pattern_drop <- paste0("^(", paste(drop_industries, collapse = "|"), ")_")
+drop_vars <- grepl(pattern_drop, var_names_filtered)
+
+cat("Dropping industries:",
+    paste(drop_industries, collapse = ", "), "\n")
+cat("Variables to drop:", sum(drop_vars), "\n")
+
+if (sum(drop_vars) > 0) {
+  drop_missing <- apply(X_raw[, drop_vars, drop = FALSE], 2,
+                        function(x) mean(is.na(x)) * 100)
+  cat("Avg missing rate (dropped vars):",
+      round(mean(drop_missing), 2), "%\n")
+}
+
+X_raw <- X_raw[, !drop_vars, drop = FALSE]
+var_names_filtered <- var_names_filtered[!drop_vars]
+var_metadata_filtered <- var_metadata_filtered[!drop_vars, ]
+
+cat("Variables after dropping selected industries:",
+    ncol(X_raw), "\n")
+
+cat("Final: 18 industries × 14 questions = 252 variables\n")
+
+## Verify clean data
+remaining_missing <- sum(is.na(X_raw)) / (nrow(X_raw) * ncol(X_raw)) * 100
+cat("Remaining overall missing rate:", round(remaining_missing, 2), "%\n")
+
+
+```
+
+## Data cleaning and standardization
+```{r}
+# drop all-NA columns (safety)
+cols_all_na <- apply(X_raw, 2, function(x) all(is.na(x)))
+if (any(cols_all_na)) {
+  X_raw <- X_raw[, !cols_all_na, drop = FALSE]
+  var_names_filtered <- var_names_filtered[!cols_all_na]
+  var_metadata_filtered <- var_metadata_filtered[!cols_all_na, ]
+}
+
+# linear interpolation (same as Level 1 baseline)
+X_filled <- apply(X_raw, 2, function(x) {
+  if (all(is.na(x))) return(x)
+  zoo::na.approx(x, rule = 2)
+})
+
+# standardize (important for PCA)
+X_std <- scale(X_filled, center = TRUE, scale = TRUE)
+
+# final sanity filter: finite and non-degenerate
+valid <- apply(X_std, 2, function(x) all(is.finite(x)) && sd(x) > 1e-10)
+X_std <- X_std[, valid, drop = FALSE]
+var_names_filtered <- var_names_filtered[valid]
+var_metadata_filtered <- var_metadata_filtered[valid, ]
+
+N <- ncol(X_std)
+T_obs <- nrow(X_std)
+
+cat("\n=== Final Data (Level 2) ===\n")
+cat("N =", N, "variables\n")
+cat("T =", T_obs, "months\n")
+```
+# Factor number selection (r)
+Holding the factor dimension fixed (r=5) to ensure comparability across levels.
+
+
+# PCA estimation + sign standardization
+```{r PCA}
+r <- 5
+pca_result <- prcomp(X_std, rank. = r)
+
+F_hat <- pca_result$x
+colnames(F_hat) <- paste0("F", 1:r)
+
+Lambda_hat <- pca_result$rotation[, 1:r, drop = FALSE]
+rownames(Lambda_hat) <- var_names_filtered
+
+cat("Factors:", nrow(F_hat), " x ", ncol(F_hat), "\n")
+cat("Loadings:", nrow(Lambda_hat), " x ", ncol(Lambda_hat), "\n")
+
+
+# Align signs with an "expansion" window (same logic as Level 1 baseline)
+expansion_period <- dates >= as.Date("2005-01-01") & dates <= as.Date("2008-12-31")
+
+for (j in 1:r) {
+  mean_expansion <- mean(F_hat[expansion_period, j], na.rm = TRUE)
+  if (mean_expansion < 0) {
+    F_hat[, j] <- -F_hat[, j]
+    Lambda_hat[, j] <- -Lambda_hat[, j]
+  }
+}
+
+```
+
+# Top loading tables
+```{r loading}
+for (j in 1:r) {
+  load_j <- Lambda_hat[, j]
+  top_idx <- order(abs(load_j), decreasing = TRUE)[1:10]
+  top_vars <- rownames(Lambda_hat)[top_idx]
+
+  industry_codes <- sapply(top_vars, extract_industry_code)
+  question_codes <- sapply(top_vars, extract_question_code)
+
+  df_top <- tibble(
+    Variable = top_vars,
+    Industry = sapply(industry_codes, get_industry_name_en),
+    Question = sapply(question_codes, get_question_name_en),
+    Group    = sapply(question_codes, get_question_group),
+    Loading  = round(load_j[top_idx], 4)
+  )
+
+  print(
+    kbl(df_top, booktabs = TRUE, caption = paste("Top 10 Loadings for Factor", j, "(Level 2)")) |>
+      kable_styling(latex_options = c("striped", "hold_position"), font_size = 8, full_width = FALSE)
+  )
+  cat("\n\n")
+}
+
+```
+
+
+# Factor time series
+```{r factor ts}
+factor_df <- data.frame(Date = dates, F_hat) %>%
+  pivot_longer(cols = starts_with("F"), names_to = "Factor", values_to = "Value")
+
+events <- tibble(
+  Date = as.Date(c("2008-09-15", "2011-08-01", "2020-03-01")),
+  Event = c("Global Financial Crisis", "Euro Crisis", "COVID-19"),
+  Year = format(Date, "%Y")
+)
+
+ggplot(factor_df, aes(x = Date, y = Value)) +
+  geom_line(size = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(data = events, aes(xintercept = Date), linetype = "dashed", alpha = 0.4) +
+  geom_text(data = events, aes(x = Date, label = Year), y = Inf, vjust = 1.2, size = 2.5, inherit.aes = FALSE) +
+  facet_wrap(~Factor, ncol = 1, scales = "free_y") +
+  labs(title = paste("Extracted Factors (Level", 2, ")"))
+
+```
+
+
+# Diagnostics
+```{r diagnostics}
+X_fitted <- F_hat %*% t(Lambda_hat)
+e_hat <- X_std - X_fitted
+
+R2 <- sapply(1:N, function(i) {
+  1 - sum(e_hat[, i]^2) / sum((X_std[, i] - mean(X_std[, i]))^2)
+})
+
+cat("R² summary:\n")
+print(summary(R2))
+
+ggplot(data.frame(R2 = R2), aes(x = R2)) +
+  geom_histogram(bins = 30, alpha = 0.8) +
+  geom_vline(xintercept = median(R2), linetype = "dashed") +
+  labs(title = "R² Distribution (Level 2)", subtitle = paste("Median R² =", round(median(R2), 3)))
+
+cor_e <- cor(e_hat)
+upper_cor <- cor_e[upper.tri(cor_e)]
+mean_abs_cor <- mean(abs(upper_cor))
+
+cat("Mean |correlation| of errors:", round(mean_abs_cor, 4), "\n")
+
+ggplot(data.frame(Cor = upper_cor), aes(x = Cor)) +
+  geom_histogram(bins = 50, alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(title = "Error Correlations (Level 2)")
+
+```
+
+```{r summary}
+cat("\n=== SUMMARY (Level 2) ===\n")
+cat("N =", N, " | T =", T_obs, "\n")
+cat("Chosen r =", r, "\n")
+cat("CumVar (first r) =", round(100 * cum_var[r], 1), "%\n")
+cat("Median R² =", round(median(R2), 3), "\n")
+cat("Mean |error corr| =", round(mean_abs_cor, 4), "\n")
+```
+
+
+
+\textbf{Extension 2: Level 3 only}
+
+```{r filter, comment=''}
+# Keep only levels 1-5
+# keep_vars <- var_metadata$level >= 1 & var_metadata$level <= 5
+
+# Keep only level 3
+keep_vars <- var_metadata$level == 3
+
+cat("Original:", sum(!is.na(var_metadata$level)), "variables\n")
+cat("Level 3 (keep):", sum(keep_vars, na.rm = TRUE), "variables\n")
+
+# Filter data
+X_raw <- as.matrix(data_wide[, c(FALSE, keep_vars)])
+var_names_filtered <- var_names[keep_vars]
+var_metadata_filtered <- var_metadata[keep_vars, ]
+
+# Exclude question KLD
+kld_vars <- grepl("_KLD$", var_names_filtered)
+
+X_raw <- X_raw[, !kld_vars]
+var_names_filtered <- var_names_filtered[!kld_vars]
+var_metadata_filtered <- var_metadata_filtered[!kld_vars, ]
+
+cat("After removing KLD:", ncol(X_raw), "variables\n")
+```
+
+
+## Missingness check for level 3
+```{r Missingness check}
+current_ind_codes <- sapply(var_names_filtered, extract_industry_code)
+
+col_miss_rates <- apply(X_raw, 2, function(x) mean(is.na(x)))
+
+miss_summary <- data.frame(
+  Industry_Code = current_ind_codes,
+  Var_Name = var_names_filtered,
+  Miss_Rate = col_miss_rates
+) %>%
+  group_by(Industry_Code) %>%
+  summarise(
+    # Average of all missing rates for variables in this industry
+    Avg_Miss_Rate_Pct = mean(Miss_Rate) * 100, 
+    # The number of variables included in this industry
+    Num_Vars = n()
+  ) %>%
+  mutate(Industry_Name = sapply(Industry_Code, get_industry_name_en)) %>%
+  select(Industry_Code, Industry_Name, everything()) %>%
+  arrange(desc(Avg_Miss_Rate_Pct))
+
+print(as.data.frame(miss_summary), row.names = FALSE)
+
+# Exclude Manufacture of dyes and pigments (C2012000), other basic chemiclas (C2014000), plastics in primary forms (C2016000)
+drop_industries <- c("C2012000", "C2014000", "C2016000")
+
+pattern_drop <- paste0("^(", paste(drop_industries, collapse = "|"), ")_")
+drop_vars <- grepl(pattern_drop, var_names_filtered)
+
+cat("Dropping industries:",
+    paste(drop_industries, collapse = ", "), "\n")
+cat("Variables to drop:", sum(drop_vars), "\n")
+
+if (sum(drop_vars) > 0) {
+  drop_missing <- apply(X_raw[, drop_vars, drop = FALSE], 2,
+                        function(x) mean(is.na(x)) * 100)
+  cat("Avg missing rate (dropped vars):",
+      round(mean(drop_missing), 2), "%\n")
+}
+
+X_raw <- X_raw[, !drop_vars, drop = FALSE]
+var_names_filtered <- var_names_filtered[!drop_vars]
+var_metadata_filtered <- var_metadata_filtered[!drop_vars, ]
+
+cat("Variables after dropping selected industries:",
+    ncol(X_raw), "\n")
+
+cat("Final: 19 industries × 14 questions = 266 variables\n")
+
+## Verify clean data
+remaining_missing <- sum(is.na(X_raw)) / (nrow(X_raw) * ncol(X_raw)) * 100
+cat("Remaining overall missing rate:", round(remaining_missing, 2), "%\n")
+
+```
+
+
+## Data cleaning and standardization
+```{r}
+# drop all-NA columns (safety)
+cols_all_na <- apply(X_raw, 2, function(x) all(is.na(x)))
+if (any(cols_all_na)) {
+  X_raw <- X_raw[, !cols_all_na, drop = FALSE]
+  var_names_filtered <- var_names_filtered[!cols_all_na]
+  var_metadata_filtered <- var_metadata_filtered[!cols_all_na, ]
+}
+
+# linear interpolation (same as Level 1 baseline)
+X_filled <- apply(X_raw, 2, function(x) {
+  if (all(is.na(x))) return(x)
+  zoo::na.approx(x, rule = 2)
+})
+
+# standardize (important for PCA)
+X_std <- scale(X_filled, center = TRUE, scale = TRUE)
+
+# final sanity filter: finite and non-degenerate
+valid <- apply(X_std, 2, function(x) all(is.finite(x)) && sd(x) > 1e-10)
+X_std <- X_std[, valid, drop = FALSE]
+var_names_filtered <- var_names_filtered[valid]
+var_metadata_filtered <- var_metadata_filtered[valid, ]
+
+N <- ncol(X_std)
+T_obs <- nrow(X_std)
+
+cat("\n=== Final Data (Level 3) ===\n")
+cat("N =", N, "variables\n")
+cat("T =", T_obs, "months\n")
+```
+
+
+# Factor number selection (r)
+Holding the factor dimension fixed (r=5) to ensure comparability across levels.
+
+
+# PCA estimation + sign standardization
+```{r PCA}
+r <- 5
+pca_result <- prcomp(X_std, rank. = r)
+
+F_hat <- pca_result$x
+colnames(F_hat) <- paste0("F", 1:r)
+
+Lambda_hat <- pca_result$rotation[, 1:r, drop = FALSE]
+rownames(Lambda_hat) <- var_names_filtered
+
+cat("Factors:", nrow(F_hat), " x ", ncol(F_hat), "\n")
+cat("Loadings:", nrow(Lambda_hat), " x ", ncol(Lambda_hat), "\n")
+
+
+# Align signs with an "expansion" window (same logic as Level 1 baseline)
+expansion_period <- dates >= as.Date("2005-01-01") & dates <= as.Date("2008-12-31")
+
+for (j in 1:r) {
+  mean_expansion <- mean(F_hat[expansion_period, j], na.rm = TRUE)
+  if (mean_expansion < 0) {
+    F_hat[, j] <- -F_hat[, j]
+    Lambda_hat[, j] <- -Lambda_hat[, j]
+  }
+}
+
+```
+
+
+# Top loading tables
+```{r loading}
+for (j in 1:r) {
+  load_j <- Lambda_hat[, j]
+  top_idx <- order(abs(load_j), decreasing = TRUE)[1:10]
+  top_vars <- rownames(Lambda_hat)[top_idx]
+
+  industry_codes <- sapply(top_vars, extract_industry_code)
+  question_codes <- sapply(top_vars, extract_question_code)
+
+  df_top <- tibble(
+    Variable = top_vars,
+    Industry = sapply(industry_codes, get_industry_name_en),
+    Question = sapply(question_codes, get_question_name_en),
+    Group    = sapply(question_codes, get_question_group),
+    Loading  = round(load_j[top_idx], 4)
+  )
+
+  print(
+    kbl(df_top, booktabs = TRUE, caption = paste("Top 10 Loadings for Factor", j, "(Level 3)")) |>
+      kable_styling(latex_options = c("striped", "hold_position"), font_size = 8, full_width = FALSE)
+  )
+  cat("\n\n")
+}
+
+```
+
+
+# Factor time series
+```{r factor ts}
+factor_df <- data.frame(Date = dates, F_hat) %>%
+  pivot_longer(cols = starts_with("F"), names_to = "Factor", values_to = "Value")
+
+events <- tibble(
+  Date = as.Date(c("2008-09-15", "2011-08-01", "2020-03-01")),
+  Event = c("Global Financial Crisis", "Euro Crisis", "COVID-19"),
+  Year = format(Date, "%Y")
+)
+
+ggplot(factor_df, aes(x = Date, y = Value)) +
+  geom_line(size = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(data = events, aes(xintercept = Date), linetype = "dashed", alpha = 0.4) +
+  geom_text(data = events, aes(x = Date, label = Year), y = Inf, vjust = 1.2, size = 2.5, inherit.aes = FALSE) +
+  facet_wrap(~Factor, ncol = 1, scales = "free_y") +
+  labs(title = paste("Extracted Factors (Level", 3, ")"))
+
+```
+
+
+# Diagnostics
+```{r diagnostics}
+X_fitted <- F_hat %*% t(Lambda_hat)
+e_hat <- X_std - X_fitted
+
+R2 <- sapply(1:N, function(i) {
+  1 - sum(e_hat[, i]^2) / sum((X_std[, i] - mean(X_std[, i]))^2)
+})
+
+cat("R² summary:\n")
+print(summary(R2))
+
+ggplot(data.frame(R2 = R2), aes(x = R2)) +
+  geom_histogram(bins = 30, alpha = 0.8) +
+  geom_vline(xintercept = median(R2), linetype = "dashed") +
+  labs(title = "R² Distribution (Level 2)", subtitle = paste("Median R² =", round(median(R2), 3)))
+
+cor_e <- cor(e_hat)
+upper_cor <- cor_e[upper.tri(cor_e)]
+mean_abs_cor <- mean(abs(upper_cor))
+
+cat("Mean |correlation| of errors:", round(mean_abs_cor, 4), "\n")
+
+ggplot(data.frame(Cor = upper_cor), aes(x = Cor)) +
+  geom_histogram(bins = 50, alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(title = "Error Correlations (Level 3)")
+
+```
+
+
+```{r summary}
+cat("\n=== SUMMARY (Level 3) ===\n")
+cat("N =", N, " | T =", T_obs, "\n")
+cat("Chosen r =", r, "\n")
+cat("CumVar (first r) =", round(100 * cum_var[r], 1), "%\n")
+cat("Median R² =", round(median(R2), 3), "\n")
+cat("Mean |error corr| =", round(mean_abs_cor, 4), "\n")
+```
+
+\subsection{Robustness Across Industry Aggregation Levels}
+
+To assess the robustness of the extracted common factors with respect to industry aggregation, we compare the factor structures obtained from Level~1, Level~2, and Level~3 classifications. The number of factors is fixed at $r=5$ across all specifications to ensure strict comparability.
+
+Each variable in the model corresponds to an \emph{industry--question} pair. Hence, factor loadings capture how specific survey indicators (e.g., current assessment, expectations, prices, inventories) within particular industries co-move with the latent factors.
+
+Before discussing individual factors, note that the sign of each factor is arbitrary up to normalization. A positive loading indicates that the respective industry–question variable co-moves positively with the factor, while a negative loading indicates inverse co-movement. Interpretation therefore focuses on the internal sign structure within each factor rather than the absolute orientation.
+
+Two systematic patterns emerge from the cross-level comparison:
+
+\begin{enumerate}
+    \item The time-series dynamics of the five factors remain highly stable across Levels~1–3, with nearly identical turning points around the 2008--2009 financial crisis and the 2020 pandemic shock.
+    \item Increasing disaggregation redistributes loadings across more narrowly defined sub-industries, reducing individual loading magnitudes while leaving cumulative explained variance (approximately $64.6\%$) largely unchanged.
+\end{enumerate}
+
+\subsubsection*{Factor 1}
+
+At Level~1, Factor~1 is dominated by production plans (QES), production changes (QVS), and order book dynamics (BVS, BUS) in \emph{Machinery (C2800000)}, \emph{Electrical Equipment (C2700000)}, \emph{Fabricated Metal Products (C2500000)}, and \emph{Rubber and Plastics Products (C2200000)}. The concentration in these capital- and intermediate-goods industries indicates a broad production–order cycle within core manufacturing.
+
+At Level~2, the factor time series remains almost identical in its cyclical evolution. However, loadings shift toward more detailed industries such as \emph{Manufacture of Plastic Products (C2220000)}, \emph{Special Purpose Machinery (C2820000)}, \emph{Manufacture of Wiring Devices (C2730000)}, \emph{Machinery for Specific Industries (C2890000)}, and \emph{Electric Motors and Transformers (C2710000)}. The dominant indicators remain production plans, employment expectations, and order book assessments, but they are now distributed across more granular activities.
+
+At Level~3, the time-series pattern remains stable, but loadings fragment further across detailed sub-industries such as \emph{C2733000 (Electrical Installation Equipment)} and \emph{C2892000 (Mining and Construction Machinery)}. Current assessments (GUS), employment expectations (BES), and order book indicators dominate. The comparison of the three factor curves shows that the common production cycle persists unchanged, while its cross-sectional representation becomes increasingly heterogeneous.
+
+\subsubsection*{Factor 2}
+
+At Level~1, Factor~2 loads positively on business expectations (GES) and productivity expectations (PRS) in \emph{Chemicals (C2000000)} and other intermediate goods industries, while price expectations (PWS, PVS) in industries such as \emph{Wearing Apparel (C1400000)} and \emph{Motor Vehicles (C2900000)} load negatively. The factor thus captures a systematic contrast between forward-looking business sentiment and price dynamics across industries.
+
+At Level~2, this structure remains clearly visible. Positive loadings appear in business expectations for \emph{Manufacture of Plastic Products (C2220000)} and \emph{Other Non-Metallic Mineral Products (C2390000)}, while price indicators in \emph{Motor Vehicle Parts and Accessories (C2930000)} and \emph{Special Purpose Machinery (C2820000)} load negatively. The expectation–price contrast remains the defining structural feature.
+
+At Level~3, business expectations across detailed industries such as \emph{C2391000 (Abrasive Products)}, \emph{C1721000 (Corrugated Paper and Packaging)}, and \emph{C1813000 (Printing and Media Prepress)} dominate the positive loadings, while price indicators remain inversely related. The three time-series curves exhibit nearly identical dynamics, indicating strong robustness of this expectation–price dimension.
+
+\subsubsection*{Factor 3}
+
+At Level~1, Factor~3 is driven by current situation assessments (GUS) in \emph{Wearing Apparel (C1400000)}, \emph{Food Products (C1000000)}, and \emph{Beverages (C1100000)}, alongside price expectations in \emph{Printing (C1800000)} and \emph{Chemicals (C2000000)}. The factor therefore links demand-related assessments with price-related indicators across industries.
+
+At Level~2, dominant loadings include order book and current assessments in \emph{Cleaning and Personal Care Products (C2040000)}, \emph{Manufacture of Computers (C2620000)}, and \emph{Wearing Apparel (C1410000)}, combined with price indicators in \emph{Medical and Dental Instruments (C3250000)}. The factor continues to represent joint movement in demand-related and pricing indicators, now at a more detailed industrial resolution.
+
+At Level~3, export order assessments (e.g., \emph{C3101000 Office Furniture}, \emph{C1414000 Underwear}), current assessments, and negatively associated productivity expectations shape the factor. The time-series comparison across levels shows that, despite shifts in detailed industry composition, the cyclical timing remains nearly unchanged.
+
+\subsubsection*{Factor 4}
+
+At Level~1, Factor~4 links export expectations (XES), order books, and current assessments in \emph{Basic Metals (C2400000)} with inventory indicators in \emph{Wood Products (C1600000)}. The structure indicates co-movement between export-oriented industries and inventory adjustments.
+
+At Level~2, foundries (C2450000), wearing apparel (C1410000), and machine tools (C2840000) dominate the loadings, combining export expectations, order book indicators, and inventories. The factor curves across Levels~1–3 remain synchronized, particularly during global downturns.
+
+At Level~3, detailed inventory indicators (LUS) and export expectations (XES) across multiple sub-industries define the factor. Disaggregation primarily increases cross-sectional dispersion without altering the common time-series dynamics.
+
+\subsubsection*{Factor 5}
+
+At Level~1, Factor~5 loads heavily on \emph{Other Manufacturing (C3200000)}, \emph{Other Transport Equipment (C3000000)}, and \emph{Paper Products (C1700000)}, indicating sector-specific fluctuations outside the main production cycle.
+
+At Level~2, finished goods inventories in \emph{Fruit and Vegetable Processing (C1030000)}, price expectations in \emph{Concrete and Cement Products (C2360000, C2350000)}, and export assessments in \emph{Metal Tanks (C2520000)} dominate. The factor reflects heterogeneous, industry-specific adjustments rather than a single dominant sector.
+
+At Level~3, export orders, employment expectations, and inventories across highly specific industries such as \emph{C2361000 (Concrete Products)}, \emph{C2529000 (Metal Containers)}, and \emph{C2899000 (Specialised Machinery)} shape the factor. The time-series comparison again shows strong stability in cyclical timing, despite increasing cross-sectional fragmentation.
+
+\subsubsection*{Diagnostics and Overall Assessment}
+
+The median $R^2$ declines from $0.71$ at Level~1 to $0.54$ at Level~2 and $0.53$ at Level~3, while the mean $R^2$ decreases from $0.65$ to $0.53$ and $0.51$, respectively. This reflects the increasing within-industry heterogeneity introduced by finer disaggregation.
+
+Importantly, cumulative explained variance remains stable at approximately $64.6\%$ across levels, and mean absolute residual correlations remain below $0.10$. Hence, the dominant cross-sectional co-movement is consistently captured by the same five-dimensional factor space.
+
+Overall, industry disaggregation redistributes the representation of common shocks across more detailed activities but does not alter the dimensionality, timing, or macroeconomic interpretation of the underlying factors.
+

@@ -1,0 +1,707 @@
+---
+title: "0302_supplement_YVFL"
+author: "Yiming Zhao"
+date: "2026-02-22"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 6)
+```
+Industry $\times$ Question Block Time-Varying Factor Loadings
+
+# Extension 1: Level 2
+```{r}
+dfm02 <- readRDS("output/dfm_results_02_level2.rds")
+
+Y_kfas <- dfm02$Y_kfas
+F_smooth <- dfm02$F_smooth
+Hdiag <- dfm02$Hdiag
+r <- dfm02$r
+dates <- dfm02$dates
+var_names_filtered <- dfm02$var_names_filtered
+var_metadata_filtered <- dfm02$var_metadata_filtered
+source("ifo_data_processing.R")
+
+library(KFAS)
+library(tidyverse)
+library(dplyr)
+
+X_kfas <- Y_kfas
+F_use <- as.matrix(F_smooth) # T x r
+T_obs <- nrow(F_use)
+N_obs <- ncol(X_kfas)
+stopifnot(ncol(F_use) == r, nrow(X_kfas) == T_obs, length(Hdiag) == N_obs)
+```
+
+
+```{r }
+extract_qcode <- function(vn) {
+  m <- str_match(vn, "_([A-Za-z]{2,4})$")[,2]
+  toupper(m)
+}
+q_code <- extract_qcode(var_names_filtered)
+
+block_map <- function(q) {
+  if (is.na(q)) return(NA_character_)
+  if (q %in% c("GUS","BUS","XUS","LUS")) return("A") # Current
+  if (q %in% c("GES","QES","XES","BES","PRS")) return("B") # Expectations
+  if (q %in% c("PWS","PVS")) return("C") # Prices
+  if (q %in% c("AVS", "BVS","QVS")) return("D") # MoM changes
+  return(NA_character_)
+}
+q_block <- vapply(q_code, block_map, character(1))
+
+table(q_block, useNA = "ifany")
+```
+```{r}
+industry_id <- as.character(var_metadata_filtered$industry_code)
+
+cell_id <- ifelse(is.na(q_block),
+                  paste0(industry_id, "_", "UNK"),
+                  paste0(industry_id, "_", q_block))
+
+cells <- sort(unique(cell_id))
+K <- length(cells)
+cat("Number of (industry × block) cells:", K, "\n")
+
+cell_sizes <- as.integer(table(cell_id)[cells])
+cell_table <- data.frame(cell = cells, n_cell = cell_sizes) |>
+  arrange(desc(n_cell))
+```
+
+```{r}
+fit_tvp_cell <- function(X_cell, Fmat, H_vec, q_init = 1e-4) {
+  
+  T_obs <- nrow(Fmat)
+  r <- ncol(Fmat)
+  n_cell <- ncol(X_cell)
+
+  # Z_{t} = 1_{n_cell} x F_t'
+  Z_arr <- array(NA_real_, dim = c(n_cell, r, T_obs))
+  for (t in 1:T_obs) {
+    Z_arr[,,t] <- matrix(rep(Fmat[t, ], each = n_cell), nrow = n_cell, byrow = FALSE)
+  }
+  
+  model0 <- SSModel(
+    X_cell ~ -1 + 
+      SSMcustom(
+        Z = Z_arr,
+        T = diag(r),
+        R = diag(r),
+        Q = diag(NA_real_, r), # updated to q*I_r in updatefn
+        a1 = rep(0, r),
+        P1 = diag(10, r)
+      ),
+    H = diag(H_vec, n_cell)    # fixed diagonal obs noise per series
+  )
+  
+  updatefn <- function(pars, model) {
+    q <- exp(pars[1])
+    model$Q[,,1] <- diag(q, r)
+    model
+  }
+  
+  # Solving for maximum likelihood estimation q
+  fit <- fitSSM(
+    model0,
+    inits = log(q_init),
+    updatefn = updatefn,
+    method = "BFGS"
+  )
+  model <- fit$model
+  q_hat <- exp(fit$optim.out$par[1])
+  
+  kfs <- KFS(model, smoothing = c("state"))
+  lambda_t <- kfs$alphahat # T x r
+  
+  colnames(lambda_t) <- paste0("lambda_", 1:r)
+  list(lambda_t = lambda_t, q_hat = q_hat)
+}
+```
+
+```{r, include=FALSE}
+# Estimate time-varying loadings for all (industry × block) cells
+Lambda_cell_tv <- vector("list", K)
+q_hat_cell <- rep(NA_real_, K)
+names(Lambda_cell_tv) <- cells
+names(q_hat_cell) <- cells
+
+for (kk in seq_along(cells)) {
+  c_id <- cells[kk]
+  idx  <- which(cell_id == c_id)
+  
+  X_cell <- as.matrix(X_kfas[, idx, drop = FALSE]) # T x n_cell
+  H_vec  <- Hdiag[idx]
+  
+  res <- fit_tvp_cell(X_cell = X_cell, Fmat = F_use, H_vec = H_vec, q_init = 1e-4)
+  
+  Lambda_cell_tv[[c_id]] <- res$lambda_t
+  q_hat_cell[c_id]       <- res$q_hat
+  
+  if (kk %% 20 == 0) cat("Done cell", kk, "/", K, "\n")
+}
+
+summary(q_hat_cell)
+
+# Expand cell-level paths to variable-level time-varying loadings:
+# each variable i inherits its cell's loading path lambda_{industry(i),block(i),t}
+Lambda_tv_list <- vector("list", N_obs)
+names(Lambda_tv_list) <- var_names_filtered
+
+for (i in 1:N_obs) {
+  c_id <- cell_id[i]
+  Lambda_tv_list[[i]] <- Lambda_cell_tv[[c_id]] # T x r
+}
+
+parse_cell <- function(cell) {
+  parts <- str_split(cell, "_", simplify = TRUE)
+  data.frame(
+    industry_code = parts[1], 
+    block = parts[2], 
+    cell = cell, 
+    stringsAsFactors = FALSE
+  )
+}
+
+# Create a metadata table for all unique cells
+cell_meta <- bind_rows(lapply(cells, parse_cell)) |>
+  mutate(n_cell = as.integer(table(cell_id)[cell]))
+
+head(cell_meta, 10)
+```
+
+```{r, include=FALSE}
+# Calculate instability metrics for every cell
+instability_by_cell <- lapply(cells, function(cell) {
+  L  <- Lambda_cell_tv[[cell]] # T x r matrix
+  dL <- apply(L, 2, diff)      # Calculate first differences (T-1 x r)
+  
+  meta <- parse_cell(cell)
+  
+  data.frame(
+    industry_code    = meta$industry_code,
+    block            = meta$block,
+    cell             = cell,
+    n_cell           = sum(cell_id == cell),
+    q_hat            = q_hat_cell[cell],
+    mean_abs_dlambda = mean(abs(dL), na.rm = TRUE),
+    sd_dlambda       = sd(as.numeric(dL), na.rm = TRUE)
+  )
+}) |> 
+  bind_rows() |> 
+  arrange(desc(mean_abs_dlambda))
+
+# Show the top 20 most unstable cells
+head(instability_by_cell, 20)
+```
+
+The instability ranking reveals a striking concentration of high-volatility cells in block D (Month-on-Month changes). This indicates that temporal variation in factor loadings is predominantly driven by short-term change indicators rather than by current assessments, expectations, or price components.
+
+
+```{r}
+qtype_labels <- c(
+  A = "Current assessments (GUS/LUS/BUS/XUS)",
+  B = "Expectations (GES/QES/XES/BES/PRS)",
+  C = "Prices (PVS/PWS)",
+  D = "MoM changes (AVS/BVS/QVS)"
+)
+
+instability_by_block <- instability_by_cell |>
+  dplyr::group_by(block) |>
+  dplyr::summarise(
+    n_cells = dplyr::n(),
+    total_series = sum(n_cell),
+    median_q = median(q_hat, na.rm = TRUE),
+    median_mean_abs_dlambda = median(mean_abs_dlambda, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+# Group instability metrics by business block (A, B, C, D)
+instability_by_qtype <- instability_by_block |>
+  mutate(
+    question_type = qtype_labels[block]
+  ) |>
+  dplyr::select(
+    question_type,
+    n_cells,
+    total_series,
+    median_q,
+    median_mean_abs_dlambda
+  ) |>
+  rename(
+    `Question type`              = question_type,
+    `# Cells (industry × type)`  = n_cells,
+    `# Series`                   = total_series,
+    `Median q (RW variance)`     = median_q,
+    `Median |Δλ|`                = median_mean_abs_dlambda
+  )
+
+print(instability_by_qtype)
+```
+The stability of factor loadings differs across question types: current assessments are the most stable, expectations and price-related questions exhibit moderate time variation, while month-on-month indicators display the highest degree of instability.
+
+```{r }
+plot_factor_block_all_industries <- function(
+  Lambda_cell_tv, dates,
+  factor_j = 1, block = "B",
+  event_years = c(2008, 2011, 2020),
+  top_k = 20,
+  rank_by = c("instability", "mean_abs"),
+  show_legend = FALSE
+) {
+  rank_by <- match.arg(rank_by)
+
+  # parse cell id robustly: "C1010000_D" or "C1010000__D"
+  parse_cell <- function(cell) {
+    parts <- strsplit(cell, "__", fixed = TRUE)[[1]]
+    if (length(parts) == 1) parts <- strsplit(cell, "_", fixed = TRUE)[[1]]
+    list(industry = parts[1], blk = parts[2])
+  }
+
+  cells <- names(Lambda_cell_tv)
+
+  meta <- tibble(cell = cells) |>
+    mutate(tmp = lapply(cell, parse_cell),
+           industry = purrr::map_chr(tmp, "industry"),
+           blk      = purrr::map_chr(tmp, "blk")) |>
+    dplyr::select(-tmp) |>
+    dplyr::filter(blk == block)
+
+  stopifnot(nrow(meta) > 0)
+
+  # long df: one line per industry in this block
+  df <- purrr::map_dfr(meta$cell, function(c_id) {
+    L <- Lambda_cell_tv[[c_id]]
+    tibble(
+      date = dates,
+      industry = meta$industry[meta$cell == c_id][1],
+      loading = as.numeric(L[, factor_j])
+    )
+  }) |>
+    dplyr::arrange(industry, date)
+
+  # rank industries within this (factor, block)
+  score <- df |>
+    dplyr::group_by(industry) |>
+    dplyr::summarise(
+      mean_abs    = mean(abs(loading), na.rm = TRUE),
+      instability = mean(abs(diff(loading)), na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  top_inds <- score |>
+    dplyr::arrange(dplyr::desc(.data[[rank_by]])) |>
+    dplyr::slice_head(n = top_k) |>
+    dplyr::pull(industry)
+
+  # keep only top-k industries
+  df <- df |>
+    dplyr::filter(industry %in% top_inds)
+
+  # events
+  event_dates <- as.Date(paste0(event_years, "-01-01"))
+  keep_evt <- event_dates >= min(dates) & event_dates <= max(dates)
+  event_dates <- event_dates[keep_evt]
+  event_labels <- as.character(event_years[keep_evt])
+
+  p <- ggplot(df, aes(x = date, y = loading, group = industry, color = industry)) +
+    geom_line(linewidth = 0.9, alpha = 0.9) +
+    scale_color_viridis_d(option = "turbo") +
+    geom_hline(yintercept = 0, linetype = 3, color = "gray60") +
+    labs(
+      title = paste0("TV Loadings across industries: Factor ", factor_j, ", Block = ", block),
+      subtitle = paste0("Showing top-", top_k, " industries by ", rank_by),
+      x = NULL,
+      y = paste0("Loading (lambda_", factor_j, ")"),
+      color = "Industry"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = if (show_legend) "bottom" else "none") +
+    guides(color = guide_legend(ncol = 3))
+
+  if (length(event_dates) > 0) {
+    p <- p +
+      geom_vline(xintercept = event_dates, linetype = 2, color = "red3", linewidth = 0.8) +
+      annotate("text", x = event_dates, y = Inf, label = event_labels,
+               vjust = 1.2, hjust = 0, color = "red3", size = 3) +
+      coord_cartesian(clip = "off")
+  }
+
+  p
+}
+```
+
+
+
+```{r fig.width=13, fig.height=6}
+for (j in 1:5) {
+
+  print(plot_factor_block_all_industries(
+    Lambda_cell_tv, dates,
+    factor_j = j, block = "D",
+    top_k = 20, rank_by = "instability",
+    show_legend = TRUE
+  ))
+
+  print(plot_factor_block_all_industries(
+    Lambda_cell_tv, dates,
+    factor_j = j, block = "B",
+    top_k = 20, rank_by = "instability",
+    show_legend = TRUE
+  ))
+}
+```
+
+At the Level-2 aggregation, time variation in factor loadings is predominantly driven by short-term change indicators (Block D), while expectations (Block B) exhibit smoother and more structural dynamics. Crisis periods (2008, 2020) coincide with pronounced dispersion and structural shifts in industry-specific factor exposures, indicating that macro shocks alter not only factor realizations but also the cross-industry loading structure.
+
+
+# Extension 2: Level 3
+
+```{r}
+dfm02 <- readRDS("output/dfm_results_02_level3.rds")
+
+Y_kfas <- dfm02$Y_kfas
+F_smooth <- dfm02$F_smooth
+Hdiag <- dfm02$Hdiag
+r <- dfm02$r
+dates <- dfm02$dates
+var_names_filtered <- dfm02$var_names_filtered
+var_metadata_filtered <- dfm02$var_metadata_filtered
+source("ifo_data_processing.R")
+
+library(KFAS)
+library(tidyverse)
+library(dplyr)
+
+X_kfas <- Y_kfas
+F_use <- as.matrix(F_smooth) # T x r
+T_obs <- nrow(F_use)
+N_obs <- ncol(X_kfas)
+stopifnot(ncol(F_use) == r, nrow(X_kfas) == T_obs, length(Hdiag) == N_obs)
+```
+
+
+```{r }
+extract_qcode <- function(vn) {
+  m <- str_match(vn, "_([A-Za-z]{2,4})$")[,2]
+  toupper(m)
+}
+q_code <- extract_qcode(var_names_filtered)
+
+block_map <- function(q) {
+  if (is.na(q)) return(NA_character_)
+  if (q %in% c("GUS","BUS","XUS","LUS")) return("A") # Current
+  if (q %in% c("GES","QES","XES","BES","PRS")) return("B") # Expectations
+  if (q %in% c("PWS","PVS")) return("C") # Prices
+  if (q %in% c("AVS", "BVS","QVS")) return("D") # MoM changes
+  return(NA_character_)
+}
+q_block <- vapply(q_code, block_map, character(1))
+
+table(q_block, useNA = "ifany")
+```
+```{r}
+industry_id <- as.character(var_metadata_filtered$industry_code)
+
+cell_id <- ifelse(is.na(q_block),
+                  paste0(industry_id, "_", "UNK"),
+                  paste0(industry_id, "_", q_block))
+
+cells <- sort(unique(cell_id))
+K <- length(cells)
+cat("Number of (industry × block) cells:", K, "\n")
+
+cell_sizes <- as.integer(table(cell_id)[cells])
+cell_table <- data.frame(cell = cells, n_cell = cell_sizes) |>
+  arrange(desc(n_cell))
+```
+
+```{r}
+fit_tvp_cell <- function(X_cell, Fmat, H_vec, q_init = 1e-4) {
+  
+  T_obs <- nrow(Fmat)
+  r <- ncol(Fmat)
+  n_cell <- ncol(X_cell)
+
+  # Z_{t} = 1_{n_cell} x F_t'
+  Z_arr <- array(NA_real_, dim = c(n_cell, r, T_obs))
+  for (t in 1:T_obs) {
+    Z_arr[,,t] <- matrix(rep(Fmat[t, ], each = n_cell), nrow = n_cell, byrow = FALSE)
+  }
+  
+  model0 <- SSModel(
+    X_cell ~ -1 + 
+      SSMcustom(
+        Z = Z_arr,
+        T = diag(r),
+        R = diag(r),
+        Q = diag(NA_real_, r), # updated to q*I_r in updatefn
+        a1 = rep(0, r),
+        P1 = diag(10, r)
+      ),
+    H = diag(H_vec, n_cell)    # fixed diagonal obs noise per series
+  )
+  
+  updatefn <- function(pars, model) {
+    q <- exp(pars[1])
+    model$Q[,,1] <- diag(q, r)
+    model
+  }
+  
+  # Solving for maximum likelihood estimation q
+  fit <- fitSSM(
+    model0,
+    inits = log(q_init),
+    updatefn = updatefn,
+    method = "BFGS"
+  )
+  model <- fit$model
+  q_hat <- exp(fit$optim.out$par[1])
+  
+  kfs <- KFS(model, smoothing = c("state"))
+  lambda_t <- kfs$alphahat # T x r
+  
+  colnames(lambda_t) <- paste0("lambda_", 1:r)
+  list(lambda_t = lambda_t, q_hat = q_hat)
+}
+```
+
+```{r, include=FALSE}
+# Estimate time-varying loadings for all (industry × block) cells
+Lambda_cell_tv <- vector("list", K)
+q_hat_cell <- rep(NA_real_, K)
+names(Lambda_cell_tv) <- cells
+names(q_hat_cell) <- cells
+
+for (kk in seq_along(cells)) {
+  c_id <- cells[kk]
+  idx  <- which(cell_id == c_id)
+  
+  X_cell <- as.matrix(X_kfas[, idx, drop = FALSE]) # T x n_cell
+  H_vec  <- Hdiag[idx]
+  
+  res <- fit_tvp_cell(X_cell = X_cell, Fmat = F_use, H_vec = H_vec, q_init = 1e-4)
+  
+  Lambda_cell_tv[[c_id]] <- res$lambda_t
+  q_hat_cell[c_id]       <- res$q_hat
+  
+  if (kk %% 20 == 0) cat("Done cell", kk, "/", K, "\n")
+}
+
+summary(q_hat_cell)
+
+# Expand cell-level paths to variable-level time-varying loadings:
+# each variable i inherits its cell's loading path lambda_{industry(i),block(i),t}
+Lambda_tv_list <- vector("list", N_obs)
+names(Lambda_tv_list) <- var_names_filtered
+
+for (i in 1:N_obs) {
+  c_id <- cell_id[i]
+  Lambda_tv_list[[i]] <- Lambda_cell_tv[[c_id]] # T x r
+}
+
+parse_cell <- function(cell) {
+  parts <- str_split(cell, "_", simplify = TRUE)
+  data.frame(
+    industry_code = parts[1], 
+    block = parts[2], 
+    cell = cell, 
+    stringsAsFactors = FALSE
+  )
+}
+
+# Create a metadata table for all unique cells
+cell_meta <- bind_rows(lapply(cells, parse_cell)) |>
+  mutate(n_cell = as.integer(table(cell_id)[cell]))
+
+head(cell_meta, 10)
+```
+
+
+```{r, include=FALSE}
+# Calculate instability metrics for every cell
+instability_by_cell <- lapply(cells, function(cell) {
+  L  <- Lambda_cell_tv[[cell]] # T x r matrix
+  dL <- apply(L, 2, diff)      # Calculate first differences (T-1 x r)
+  
+  meta <- parse_cell(cell)
+  
+  data.frame(
+    industry_code    = meta$industry_code,
+    block            = meta$block,
+    cell             = cell,
+    n_cell           = sum(cell_id == cell),
+    q_hat            = q_hat_cell[cell],
+    mean_abs_dlambda = mean(abs(dL), na.rm = TRUE),
+    sd_dlambda       = sd(as.numeric(dL), na.rm = TRUE)
+  )
+}) |> 
+  bind_rows() |> 
+  arrange(desc(mean_abs_dlambda))
+
+# Show the top 20 most unstable cells
+head(instability_by_cell, 20)
+```
+
+The instability ranking reveals a striking concentration of high-volatility cells in block D (Month-on-Month changes). This indicates that temporal variation in factor loadings is predominantly driven by short-term change indicators rather than by current assessments, expectations, or price components.
+
+
+```{r}
+qtype_labels <- c(
+  A = "Current assessments (GUS/LUS/BUS/XUS)",
+  B = "Expectations (GES/QES/XES/BES/PRS)",
+  C = "Prices (PVS/PWS)",
+  D = "MoM changes (AVS/BVS/QVS)"
+)
+
+instability_by_block <- instability_by_cell |>
+  dplyr::group_by(block) |>
+  dplyr::summarise(
+    n_cells = dplyr::n(),
+    total_series = sum(n_cell),
+    median_q = median(q_hat, na.rm = TRUE),
+    median_mean_abs_dlambda = median(mean_abs_dlambda, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+# Group instability metrics by business block (A, B, C, D)
+instability_by_qtype <- instability_by_block |>
+  mutate(
+    question_type = qtype_labels[block]
+  ) |>
+  dplyr::select(
+    question_type,
+    n_cells,
+    total_series,
+    median_q,
+    median_mean_abs_dlambda
+  ) |>
+  rename(
+    `Question type`              = question_type,
+    `# Cells (industry × type)`  = n_cells,
+    `# Series`                   = total_series,
+    `Median q (RW variance)`     = median_q,
+    `Median |Δλ|`                = median_mean_abs_dlambda
+  )
+
+print(instability_by_qtype)
+```
+
+The stability of factor loadings differs across question types: current assessments are the most stable, expectations and price-related questions exhibit moderate time variation, while month-on-month indicators display the highest degree of instability.
+
+```{r }
+plot_factor_block_all_industries <- function(
+  Lambda_cell_tv, dates,
+  factor_j = 1, block = "B",
+  event_years = c(2008, 2011, 2020),
+  top_k = 20,
+  rank_by = c("instability", "mean_abs"),
+  show_legend = FALSE
+) {
+  rank_by <- match.arg(rank_by)
+
+  # parse cell id robustly: "C1010000_D" or "C1010000__D"
+  parse_cell <- function(cell) {
+    parts <- strsplit(cell, "__", fixed = TRUE)[[1]]
+    if (length(parts) == 1) parts <- strsplit(cell, "_", fixed = TRUE)[[1]]
+    list(industry = parts[1], blk = parts[2])
+  }
+
+  cells <- names(Lambda_cell_tv)
+
+  meta <- tibble(cell = cells) |>
+    mutate(tmp = lapply(cell, parse_cell),
+           industry = purrr::map_chr(tmp, "industry"),
+           blk      = purrr::map_chr(tmp, "blk")) |>
+    dplyr::select(-tmp) |>
+    dplyr::filter(blk == block)
+
+  stopifnot(nrow(meta) > 0)
+
+  # long df: one line per industry in this block
+  df <- purrr::map_dfr(meta$cell, function(c_id) {
+    L <- Lambda_cell_tv[[c_id]]
+    tibble(
+      date = dates,
+      industry = meta$industry[meta$cell == c_id][1],
+      loading = as.numeric(L[, factor_j])
+    )
+  }) |>
+    dplyr::arrange(industry, date)
+
+  # rank industries within this (factor, block)
+  score <- df |>
+    dplyr::group_by(industry) |>
+    dplyr::summarise(
+      mean_abs    = mean(abs(loading), na.rm = TRUE),
+      instability = mean(abs(diff(loading)), na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  top_inds <- score |>
+    dplyr::arrange(dplyr::desc(.data[[rank_by]])) |>
+    dplyr::slice_head(n = top_k) |>
+    dplyr::pull(industry)
+
+  # keep only top-k industries
+  df <- df |>
+    dplyr::filter(industry %in% top_inds)
+
+  # events
+  event_dates <- as.Date(paste0(event_years, "-01-01"))
+  keep_evt <- event_dates >= min(dates) & event_dates <= max(dates)
+  event_dates <- event_dates[keep_evt]
+  event_labels <- as.character(event_years[keep_evt])
+
+  p <- ggplot(df, aes(x = date, y = loading, group = industry, color = industry)) +
+    geom_line(linewidth = 0.9, alpha = 0.9) +
+    scale_color_viridis_d(option = "turbo") +
+    geom_hline(yintercept = 0, linetype = 3, color = "gray60") +
+    labs(
+      title = paste0("TV Loadings across industries: Factor ", factor_j, ", Block = ", block),
+      subtitle = paste0("Showing top-", top_k, " industries by ", rank_by),
+      x = NULL,
+      y = paste0("Loading (lambda_", factor_j, ")"),
+      color = "Industry"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = if (show_legend) "bottom" else "none") +
+    guides(color = guide_legend(ncol = 3))
+
+  if (length(event_dates) > 0) {
+    p <- p +
+      geom_vline(xintercept = event_dates, linetype = 2, color = "red3", linewidth = 0.8) +
+      annotate("text", x = event_dates, y = Inf, label = event_labels,
+               vjust = 1.2, hjust = 0, color = "red3", size = 3) +
+      coord_cartesian(clip = "off")
+  }
+
+  p
+}
+```
+
+
+```{r fig.width=13, fig.height=6}
+for (j in 1:5) {
+
+  print(plot_factor_block_all_industries(
+    Lambda_cell_tv, dates,
+    factor_j = j, block = "D",
+    top_k = 20, rank_by = "instability",
+    show_legend = TRUE
+  ))
+
+  print(plot_factor_block_all_industries(
+    Lambda_cell_tv, dates,
+    factor_j = j, block = "B",
+    top_k = 20, rank_by = "instability",
+    show_legend = TRUE
+  ))
+}
+```
+
+At the Level-3 disaggregation, cross-sectional heterogeneity in time-varying loadings becomes substantially more pronounced. While the overall block- and factor-level patterns remain consistent with Level 2, the finer industry classification reveals strong and persistent sectoral divergence, particularly in high-frequency (Block D) indicators. Crisis episodes, especially 2020, coincide with structural reallocation rather than temporary dispersion, suggesting that macro shocks alter the industry-specific exposure to latent drivers in a lasting manner.

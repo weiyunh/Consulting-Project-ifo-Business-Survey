@@ -1,0 +1,767 @@
+---
+title: "Network"
+author: "Yiming Zhao"
+date: "2026-01-07"
+output:
+  pdf_document:
+    latex_engine: xelatex
+---
+\LARGE \textbf{Network Analysis Framework: Structural vs. Causal Networks}
+
+```{r setup, include=FALSE, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(igraph)
+library(ggraph)
+library(vars)
+library(car)
+
+# Make sure we have the helper functions and results used throughout your project
+source("ifo_data_processing.R")
+
+dfm <- readRDS("dfm_static_objects.rds")
+
+X_std <- dfm$X_std
+F_hat <- dfm$F_hat
+Lambda_hat <- dfm$Lambda_hat
+var_names_filtered <- dfm$var_names_filtered
+
+```
+
+\Large \textbf{1. Structural Networks: Loadings and Residual Dependence}
+
+\normalsize
+\textbf{Goal:} We construct two economically distinct similarity measures and build two complementary networks to uncover “structure” in the ifo manufacturing survey panel:
+\begin{itemize}
+  \item Loading-distance network captures similarity in structural exposure to the latent business-cycle factors.
+  \item Residual-correlation network captures remaining dependence after removing common factors, i.e., potential sectoral linkages not explained by macro components.
+\end{itemize}
+
+For each measure, we obtain a parsimonious representation of the underlying structure using the same network construction device Minimum Spanning Tree (MST): N-1 edges connecting all nodes with minimal total distance and no arbitrary correlation threshold needed.
+
+Notion: it does *not* imply any causality or lead–lag.
+
+
+
+\textbf{Methodological remark}
+
+The MST should not be interpreted as a complete representation of all relevant relationships. Because it imposes a tree structure, some potentially meaningful redundant or local connections are necessarily omitted, while each node is forced to be connected somewhere in the graph. Accordingly, individual edges should be interpreted cautiously: they reflect the selected backbone under the MST criterion, rather than uniquely identifying economically meaningful pairwise relationships.
+
+Alternative sparsification strategies, such as \(k\)-nearest-neighbor graphs or thresholded networks, may preserve richer local connectivity, but they require additional tuning choices and may produce less transparent structures in high dimensions. We therefore use the MST mainly as a descriptive summary device, and interpret the resulting bridge positions and edge patterns as suggestive rather than definitive.
+
+The MST is therefore adopted as a parsimonious backbone representation, with robustness
+assessed via perturbation-based stability checks:
+
+The minimum spanning tree (MST) provides a threshold-free and fully connected backbone of the similarity structure, which makes the network interpretable in high dimensions.
+However, MST topology can be sensitive to small perturbations in edge weights.
+In particular, bridge nodes identified by high betweenness centrality may change when distances are slightly perturbed.
+Accordingly, conclusions based on individual MST edges or bridge rankings are interpreted as suggestive rather than definitive.
+
+To assess the robustness of the identified backbone and bridge nodes, we complement the MST analysis with a stability check based on repeated MST reconstruction under small perturbations of the input distance matrix.
+For very small perturbations ($\texttt{jitter\_sd}=10^{-4}$), both the MST edge set and the top-10 betweenness ranking remain unchanged across all repetitions.
+When the perturbation magnitude is increased to $\texttt{jitter\_sd}=10^{-3}$, the MST backbone itself remains fully stable, while a small number of nodes close to the top-10 threshold occasionally drop out of the bridge set.
+In particular, the minimum retention frequency among baseline top-10 bridges remains close to 0.9, whereas the highest-ranked bridges are retained in all repetitions.
+
+Taken together, these results indicate that the most central bridge nodes are structurally robust, while a subset of marginal bridges exhibits limited sensitivity to moderate perturbations in network weights.
+Bridge status should therefore be interpreted as a graded property rather than a binary classification.
+\bigskip
+
+
+\large \textbf{1.1 Loading Similarity Network: structural similarity from factor} 
+
+\normalsize
+We already extracted common factors using a Dynamic Factor Model (DFM).
+Each variable \(i\)  (industry × question) is represented by a 5-dimensional factor loading vector \(\lambda_i\), which summarizes how strongly it reacts to each latent factor.
+Two series are considered “structurally close” if their loading vectors are close in factor space.
+
+\begin{itemize}
+ \item Nodes: industry–question combinations
+ \item Edges: distance between factor loading vectors,i.e. cosine distance)
+ \item Graph construction: minimum spanning tree (MST)
+ \item Centrality measures: identify indicators that are structurally important or act as bridges between factor-driven groups
+\end{itemize}
+
+\textbf{Distance metric in loading space}
+
+Let $\lambda_i \in \mathbb{R}^r$ denote the loading vector of indicator $i$ on the $r$ latent factors.
+We measure similarity between indicators by the cosine distance
+\[
+d^{\cos}_{ij} = 1 - \frac{\lambda_i^\top \lambda_j}{\|\lambda_i\|\,\|\lambda_j\|}.
+\]
+Cosine distance is scale-invariant and focuses on the composition of factor exposures (direction in loading space) rather than their overall magnitude.
+This is desirable because loading magnitudes can vary due to factor scaling and heterogeneous measurement noise, while the relative pattern across factors is more directly interpretable as a structural exposure profile.
+
+To assess the sensitivity of the MST backbone to the choice of distance metric, we compare the loading-based MST constructed using cosine distance with an alternative MST based on Euclidean distance,
+\[
+d^{\mathrm{Euc}}_{ij} = \|\lambda_i - \lambda_j\|_2,
+\]
+which additionally penalizes differences in exposure intensity:
+Approximately 74\% of edges in the cosine-based MST are also present in the Euclidean-distance MST.
+This substantial overlap indicates that the global backbone structure of the network is largely robust to the choice of distance metric, while allowing for meaningful local differences in connectivity.
+These local discrepancies primarily affect secondary links and marginal bridge positions, rather than the core structure of the network.
+
+\textbf{Interpretation caveat}
+
+The network is constructed based on pairwise similarity measures between indicators. As a result, it captures proximity in the factor-loading space, rather than direct economic relationships.
+
+In particular, the presence of an edge between two nodes does not necessarily imply a direct structural linkage. The observed similarity may arise from common exposure to latent factors or indirect relationships mediated through other indicators. Moreover, higher-order dependencies across multiple nodes are not explicitly taken into account.
+
+Accordingly, the network should be interpreted as a descriptive representation of similarity patterns, rather than a fully specified structural model of economic interactions.
+
+
+
+```{r 1.1 mst_loading, fig.width=12, fig.height=7, message=FALSE, warning=FALSE}
+
+# 1) Prepare loadings
+loadings <- as.matrix(Lambda_hat)
+rownames(loadings) <- var_names_filtered
+
+# Node metadata
+node_tbl <- tibble(variable = var_names_filtered) %>%
+  mutate(
+    industry_code  = sapply(variable, extract_industry_code),
+    question       = sapply(variable, extract_question_code),
+    industry_name  = sapply(industry_code, get_industry_name_en),
+    question_name  = sapply(question, get_question_name_en),
+    question_group = sapply(question, get_question_group)
+  )
+
+# 2) Cosine distance in loading space
+cosine_dist_mat <- function(M) {
+  M_norm <- M / sqrt(rowSums(M^2))
+  S <- M_norm %*% t(M_norm)     # cosine similarity
+  D <- 1 - S                    # cosine distance
+  diag(D) <- 0
+  D
+}
+D_load <- cosine_dist_mat(loadings)
+
+rownames(D_load) <- rownames(loadings); colnames(D_load) <- rownames(loadings)
+g_full <- graph_from_adjacency_matrix(D_load, mode = "undirected", weighted = TRUE, diag = FALSE)
+g_mst_load <- mst(g_full, weights = E(g_full)$weight)
+
+# MST stability check via distance perturbation (jitter)
+## Input: D_load, a symmetric distance matrix with diag=0
+mst_stability_jitter <- function(D, B = 200, jitter_sd = 1e-3, seed = 1) {
+  set.seed(seed)
+  stopifnot(is.matrix(D), nrow(D) == ncol(D))
+  n <- nrow(D)
+  vars <- rownames(D)
+  if (is.null(vars)) vars <- as.character(seq_len(n))
+
+  ## helper: extract undirected edge list in canonical "a___b" form
+  get_edge_keys <- function(g) {
+    ed <- as.data.frame(ends(g, E(g)))
+    apply(ed, 1, function(x) paste(sort(x), collapse = "___"))
+  }
+
+  ## baseline MST
+  g0_full <- graph_from_adjacency_matrix(D, mode = "undirected", weighted = TRUE, diag = FALSE)
+  g0_mst  <- mst(g0_full, weights = E(g0_full)$weight)
+  base_edges <- get_edge_keys(g0_mst)
+
+  ## storage
+  edge_freq <- setNames(rep(0L, length(base_edges)), base_edges)
+  bridge_hits <- setNames(rep(0L, n), vars)
+
+  ## baseline betweenness ranking
+  b0 <- betweenness(g0_mst, normalized = TRUE)
+  names(b0) <- V(g0_mst)$name
+  top0 <- names(sort(b0, decreasing = TRUE))[1:10]
+
+  ## repetitions
+  for (b in 1:B) {
+    # symmetric jitter, keep diag=0, keep nonnegative
+    Eps <- matrix(rnorm(n * n, mean = 0, sd = jitter_sd), n, n)
+    Eps <- (Eps + t(Eps)) / 2
+    Dj <- D + Eps
+    diag(Dj) <- 0
+    Dj[Dj < 0] <- 0
+
+    gj_full <- graph_from_adjacency_matrix(Dj, mode = "undirected", weighted = TRUE, diag = FALSE)
+    gj_mst  <- mst(gj_full, weights = E(gj_full)$weight)
+
+    ## edge inclusion relative to baseline MST edges
+    ej <- get_edge_keys(gj_mst)
+    edge_freq[intersect(names(edge_freq), ej)] <- edge_freq[intersect(names(edge_freq), ej)] + 1L
+
+    ## bridge stability: how often baseline top-10 bridges stay in top-10
+    bj <- betweenness(gj_mst, normalized = TRUE)
+    names(bj) <- V(gj_mst)$name
+    topj <- names(sort(bj, decreasing = TRUE))[1:10]
+    bridge_hits[intersect(top0, topj)] <- bridge_hits[intersect(top0, topj)] + 1L
+  }
+
+  list(
+    baseline_top10_bridges = top0,
+    edge_inclusion = sort(edge_freq / B, decreasing = TRUE),
+    top10_bridge_retention = bridge_hits[top0] / B
+  )
+}
+
+## Example run:
+stab_load <- mst_stability_jitter(D_load, B = 200, jitter_sd = 1e-3, seed = 1)
+
+## Show: most stable edges among baseline MST edges
+head(stab_load$edge_inclusion, 15)
+
+## Show: how often each baseline top bridge stays in top-10
+stab_load$top10_bridge_retention
+
+# Robustness check: Euclidean distance MST
+D_euc <- as.matrix(stats::dist(loadings, method = "euclidean"))
+rownames(D_euc) <- rownames(loadings); colnames(D_euc) <- rownames(loadings)
+diag(D_euc) <- 0
+
+g_full_euc <- graph_from_adjacency_matrix(D_euc, mode = "undirected", weighted = TRUE, diag = FALSE)
+g_mst_euc  <- mst(g_full_euc, weights = E(g_full_euc)$weight)
+
+## Compare overlap of edges between cosine-MST and euclidean-MST
+edge_keys <- function(g) {
+  ed <- as.data.frame(ends(g, E(g)))
+  apply(ed, 1, function(x) paste(sort(x), collapse = "___"))
+}
+
+e_cos <- edge_keys(g_mst_load)
+e_euc <- edge_keys(g_mst_euc)
+
+overlap_rate <- length(intersect(e_cos, e_euc)) / length(e_cos)
+overlap_rate
+
+
+
+# 3) Build MST
+g_full <- graph_from_adjacency_matrix(D_load, mode = "undirected", weighted = TRUE, diag = FALSE)
+g_mst_load <- mst(g_full, weights = E(g_full)$weight)
+
+# attach node attributes
+g_mst_load <- g_mst_load %>%
+  set_vertex_attr("industry_code", value = node_tbl$industry_code[match(V(.)$name, node_tbl$variable)]) %>%
+  set_vertex_attr("question",      value = node_tbl$question[match(V(.)$name, node_tbl$variable)]) %>%
+  set_vertex_attr("industry_name", value = node_tbl$industry_name[match(V(.)$name, node_tbl$variable)]) %>%
+  set_vertex_attr("question_name", value = node_tbl$question_name[match(V(.)$name, node_tbl$variable)]) %>%
+  set_vertex_attr("question_group",value = node_tbl$question_group[match(V(.)$name, node_tbl$variable)])
+
+# centrality for interpretation
+V(g_mst_load)$degree <- degree(g_mst_load)
+V(g_mst_load)$betw   <- betweenness(g_mst_load, normalized = TRUE)
+
+# 4) Plot MST
+top_label_k <- 10
+top_names <- names(sort(V(g_mst_load)$betw, decreasing = TRUE))[1:top_label_k]
+
+set.seed(1)
+ggraph(g_mst_load, layout = "fr") +
+  geom_edge_link(alpha = 0.25, show.legend = FALSE) +
+  geom_node_point(aes(size = betw), alpha = 0.9) +
+  geom_node_text(
+    data = function(x) subset(x, name %in% top_names),
+    aes(label = paste0(industry_code, "_", question)),
+    size = 3,
+    repel = TRUE,
+    max.overlaps = 200
+  ) +
+  scale_size_continuous(range = c(1.2, 7)) +
+  labs(
+    title = "MST Backbone: Loading Similarity Network (DFM)",
+    subtitle = "Node size = betweenness",
+    size = "Betweenness"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+# Top central indicators
+topK <- 10
+tbl_top_load <- tibble(
+  variable      = V(g_mst_load)$name,
+  industry_code = V(g_mst_load)$industry_code,
+  industry_name = V(g_mst_load)$industry_name,
+  question      = V(g_mst_load)$question,
+  question_name = V(g_mst_load)$question_name,
+  question_group= V(g_mst_load)$question_group,
+  degree        = V(g_mst_load)$degree,
+  betweenness   = V(g_mst_load)$betw
+) %>%
+  arrange(desc(betweenness)) %>%
+  slice(1:topK)
+
+tbl_top_load
+
+
+knitr::kable(
+  tbl_top_load, 
+  digits = 3, 
+  caption = "Top central indicators in the loading-based MST (ranked by betweenness)" 
+)
+```
+
+\textbf{Interpretation:}
+
+Loading-based MST reveals how industry–question indicators cluster according to their exposure to common latent economic factors.
+\begin{itemize}
+  \item Nodes with high betweenness centrality occupy bridge-like positions in the MST backbone, connecting otherwise more distant parts of the loading space. These indicators appear structurally central within the backbone representation, as they load on multiple latent factors and integrate information from different segments of the survey. Such indicators may be particularly informative for monitoring changes in the business cycle, as they reflect multiple underlying economic forces simultaneously.
+  \item The most central indicators are predominantly associated with manufacturing industries located in the middle of the production chain, such as wood products, glass and ceramics, fabricated metal products, and rubber and plastics, suggesting broad exposure to both upstream and downstream economic conditions.
+  \begin{itemize}
+    \item The loading-based MST exhibits only a small number of clear structural bridge indicators, as measured by high betweenness centrality.
+    \item Two industries dominate these bridge positions: C1600000 (Wood Products) and C2300000 (Glass, ceramics, and stone processing), each appearing three times among the Top-10 central nodes across different survey questions.
+   \item Bridge status is not driven by a single survey item; instead, multiple question types within the same industry contribute to central positions, indicating exposure to combinations of latent factors rather than isolated survey dimensions.
+  \end{itemize}
+  \item While the analysis is static and does not establish causality or predictive power, the identified central indicators provide a natural candidate set for subsequent dynamic and early-warning analyses.
+\end{itemize}
+\bigskip
+
+
+
+\large \textbf{1.2 Residual Correlation Network: structure beyond common factors}
+
+\normalsize
+After removing the common component using the dynamic factor model
+\[
+\hat X_t = \hat F_t \hat\Lambda',
+\]
+the residuals
+\[
+\hat\xi_t = X_t - \hat X_t
+\]
+capture idiosyncratic dynamics that are not explained by the common business-cycle factors. Persistent correlations among these residuals therefore indicate structural dependence beyond the common cycle, such as sectoral linkages, shared idiosyncratic shocks, or measurement overlap.
+
+To obtain a parsimonious representation of this residual dependence, we construct a minimum spanning tree based on a residual-correlation distance,
+\[
+d_{ij} = 1 - \big| \mathrm{corr}(\hat\xi_i, \hat\xi_j) \big|
+\]
+Under this metric, indicators with stronger residual correlations are closer in distance, and the resulting MST highlights the strongest remaining linkages after controlling for the common factor structure.
+
+\textbf{Stability of residual bridges}
+
+Bootstrap resampling of the residual dependence network reveals a clear contrast between local and global structures.
+Edges connecting indicators within the same industry and question block are extremely stable and appear in nearly all bootstrap replications.
+By contrast, nodes with high betweenness centrality exhibit substantial variation in their ranking across bootstrap samples.
+
+In particular, no residual bridge node remains in the top-10 betweenness set with high probability.
+This finding is economically intuitive: residual correlations capture short-lived, context-dependent interactions that vary across time windows and business-cycle phases.
+Accordingly, bridge status in the residual network should be interpreted as a graded and state-dependent property rather than a fixed structural characteristic.
+
+
+```{r 1.2 mst_residual, fig.width=12, fig.height=7, message=FALSE, warning=FALSE}
+# 1) Residuals from static DFM 
+X_fitted <- F_hat %*% t(Lambda_hat)   ## T×N
+e_hat <- X_std - X_fitted             ## T×N
+colnames(e_hat) <- var_names_filtered
+
+# 2) Residual correlation -> distance
+R_res <- cor(e_hat, use = "pairwise.complete.obs")
+D_res <- 1 - abs(R_res)
+diag(D_res) <- 0
+
+rownames(D_res) <- var_names_filtered
+colnames(D_res) <- var_names_filtered
+
+# 3) Build MST
+g_full_res <- graph_from_adjacency_matrix(D_res, mode = "undirected", weighted = TRUE, diag = FALSE)
+g_mst_res <- mst(g_full_res, weights = E(g_full_res)$weight)
+
+# attach node attributes
+g_mst_res <- g_mst_res %>%
+  set_vertex_attr("industry_code", value = node_tbl$industry_code[match(V(.)$name, node_tbl$variable)]) %>%
+  set_vertex_attr("question",      value = node_tbl$question[match(V(.)$name, node_tbl$variable)]) %>%
+  set_vertex_attr("industry_name", value = node_tbl$industry_name[match(V(.)$name, node_tbl$variable)]) %>%
+  set_vertex_attr("question_name", value = node_tbl$question_name[match(V(.)$name, node_tbl$variable)]) %>%
+  set_vertex_attr("question_group",value = node_tbl$question_group[match(V(.)$name, node_tbl$variable)])
+
+V(g_mst_res)$degree <- degree(g_mst_res)
+V(g_mst_res)$betw   <- betweenness(g_mst_res, normalized = TRUE)
+
+betw_vec <- V(g_mst_res)$betw
+names(betw_vec) <- V(g_mst_res)$name
+
+# Attach signed residual correlations to MST edges
+edge_ends_res <- ends(g_mst_res, E(g_mst_res))
+
+E(g_mst_res)$corr_signed <- mapply(function(a, b) R_res[a, b],
+                                   edge_ends_res[, 1], edge_ends_res[, 2])
+E(g_mst_res)$corr_abs <- abs(E(g_mst_res)$corr_signed)
+E(g_mst_res)$sign <- ifelse(E(g_mst_res)$corr_signed >= 0, "+", "-")
+
+
+# 4) Plot MST
+set.seed(2)
+ggraph(g_mst_res, layout = "fr") +
+  geom_edge_link(aes(alpha = corr_abs, color = sign), alpha = 0.35, show.legend = TRUE) +
+  geom_node_point(aes(size = betw), alpha = 0.9) +
+  geom_node_text(
+    data = function(x) subset(x, name %in% top_names),
+    aes(label = paste0(industry_code, "_", question)),
+    size = 3,
+    repel = TRUE,
+    max.overlaps = 200
+  ) +
+  scale_size_continuous(range = c(1.2, 7)) +
+  labs(
+    title = "MST Backbone: Residual Dependence Network (after DFM)",
+    subtitle = "Distance = 1 - |corr(residuals)|; node size = betweenness; edge color = sign(corr)",
+    size = "Betweenness",
+    color = "Sign of corr"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+# Top central indicators in the residual MST
+tbl_top_res <- tibble(
+  variable       = V(g_mst_res)$name,
+  industry_code  = V(g_mst_res)$industry_code,
+  industry_name  = V(g_mst_res)$industry_name,
+  question       = V(g_mst_res)$question,
+  question_name  = V(g_mst_res)$question_name,
+  question_group = V(g_mst_res)$question_group,
+  degree         = degree(g_mst_res),
+  betweenness    = V(g_mst_res)$betw
+) %>%
+  arrange(desc(betweenness)) %>%
+  slice(1:topK)
+
+tbl_top_res
+
+knitr::kable(
+  tbl_top_res,
+  digits = 3,
+  caption = "Top central indicators in the residual MST (ranked by betweenness)"
+)
+
+
+# 5) Bootstrap stability for residual-based MST
+bootstrap_residual_mst <- function(
+  e_hat,
+  var_names,
+  block_length = 12,
+  B = 200,
+  topK = 10,
+  seed = 1
+) {
+  set.seed(seed)
+
+  T <- nrow(e_hat)
+  N <- ncol(e_hat)
+
+  stopifnot(colnames(e_hat) == var_names)
+
+  # helper: sample blocks of time indices
+  sample_blocks <- function() {
+    starts <- sample(1:(T - block_length + 1),
+                     size = ceiling(T / block_length),
+                     replace = TRUE)
+    idx <- unlist(lapply(starts, function(s) s:(s + block_length - 1)))
+    idx[1:T]
+  }
+
+  # helper: canonical edge keys
+  edge_keys <- function(g) {
+    ed <- as.data.frame(ends(g, E(g)))
+    apply(ed, 1, function(x) paste(sort(x), collapse = "___"))
+  }
+
+  ## baseline MST
+  R0 <- cor(e_hat, use = "pairwise.complete.obs")
+  D0 <- 1 - abs(R0)
+  diag(D0) <- 0
+  rownames(D0) <- colnames(D0) <- var_names
+
+  g0 <- mst(
+    graph_from_adjacency_matrix(D0, mode = "undirected",
+                                weighted = TRUE, diag = FALSE),
+    weights = E(graph_from_adjacency_matrix(D0,
+                                            mode = "undirected",
+                                            weighted = TRUE))$weight
+  )
+
+  base_edges <- edge_keys(g0)
+
+  betw0 <- betweenness(g0, normalized = TRUE)
+  top0  <- names(sort(betw0, decreasing = TRUE))[1:topK]
+
+  ## storage
+  edge_freq   <- setNames(rep(0L, length(base_edges)), base_edges)
+  bridge_hits <- setNames(rep(0L, length(top0)), top0)
+
+  ## bootstrap loop
+  for (b in 1:B) {
+
+    idx <- sample_blocks()
+    e_b <- e_hat[idx, , drop = FALSE]
+
+    Rb <- cor(e_b, use = "pairwise.complete.obs")
+    Db <- 1 - abs(Rb)
+    diag(Db) <- 0
+    rownames(Db) <- colnames(Db) <- var_names
+
+    gb <- mst(
+      graph_from_adjacency_matrix(Db, mode = "undirected",
+                                  weighted = TRUE, diag = FALSE),
+      weights = E(graph_from_adjacency_matrix(Db,
+                                              mode = "undirected",
+                                              weighted = TRUE))$weight
+    )
+
+    ## edge stability
+    eb <- edge_keys(gb)
+    edge_freq[intersect(names(edge_freq), eb)] <-
+      edge_freq[intersect(names(edge_freq), eb)] + 1L
+
+    ## bridge stability
+    betw_b <- betweenness(gb, normalized = TRUE)
+    top_b  <- names(sort(betw_b, decreasing = TRUE))[1:topK]
+
+    bridge_hits[intersect(top0, top_b)] <-
+      bridge_hits[intersect(top0, top_b)] + 1L
+  }
+
+  list(
+    baseline_top_bridges = top0,
+    edge_inclusion_rate  = sort(edge_freq / B, decreasing = TRUE),
+    bridge_retention     = bridge_hits / B
+  )
+}
+
+stab_res <- bootstrap_residual_mst(
+  e_hat      = e_hat,
+  var_names = var_names_filtered,
+  block_length = 12,
+  B = 200,
+  topK = topK,
+  seed = 2
+)
+
+## Edge stability: how often baseline MST edges reappear
+head(stab_res$edge_inclusion_rate, 15)
+
+## Bridge stability: how often top bridges stay top-10
+stab_res$bridge_retention
+
+```
+
+\textbf{Interpretation:}
+The residual-based MST provides a parsimonious backbone representation of the remaining dependence structure between survey indicators after removing the common business-cycle component identified by the DFM.
+\begin{itemize}
+  \item The fact that the residual network is neither extremely sparse nor uniformly dense implies that the DFM successfully captures the dominant common cycle, while still leaving room for economically meaningful structure beyond the common component.
+  \item The indicators with the highest betweenness centrality are dominated by export order assessments (XUS) across several manufacturing industries, including Machinery (C2800000), Electrical Equipment (C2700000), Basic Metals (C2400000), Fabricated Metal Products (C2500000), and Wearing Apparel (C1400000). It suggests that international demand conditions generate cross-industry linkages that are not fully captured by the common latent factors. These residual connections may be consistent with shared exposure to external trade shocks or global supply-chain disruptions that affect multiple sectors simultaneously but are not purely macro-cyclical.
+  \item Several manufacturing industries appear repeatedly among the most central residual nodes, most notably Fabricated Metal Products (C2500000) and Printing (C1800000), indicating structurally rich idiosyncratic dynamics beyond the common cycle. These industries contribute central indicators related to export demand and pricing, suggesting that residual dependence may be driven by industry-specific channels such as external demand exposure and cost pass-through.
+\end{itemize}
+
+
+
+\large \textbf{Summary structural networks:}
+\normalsize
+While the loading-based MST identifies indicators that are structurally important due to their exposure to multiple latent factors, the residual-based MST emphasizes indicators related to export demand and pricing, suggesting distinct sectoral channels of dependence beyond the common cycle.
+\bigskip
+
+
+                        
+\Large \textbf{2. Causal Networks: Factor-Level and Indicator-Level Analysis}
+
+\normalsize
+\textbf{Goal:} While the structural networks characterize contemporaneous dependence patterns across survey indicators, they do not encode temporal ordering or directional information flows. To analyze how economic shocks propagate through the system over time, we therefore introduce time and direction by constructing causal (dynamic) networks.
+
+Rather than modeling causal relationships directly among hundreds of noisy survey indicators, we focus on the dynamic interactions among the latent factors extracted by DFM. These factors summarize common economic forces underlying the manufacturing survey and serve as state variables describing the evolution of the system over time.
+
+Causal relationships are identified using a vector autoregressive (VAR) framework estimated on the dynamic factors. Directed edges in the resulting network correspond to statistically significant Granger-causal relationships between factors, indicating predictive lead--lag effects and potential transmission channels of economic shocks.
+
+\textbf{Methodology:}
+Let $F_t \in \mathbb{R}^r$ denote the vector of \emph{smoothed} dynamic factors obtained from the dynamic factor model. We estimate a VAR($p$) model:
+\begin{equation}
+F_t
+=
+c + A_1 F_{t-1} + \cdots + A_p F_{t-p} + u_t,
+\qquad
+u_t \sim \mathcal{N}(0, Q),
+\end{equation}
+where $c \in \mathbb{R}^r$ is an intercept vector, $A_\ell \in \mathbb{R}^{r \times r}$ are lag coefficient matrices, and $Q$ denotes the covariance matrix of the VAR innovations.
+
+For each ordered pair of factors $(i,j)$, we test whether lagged values of factor $i$ provide additional predictive power for factor $j$, conditional on lagged values of all other factors. Statistically significant Granger-causal relationships define directed edges in the factor-level causal network.
+
+To control for multiple testing across all ordered factor pairs, we adjust p-values using the Benjamini--Hochberg false discovery rate (FDR) procedure and retain edges that remain significant under the chosen FDR threshold.
+
+
+```{r 2. factor-level causal network}
+# Load prepared DFM state
+st <- readRDS("output/dfm_state_04.rds")
+
+F <- as.data.frame(st$F_smooth)
+colnames(F) <- paste0("F", seq_len(ncol(F)))
+r <- ncol(F)
+
+# VAR lag selection
+max_p <- 6
+ic_tbl <- map_dfr(1:max_p, function(p){
+  fit <- VAR(F, p = p, type = "const")
+  tibble(p = p, AIC = AIC(fit), BIC = BIC(fit))
+})
+p_var <- ic_tbl$p[which.min(ic_tbl$BIC)]
+
+var_fit <- VAR(F, p = p_var, type = "const")
+
+# Equation-specific Granger tests
+vars_nm <- colnames(F)
+pvals <- matrix(NA_real_, r, r, dimnames = list(vars_nm, vars_nm))
+
+lag_coef_names <- function(cause, p) paste0(cause, ".l", 1:p)
+
+for (j in seq_along(vars_nm)) {
+  resp <- vars_nm[j]
+  eq_j <- var_fit$varresult[[resp]]
+  for (i in seq_along(vars_nm)) {
+    cause <- vars_nm[i]
+    if (cause == resp) next
+    hn <- lag_coef_names(cause, p_var)
+    hn <- hn[hn %in% names(coef(eq_j))]
+    if (length(hn) == 0) next
+    lh <- try(linearHypothesis(eq_j, hn), silent = TRUE)
+    if (!inherits(lh, "try-error")) {
+      pvals[i, j] <- lh[2, "Pr(>F)"]
+    }
+  }
+}
+
+# BH-FDR correction
+p_vec <- as.vector(pvals)
+p_adj <- rep(NA_real_, length(p_vec))
+ok <- is.finite(p_vec)
+p_adj[ok] <- p.adjust(p_vec[ok], method = "BH")
+p_adj_mat <- matrix(p_adj, r, r, dimnames = dimnames(pvals))
+
+# Build directed graph
+alpha_fdr <- 0.05
+edges <- as_tibble(as.table(p_adj_mat), .name_repair = "minimal") |>
+  set_names(c("from", "to", "p_fdr")) |>
+  filter(from != to, p_fdr <= alpha_fdr)
+
+# Edge weights from VAR coefficients
+get_edge_weight <- function(from, to, var_fit, p_var) {
+  eq_to <- var_fit$varresult[[to]]
+  coef_all <- coef(eq_to)
+  lag_names <- paste0(from, ".l", 1:p_var)
+  lag_names <- lag_names[lag_names %in% names(coef_all)]
+  if (length(lag_names) == 0) return(NA_real_)
+  sum(abs(coef_all[lag_names]))
+}
+
+edges <- edges |>
+  mutate(weight = purrr::map2_dbl(from, to, ~ get_edge_weight(.x, .y, var_fit, p_var)))
+
+g_fac <- graph_from_data_frame(edges, directed = TRUE)
+
+V(g_fac)$in_degree  <- degree(g_fac, mode = "in")
+V(g_fac)$out_degree <- degree(g_fac, mode = "out")
+V(g_fac)$betw       <- betweenness(g_fac, directed = TRUE, normalized = TRUE)
+
+# Plot
+set.seed(3)
+
+ggraph(g_fac, layout = "fr") +
+  geom_edge_link(
+    aes(width = weight),
+    arrow = arrow(length = unit(3, "mm")),
+    end_cap = circle(2, "mm"),
+    alpha = 0.7,
+    show.legend = TRUE
+  ) +
+  geom_node_point(
+  aes(size = betw),
+  show.legend = TRUE,
+  key_glyph = draw_key_point
+  ) +
+  geom_node_label(
+    aes(label = name),
+    repel = TRUE,
+    size = 4,
+    label.size = 0,
+    fill = "white",
+    alpha = 0.9,
+    label.padding = unit(0.2, "lines"),
+    point.padding = unit(1.2, "lines"),
+    box.padding = unit(0.8, "lines"),
+    show.legend = FALSE
+  ) +
+  scale_edge_width(
+    range = c(0.6, 2.2),
+    name = "Influence"
+  ) +
+  scale_size_continuous(
+    range = c(3, 8),
+    name = "Betweenness"
+  ) +
+  guides(
+    edge_width = guide_legend(
+      title = "Influence",
+      order = 1,
+      override.aes = list(
+        alpha = 1,
+        colour = "grey30",
+        linetype = 1
+      )
+    ),
+    size = guide_legend(
+      title = "Betweenness",
+      order = 2,
+      override.aes = list(
+        shape = 16,
+        alpha = 1
+      )
+    )
+  ) +
+  labs(
+    title = "Factor-Level Causal Network (VAR–Granger)",
+    subtitle = paste0("Directed edges: BH-FDR \u2264 ", alpha_fdr,
+                      ", VAR lag p = ", p_var)
+  ) +
+  theme_minimal()
+
+# Table: in-/out-degree and strength 
+get_edge_weight <- function(from, to, var_fit, p_var) {
+  eq_to <- var_fit$varresult[[to]]
+  coef_all <- coef(eq_to)
+
+  lag_names <- paste0(from, ".l", 1:p_var)
+  lag_names <- lag_names[lag_names %in% names(coef_all)]
+
+  if (length(lag_names) == 0) return(NA_real_)
+
+  # influence as sum of all abs value of all lags
+  sum(abs(coef_all[lag_names]))
+}
+
+edges <- edges |>
+  dplyr::mutate(
+    weight = purrr::map2_dbl(from, to, ~ get_edge_weight(.x, .y, var_fit, p_var))
+  )
+
+g_fac <- graph_from_data_frame(edges, directed = TRUE)
+
+V(g_fac)$in_degree  <- degree(g_fac, mode = "in")
+V(g_fac)$out_degree <- degree(g_fac, mode = "out")
+V(g_fac)$betw       <- betweenness(g_fac, directed = TRUE, normalized = TRUE)
+
+# weighted degree = strength
+V(g_fac)$in_strength  <- strength(g_fac, mode = "in",  weights = E(g_fac)$weight)
+V(g_fac)$out_strength <- strength(g_fac, mode = "out", weights = E(g_fac)$weight)
+
+factor_summary <- tibble::tibble(
+  factor = V(g_fac)$name,
+  in_degree = V(g_fac)$in_degree,
+  out_degree = V(g_fac)$out_degree,
+  in_strength = round(V(g_fac)$in_strength, 3),
+  out_strength = round(V(g_fac)$out_strength, 3),
+  betweenness = round(V(g_fac)$betw, 3)
+) |>
+  dplyr::arrange(dplyr::desc(out_strength))
+
+factor_summary
+```
+\textbf{Interpretation:}
+\begin{itemize}
+  \item The VAR–Granger network reveals systematic lead–lag relationships among latent economic mechanism. The highly interconnected network system indicates that the main latent economic mechanisms in manufacturing evolve jointly rather than in isolation.
+  \item Factor 2 (Supply-side and Productivity conditions) occupies a central bridging position, exerting Granger-causal influence on multiple other factors. This suggests that supply-side conditions play a key role in initiating and transmitting shocks across the system.
+  \item Factor 3 (Consumer demand and price dynamics) acts as an important aggregation node, receiving inputs from other factors and propagating effects further. This positioning is consistent with demand and pricing responding endogenously to upstream investment and supply developments.
+  \item The presence of bidirectional causal links, particularly among Factors 1, 2, and 3, points to feedback loops between investment activity, supply conditions, and demand–price dynamics, rather than a unidirectional propagation structure.
+  \item Factors 4 (Global industrial demand) and 5 (Specialized manufacturing) are less central but remain dynamically connected, indicating that more specialized or externally driven mechanisms are still endogenously linked to the core domestic manufacturing cycle.
+\end{itemize}
+
+
+

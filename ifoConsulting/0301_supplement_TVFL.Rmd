@@ -1,0 +1,875 @@
+---
+title: "0301_supplement_TVFL"
+author: "Yiming Zhao"
+date: "2026-02-20"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 6)
+```
+
+## Extension 1: Level 2
+
+```{r}
+dfm02 <- readRDS("output/dfm_results_02_level2.rds")
+source("ifo_data_processing.R")
+
+Y_kfas <- dfm02$Y_kfas
+F_smooth <- dfm02$F_smooth
+Hdiag <- dfm02$Hdiag
+r <- dfm02$r
+dates <- dfm02$dates
+var_names_filtered <- dfm02$var_names_filtered
+var_metadata_filtered <- dfm02$var_metadata_filtered
+
+library(KFAS)
+library(tidyverse)
+
+X_kfas <- Y_kfas
+F_use <- as.matrix(F_smooth) # T x r
+T_obs <- nrow(F_use)
+N_obs <- ncol(X_kfas)
+stopifnot(ncol(F_use) == r, nrow(X_kfas) == T_obs, length(Hdiag) == N_obs)
+```
+
+
+
+```{r }
+# Keep only Level 2
+keep_vars <- var_metadata$level == 2
+
+stopifnot("industry_code" %in% colnames(var_metadata_filtered))
+stopifnot("level" %in% colnames(var_metadata_filtered))
+
+group_id <- as.character(var_metadata_filtered$industry_code)
+groups <- sort(unique(group_id))
+G <- length(groups)
+
+cat("Number of Level-2 groups (industry_code):", G, "\n")
+
+# Group sizes
+group_sizes <- as.integer(table(group_id)[groups])
+group_table <- data.frame(industry_code = groups, n_g = group_sizes) |>
+arrange(desc(n_g))
+head(group_table, 10)
+```
+
+```{r}
+# Time-Varying Parameter (TVP) Factor Loading Estimation using KFAS
+fit_tvp_group <- function(X_group, Fmat, H_vec, q_init = 1e-4) {
+  
+  T_obs <- nrow(Fmat) 
+  r     <- ncol(Fmat)     
+  n_g   <- ncol(X_group)   
+  
+  
+  # Build time-varying measurement matrix Z_{g,t}
+  Z_arr <- array(NA_real_, dim = c(n_g, r, T_obs))
+  
+  for (t in 1:T_obs) {
+    Z_arr[, , t] <- matrix(
+      rep(Fmat[t, ], each = n_g),  ## For each time t, create an (n_g x r) matrix
+      nrow  = n_g,                 ## where each row is F_t' (the factor values at time t)
+      byrow = FALSE
+    )
+  }
+  
+  # Specify State-Space Model using SSMcustom
+  model0 <- SSModel(
+    X_group ~ -1 +  ## Left-hand side: observed data (no intercept)
+      
+      SSMcustom(
+        Z  = Z_arr,                    ## Time-varying measurement matrix (n_g, r, T)
+        T  = diag(r),                  ## State transition: I_r (random walk)
+        R  = diag(r),                  ## Selection matrix: I_r (full innovations)
+        Q  = diag(NA_real_, r),        ## Innovation variance: q * I_r (to be estimated)
+        a1 = rep(0, r),                ## Initial state mean: 0
+        P1 = diag(10, r)               ## Initial state variance: diffuse prior
+      ),
+    
+    H = diag(H_vec, n_g)               ## Observation error variance: fixed diagonal
+  )
+  
+  
+  # Define update function for Q matrix
+  updatefn <- function(pars, model) {
+    q <- exp(pars[1])            ## Exponentiate to ensure positivity
+    model$Q[, , 1] <- diag(q, r) ## Update Q matrix: q * I_r
+    return(model)
+  }
+  
+  
+  # Optimize the log-likelihood to estimate q_g
+  fit <- fitSSM(
+    model  = model0,
+    inits  = log(q_init),      ## Starting value: log(q_init)
+    updatefn = updatefn,       ## Function to update Q given parameters
+    method = "BFGS"            ## Optimization algorithm
+  )
+  
+  model <- fit$model
+  q_hat <- exp(fit$optim.out$par[1])  ## Estimated innovation variance
+  
+  
+  # Kalman Smoothing - Smoothed states: alpha_{t|T} (uses full-sample information)
+  kfs <- KFS(
+    model = model,
+    smoothing = c("state")  ## Request smoothed state estimates
+  )
+  
+  ## Extract smoothed state estimates: lambda_{g,t|T}
+  lambda_t <- kfs$alphahat  ## T x r matrix
+  colnames(lambda_t) <- paste0("lambda_", 1:r)
+  
+  return(list(
+    lambda_t = lambda_t,  ## Smoothed time-varying loadings (T x r)
+    q_hat    = q_hat      ## Estimated innovation variance (scalar)
+  ))
+  
+}
+```
+
+```{r}
+## Estimation of Time-Varying Loadings for All Industry Groups
+
+## Storage for time-varying loadings
+Lambda_g_tv <- vector("list", G)
+names(Lambda_g_tv) <- groups
+
+## Storage for estimated innovation variances
+q_hat_g <- rep(NA_real_, G)
+names(q_hat_g) <- groups
+
+
+for (gg in seq_along(groups)) {
+  
+  g <- groups[gg]                ## Group name (e.g., "C2800000")
+  idx <- which(group_id == g)    ## Column indices for this group in X_kfas
+  n_g <- length(idx)             ## Number of series in this group
+  
+  # Extract observed data for this group: T x n_g matrix
+  X_group <- as.matrix(X_kfas[, idx, drop = FALSE])
+  
+  # Extract fixed observation error variances for this group
+  H_vec <- Hdiag[idx]
+
+  # Estimate time-varying loadings using KFAS
+  res <- fit_tvp_group(
+    X_group = X_group,     ## T x n_g observed data
+    Fmat    = F_use,       ## T x r static factors
+    H_vec   = H_vec,       ## n_g observation error variances
+    q_init  = 1e-4         ## Initial value for innovation variance
+  )
+
+  Lambda_g_tv[[g]] <- res$lambda_t
+  q_hat_g[g] <- res$q_hat
+}  
+
+```
+
+```{r}
+## Expand Group-Level TV Loadings to Variable Level - maps group-level loading 
+N_obs <- length(var_names_filtered)
+
+Lambda_tv_list <- vector("list", N_obs)
+names(Lambda_tv_list) <- var_names_filtered
+
+# Map group-level loadings to individual variables
+for (i in 1:N_obs) {
+  g <- group_id[i]
+  Lambda_tv_list[[i]] <- Lambda_g_tv[[g]]  # T x r 
+}
+```
+
+```{r, include=FALSE}
+# Instability Measures for Each Group
+instability_by_group <- lapply(groups, function(g) {
+  
+  L <- Lambda_g_tv[[g]]  # T x r
+  
+  dL <- apply(L, 2, diff)
+  
+  data.frame(
+    industry_code       = g,
+    n_g                 = sum(group_id == g),
+    q_hat               = q_hat_g[g],
+    mean_abs_dlambda    = mean(abs(dL), na.rm = TRUE),
+    sd_dlambda          = sd(as.numeric(dL), na.rm = TRUE),
+    failed = FALSE
+  )
+  
+}) |>
+  bind_rows() |>
+  arrange(desc(mean_abs_dlambda))
+
+head(instability_by_group, 15)
+```
+
+```{r}
+plot_factor_all_industries <- function(
+  Lambda_g_tv,
+  dates,
+  factor_j = 1,
+  industries = NULL,
+  event_years = c(2008, 2011, 2020),
+  title_prefix = "Industry-only time-varying loadings",
+  show_legend = TRUE,
+  fade_highvol = TRUE,  
+  top_k = 5
+) {
+  gs <- names(Lambda_g_tv)
+  if (!is.null(industries)) gs <- intersect(gs, industries)
+  stopifnot(length(gs) > 0)
+
+  # compute volatility per industry (for this factor)
+  vol_df <- data.frame(
+    industry_code = gs,
+    vol = sapply(gs, function(g) {
+      L <- Lambda_g_tv[[g]][, factor_j]
+      stats::sd(diff(L), na.rm = TRUE)
+    }),
+    stringsAsFactors = FALSE
+  )
+
+  highvol_industries <- vol_df |>
+    dplyr::arrange(dplyr::desc(vol)) |>
+    dplyr::slice_head(n = top_k) |>
+    dplyr::pull(industry_code)
+
+  gs <- highvol_industries
+  
+  # build long data
+  df_long <- do.call(rbind, lapply(gs, function(g) {
+    L <- Lambda_g_tv[[g]]  # T x r
+    stopifnot(nrow(L) == length(dates))
+    data.frame(
+      date = dates,
+      industry_code = g,
+      industry_name = get_industry_name_en(g),
+      loading = as.numeric(L[, factor_j]),
+      is_highvol = g %in% highvol_industries,  
+      stringsAsFactors = FALSE
+    )
+  }))
+
+  # events
+  event_dates  <- as.Date(paste0(event_years, "-01-01"))
+  keep_evt <- event_dates >= min(dates) & event_dates <= max(dates)
+  event_dates  <- event_dates[keep_evt]
+  event_labels <- as.character(event_years[keep_evt])
+
+  # base plot: keep global color mapping so ALL are colored
+  p <- ggplot2::ggplot(df_long, ggplot2::aes(x = date, y = loading, color = industry_name)) +
+    ggplot2::geom_hline(yintercept = 0, linetype = 3, color = "gray60") +
+    ggplot2::scale_color_viridis_d(option = "turbo") +
+    ggplot2::labs(
+      title = paste0(title_prefix, " — Factor ", factor_j),
+      subtitle = if (fade_highvol)
+        paste0("High-volatility industries (top ", top_k, ") are faded")
+      else
+        "Each line corresponds to one Level-2 industry",
+      x = NULL,
+      y = paste0("Loading (lambda_", factor_j, ")"),
+      color = "Industry"
+    ) +
+    ggplot2::theme_minimal(base_size = 12) +
+    ggplot2::theme(
+      plot.title.position = "plot",
+      legend.position = if (show_legend) "bottom" else "none",
+      legend.key.height = grid::unit(0.45, "lines"),
+      legend.text = ggplot2::element_text(size = 9),
+      plot.margin = grid::unit(c(6, 6, 6, 6), "pt")
+    )
+
+  # draw lines in two layers to control emphasis
+  if (fade_highvol) {
+    # 1) draw HIGH-vol first (faded, but still colored)
+    p <- p + ggplot2::geom_line(
+      data = df_long[df_long$is_highvol, ],
+      linewidth = 0.7,
+      alpha = 0.25
+    )
+    # 2) draw LOW-vol on top (more visible)
+    p <- p + ggplot2::geom_line(
+      data = df_long[!df_long$is_highvol, ],
+      linewidth = 1.0,
+      alpha = 0.95
+    )
+  } else {
+    # no fading: all same style
+    p <- p + ggplot2::geom_line(linewidth = 0.9, alpha = 0.85)
+  }
+
+  if (show_legend) {
+    p <- p + ggplot2::guides(color = ggplot2::guide_legend(ncol = 3))
+  }
+
+  if (length(event_dates) > 0) {
+    evt_df <- data.frame(date = event_dates, label = event_labels)
+    p <- p +
+      ggplot2::geom_vline(xintercept = event_dates, linetype = 2, color = "red3", linewidth = 0.8) +
+      ggplot2::geom_text(
+        data = evt_df,
+        ggplot2::aes(x = date, y = Inf, label = label),
+        inherit.aes = FALSE,
+        vjust = 1.2, hjust = 0,
+        color = "red3",
+        size = 3
+      ) +
+      ggplot2::coord_cartesian(clip = "off")
+  }
+
+  p
+}
+```
+
+```{r fig.width=14, fig.height=6}
+
+for (j in 1:r) {
+  print(plot_factor_all_industries(
+    Lambda_g_tv,
+    dates,
+    factor_j = j,
+    fade_highvol = FALSE,   
+    top_k = 20,             # display top-20 highest loading volatility for each factor
+    show_legend = TRUE
+  ))
+}
+```
+
+To improve interpretability, we restrict the visualization to the 20 industries with the highest loading volatility (standard deviation of first differences of the time-varying loadings) for each factor. Focusing on the most dynamically responsive industries allows us to highlight structural adjustments while avoiding overplotting that would obscure patterns in a full sample visualization.
+
+\textbf{Factor 1 — Capital Goods / Investment Cycle}
+
+Factor 1 exhibits consistently positive loadings for core capital-goods industries such as Machinery, Fabricated Metals, Electrical Equipment and related upstream segments. Their exposure remains persistently elevated across the sample, confirming that this factor captures the investment-driven backbone of manufacturing activity.
+
+Around the 2008–2011 period, loadings compress somewhat across industries, reflecting the synchronized contraction during the Global Financial Crisis and subsequent adjustment phase. After 2020, dispersion increases moderately, suggesting heterogeneous recovery dynamics following the pandemic shock.
+
+Overall, the cross-sectional spread is noticeable but not extreme, indicating that Factor 1 represents a broad macro-investment cycle rather than a narrowly concentrated sectoral shock.
+
+\textbf{Factor 2 — Supply-Side & Cost / Expectation Cycle}
+
+Loadings on Factor 2 are more heterogeneous and display clearer sign differences across industries. Several energy-intensive and intermediate industries show pronounced shifts around 2008 and again after 2020.
+
+In particular, some industries transition from positive to negative exposure in the post-crisis period, suggesting a reallocation in supply-side sensitivities. The dispersion increases after 2020, consistent with differentiated exposure to energy price dynamics and input cost shocks.
+
+Compared to Factor 1, Factor 2 exhibits stronger time variation in sign and relative ranking, indicating that it captures a dimension linked to supply conditions and productivity adjustments rather than a synchronized aggregate cycle.
+
+\textbf{Factor 3 — Consumer Demand & Domestic Adjustment}
+Factor 3 displays more persistent cross-sectional ranking and smoother time paths. Consumer-related industries such as Food processing, Apparel, and related light manufacturing segments show relatively stable exposure patterns.
+
+There is visible adjustment around 2012–2015 and again during 2020, but the overall ordering across industries changes less dramatically than in Factor 2. This relative stability is consistent with a demand-side factor tied to household consumption, which tends to adjust more gradually than investment or supply shocks.
+
+Thus, Factor 3 appears to represent a more persistent domestic demand component with moderate but systematic heterogeneity.
+
+\textbf{Factor 4 — External / Global Industrial Demand}
+
+Factor 4 exhibits stronger sign reversals and deeper troughs around 2008 and 2020. Industries linked to intermediate and externally exposed production show clearer cyclical sensitivity.
+
+The dispersion widens notably during crisis periods, suggesting that global trade and external demand shocks are unevenly transmitted across sectors. Some industries maintain relatively stable exposure, while others experience sharp temporary declines.
+
+This pattern supports interpreting Factor 4 as reflecting external demand and global industrial fluctuations rather than purely domestic dynamics.
+
+\textbf{Factor 5 — Specialized or Structural Dimension}
+
+Factor 5 shows the largest cross-sectional dispersion in loadings across industries. A few industries exhibit persistently high positive exposure, while others remain structurally negative over most of the sample.
+
+Time variation is present but secondary to the cross-sectional differentiation. The relative ranking of industries is comparatively stable, indicating that this factor captures a more structural or sector-specific dimension rather than a broad cyclical force.
+
+Hence, Factor 5 appears to represent a narrower specialization or structural alignment factor, characterized by strong cross-sectional heterogeneity and moderate temporal adjustment.
+
+\textbf{Summary}
+
+Across all five factors, the dominant pattern is cross-sectional heterogeneity combined with moderate time variation. Crisis periods (2008, 2011, 2020) coincide with temporary increases in dispersion, but there is no evidence of a systematic structural break in the overall factor–industry mapping.
+
+This supports the interpretation that time variation in loadings reflects cyclical reallocation rather than a fundamental redefinition of the factor structure.
+
+### Instability in Factor Exposure
+
+```{r, include=FALSE}
+get_top5_industries_by_factor <- function(Lambda_g_tv, top_k = 5) {
+  gs <- names(Lambda_g_tv)
+  r  <- ncol(Lambda_g_tv[[1]])
+
+  res <- do.call(rbind, lapply(1:r, function(j) {
+
+    vol_df <- data.frame(
+      industry_code = gs,
+      industry_name = sapply(gs, get_industry_name_en),
+      volatility = sapply(gs, function(g) {
+        L <- Lambda_g_tv[[g]][, j]
+        sd(diff(L), na.rm = TRUE)
+      }),
+      stringsAsFactors = FALSE
+    )
+
+    vol_df |>
+      dplyr::arrange(dplyr::desc(volatility)) |>
+      dplyr::slice_head(n = top_k) |>
+      dplyr::mutate(
+        factor = paste0("Factor ", j),
+        rank = dplyr::row_number()
+      ) |>
+      dplyr::select(factor, rank, industry_code, industry_name, volatility)
+
+  }))
+  
+  rownames(res) <- NULL
+  res
+}
+```
+
+This measure captures temporal instability in factor exposure and captures industries whose relationship with a given factor is subject to pronounced structural adjustment.
+
+
+```{r}
+top5_by_factor <- get_top5_industries_by_factor(Lambda_g_tv, top_k = 5)
+
+print(top5_by_factor)
+```
+
+The table reports, for each factor, the five industries with the highest temporal loading volatility, measured as the standard deviation of first differences of the time-varying loadings.
+
+\textbf{Cross-Factor Recurrence}
+
+A striking pattern is the persistent recurrence of a small set of industries across multiple factors:
+
+\begin{itemize}
+  \item Dairy Products (C1050000) ranks first across all five factors.
+This systematic presence indicates that the industry’s factor exposure is not only volatile in one specific dimension but broadly sensitive to structural reallocation across multiple economic forces. Rather than reflecting idiosyncratic noise, this pattern suggests that food-processing segments may act as a flexible adjustment margin within the manufacturing system.
+  \item Leather Goods and Footwear also appear repeatedly among the top-ranked industries. Their consistent volatility across factors points to a structurally exposed position within supply chains and demand cycles, likely driven by a combination of trade exposure, cost sensitivity, and consumer demand shifts.
+  \item Similarly, Agricultural and Forestry Machinery shows recurrent instability, especially for Factors 1, 3, and 5. As a capital-goods segment tied to both domestic investment and global demand conditions, its exposure appears to be reallocated across different macroeconomic dimensions over time.
+\end{itemize}
+
+
+\textbf{Sectoral Sensitivity vs. Factor-Specific Instability}
+
+An important observation is that the ranking is not entirely factor-specific.
+Instead of each factor producing a distinct set of volatile industries, several industries remain volatile regardless of the factor considered. This suggests that temporal instability is partly an industry characteristic rather than purely a factor-driven phenomenon.
+
+In contrast, industries such as Sawmilling and Planing of Wood and Optical and Photographic Equipment appear only under certain factors, indicating more dimension-specific exposure shifts.
+
+\textbf{Magnitude of Volatility}
+
+The volatility values themselves remain modest in absolute magnitude (ranging roughly between 0.001 and 0.004). Even for the most unstable industries, loading adjustments are gradual rather than abrupt. This supports the interpretation that structural change occurs through continuous reallocation rather than discrete structural breaks.
+
+\textbf{Summary}
+
+Overall, the results confirm the presence of non-negligible heterogeneity in the evolution of industry–factor relationships. However, instability is concentrated in a limited group of structurally sensitive industries, while the majority of sectors remain comparatively stable.
+
+Moreover, the repeated appearance of the same industries across factors indicates that temporal instability reflects persistent structural exposure rather than random fluctuation or factor-specific shocks.
+
+
+
+## Extension 2: Level 3
+
+```{r}
+dfm02 <- readRDS("output/dfm_results_02_level3.rds")
+source("ifo_data_processing.R")
+
+Y_kfas <- dfm02$Y_kfas
+F_smooth <- dfm02$F_smooth
+Hdiag <- dfm02$Hdiag
+r <- dfm02$r
+dates <- dfm02$dates
+var_names_filtered <- dfm02$var_names_filtered
+var_metadata_filtered <- dfm02$var_metadata_filtered
+
+library(KFAS)
+library(tidyverse)
+
+X_kfas <- Y_kfas
+F_use <- as.matrix(F_smooth) # T x r
+T_obs <- nrow(F_use)
+N_obs <- ncol(X_kfas)
+stopifnot(ncol(F_use) == r, nrow(X_kfas) == T_obs, length(Hdiag) == N_obs)
+```
+
+
+
+```{r }
+# Keep only Level 3
+keep_vars <- var_metadata$level == 3
+
+stopifnot("industry_code" %in% colnames(var_metadata_filtered))
+stopifnot("level" %in% colnames(var_metadata_filtered))
+
+group_id <- as.character(var_metadata_filtered$industry_code)
+groups <- sort(unique(group_id))
+G <- length(groups)
+
+cat("Number of Level-3 groups (industry_code):", G, "\n")
+
+# Group sizes
+group_sizes <- as.integer(table(group_id)[groups])
+group_table <- data.frame(industry_code = groups, n_g = group_sizes) |>
+arrange(desc(n_g))
+head(group_table, 10)
+```
+
+
+```{r}
+# Time-Varying Parameter (TVP) Factor Loading Estimation using KFAS
+fit_tvp_group <- function(X_group, Fmat, H_vec, q_init = 1e-4) {
+  
+  T_obs <- nrow(Fmat) 
+  r     <- ncol(Fmat)     
+  n_g   <- ncol(X_group)   
+  
+  
+  # Build time-varying measurement matrix Z_{g,t}
+  Z_arr <- array(NA_real_, dim = c(n_g, r, T_obs))
+  
+  for (t in 1:T_obs) {
+    Z_arr[, , t] <- matrix(
+      rep(Fmat[t, ], each = n_g),  ## For each time t, create an (n_g x r) matrix
+      nrow  = n_g,                 ## where each row is F_t' (the factor values at time t)
+      byrow = FALSE
+    )
+  }
+  
+  # Specify State-Space Model using SSMcustom
+  model0 <- SSModel(
+    X_group ~ -1 +  ## Left-hand side: observed data (no intercept)
+      
+      SSMcustom(
+        Z  = Z_arr,                    ## Time-varying measurement matrix (n_g, r, T)
+        T  = diag(r),                  ## State transition: I_r (random walk)
+        R  = diag(r),                  ## Selection matrix: I_r (full innovations)
+        Q  = diag(NA_real_, r),        ## Innovation variance: q * I_r (to be estimated)
+        a1 = rep(0, r),                ## Initial state mean: 0
+        P1 = diag(10, r)               ## Initial state variance: diffuse prior
+      ),
+    
+    H = diag(H_vec, n_g)               ## Observation error variance: fixed diagonal
+  )
+  
+  
+  # Define update function for Q matrix
+  updatefn <- function(pars, model) {
+    q <- exp(pars[1])            ## Exponentiate to ensure positivity
+    model$Q[, , 1] <- diag(q, r) ## Update Q matrix: q * I_r
+    return(model)
+  }
+  
+  
+  # Optimize the log-likelihood to estimate q_g
+  fit <- fitSSM(
+    model  = model0,
+    inits  = log(q_init),      ## Starting value: log(q_init)
+    updatefn = updatefn,       ## Function to update Q given parameters
+    method = "BFGS"            ## Optimization algorithm
+  )
+  
+  model <- fit$model
+  q_hat <- exp(fit$optim.out$par[1])  ## Estimated innovation variance
+  
+  
+  # Kalman Smoothing - Smoothed states: alpha_{t|T} (uses full-sample information)
+  kfs <- KFS(
+    model = model,
+    smoothing = c("state")  ## Request smoothed state estimates
+  )
+  
+  ## Extract smoothed state estimates: lambda_{g,t|T}
+  lambda_t <- kfs$alphahat  ## T x r matrix
+  colnames(lambda_t) <- paste0("lambda_", 1:r)
+  
+  return(list(
+    lambda_t = lambda_t,  ## Smoothed time-varying loadings (T x r)
+    q_hat    = q_hat      ## Estimated innovation variance (scalar)
+  ))
+  
+}
+```
+
+```{r}
+## Estimation of Time-Varying Loadings for All Industry Groups
+
+## Storage for time-varying loadings
+Lambda_g_tv <- vector("list", G)
+names(Lambda_g_tv) <- groups
+
+## Storage for estimated innovation variances
+q_hat_g <- rep(NA_real_, G)
+names(q_hat_g) <- groups
+
+
+for (gg in seq_along(groups)) {
+  
+  g <- groups[gg]                ## Group name (e.g., "C2800000")
+  idx <- which(group_id == g)    ## Column indices for this group in X_kfas
+  n_g <- length(idx)             ## Number of series in this group
+  
+  # Extract observed data for this group: T x n_g matrix
+  X_group <- as.matrix(X_kfas[, idx, drop = FALSE])
+  
+  # Extract fixed observation error variances for this group
+  H_vec <- Hdiag[idx]
+
+  # Estimate time-varying loadings using KFAS
+  res <- fit_tvp_group(
+    X_group = X_group,     ## T x n_g observed data
+    Fmat    = F_use,       ## T x r static factors
+    H_vec   = H_vec,       ## n_g observation error variances
+    q_init  = 1e-4         ## Initial value for innovation variance
+  )
+
+  Lambda_g_tv[[g]] <- res$lambda_t
+  q_hat_g[g] <- res$q_hat
+}  
+
+```
+
+```{r}
+## Expand Group-Level TV Loadings to Variable Level - maps group-level loading 
+N_obs <- length(var_names_filtered)
+
+Lambda_tv_list <- vector("list", N_obs)
+names(Lambda_tv_list) <- var_names_filtered
+
+# Map group-level loadings to individual variables
+for (i in 1:N_obs) {
+  g <- group_id[i]
+  Lambda_tv_list[[i]] <- Lambda_g_tv[[g]]  # T x r 
+}
+```
+
+```{r, include=FALSE}
+# Instability Measures for Each Group
+instability_by_group <- lapply(groups, function(g) {
+  
+  L <- Lambda_g_tv[[g]]  # T x r
+  
+  dL <- apply(L, 2, diff)
+  
+  data.frame(
+    industry_code       = g,
+    n_g                 = sum(group_id == g),
+    q_hat               = q_hat_g[g],
+    mean_abs_dlambda    = mean(abs(dL), na.rm = TRUE),
+    sd_dlambda          = sd(as.numeric(dL), na.rm = TRUE),
+    failed = FALSE
+  )
+  
+}) |>
+  bind_rows() |>
+  arrange(desc(mean_abs_dlambda))
+
+head(instability_by_group, 15)
+```
+
+
+```{r}
+plot_factor_all_industries <- function(
+  Lambda_g_tv,
+  dates,
+  factor_j = 1,
+  industries = NULL,
+  event_years = c(2008, 2011, 2020),
+  title_prefix = "Industry-only time-varying loadings",
+  show_legend = TRUE,
+  fade_highvol = TRUE,  
+  top_k = 5
+) {
+  gs <- names(Lambda_g_tv)
+  if (!is.null(industries)) gs <- intersect(gs, industries)
+  stopifnot(length(gs) > 0)
+
+  # compute volatility per industry (for this factor)
+  vol_df <- data.frame(
+    industry_code = gs,
+    vol = sapply(gs, function(g) {
+      L <- Lambda_g_tv[[g]][, factor_j]
+      stats::sd(diff(L), na.rm = TRUE)
+    }),
+    stringsAsFactors = FALSE
+  )
+
+  highvol_industries <- vol_df |>
+    dplyr::arrange(dplyr::desc(vol)) |>
+    dplyr::slice_head(n = top_k) |>
+    dplyr::pull(industry_code)
+
+  gs <- highvol_industries
+  
+  # build long data
+  df_long <- do.call(rbind, lapply(gs, function(g) {
+    L <- Lambda_g_tv[[g]]  # T x r
+    stopifnot(nrow(L) == length(dates))
+    data.frame(
+      date = dates,
+      industry_code = g,
+      industry_name = get_industry_name_en(g),
+      loading = as.numeric(L[, factor_j]),
+      is_highvol = g %in% highvol_industries,  
+      stringsAsFactors = FALSE
+    )
+  }))
+
+  # events
+  event_dates  <- as.Date(paste0(event_years, "-01-01"))
+  keep_evt <- event_dates >= min(dates) & event_dates <= max(dates)
+  event_dates  <- event_dates[keep_evt]
+  event_labels <- as.character(event_years[keep_evt])
+
+  # base plot: keep global color mapping so ALL are colored
+  p <- ggplot2::ggplot(df_long, ggplot2::aes(x = date, y = loading, color = industry_name)) +
+    ggplot2::geom_hline(yintercept = 0, linetype = 3, color = "gray60") +
+    ggplot2::scale_color_viridis_d(option = "turbo") +
+    ggplot2::labs(
+      title = paste0(title_prefix, " — Factor ", factor_j),
+      subtitle = if (fade_highvol)
+        paste0("High-volatility industries (top ", top_k, ") are faded")
+      else
+        "Each line corresponds to one Level-3 industry",
+      x = NULL,
+      y = paste0("Loading (lambda_", factor_j, ")"),
+      color = "Industry"
+    ) +
+    ggplot2::theme_minimal(base_size = 12) +
+    ggplot2::theme(
+      plot.title.position = "plot",
+      legend.position = if (show_legend) "bottom" else "none",
+      legend.key.height = grid::unit(0.45, "lines"),
+      legend.text = ggplot2::element_text(size = 9),
+      plot.margin = grid::unit(c(6, 6, 6, 6), "pt")
+    )
+
+  # draw lines in two layers to control emphasis
+  if (fade_highvol) {
+    # 1) draw HIGH-vol first (faded, but still colored)
+    p <- p + ggplot2::geom_line(
+      data = df_long[df_long$is_highvol, ],
+      linewidth = 0.7,
+      alpha = 0.25
+    )
+    # 2) draw LOW-vol on top (more visible)
+    p <- p + ggplot2::geom_line(
+      data = df_long[!df_long$is_highvol, ],
+      linewidth = 1.0,
+      alpha = 0.95
+    )
+  } else {
+    # no fading: all same style
+    p <- p + ggplot2::geom_line(linewidth = 0.9, alpha = 0.85)
+  }
+
+  if (show_legend) {
+    p <- p + ggplot2::guides(color = ggplot2::guide_legend(ncol = 3))
+  }
+
+  if (length(event_dates) > 0) {
+    evt_df <- data.frame(date = event_dates, label = event_labels)
+    p <- p +
+      ggplot2::geom_vline(xintercept = event_dates, linetype = 2, color = "red3", linewidth = 0.8) +
+      ggplot2::geom_text(
+        data = evt_df,
+        ggplot2::aes(x = date, y = Inf, label = label),
+        inherit.aes = FALSE,
+        vjust = 1.2, hjust = 0,
+        color = "red3",
+        size = 3
+      ) +
+      ggplot2::coord_cartesian(clip = "off")
+  }
+
+  p
+}
+```
+
+```{r fig.width=14, fig.height=6}
+
+for (j in 1:r) {
+  print(plot_factor_all_industries(
+    Lambda_g_tv,
+    dates,
+    factor_j = j,
+    fade_highvol = FALSE,   
+    top_k = 20,             # display top-20 highest loading volatility for each factor
+    show_legend = TRUE
+  ))
+}
+```
+Unlike the broader Level-1 aggregation, the finer classification makes clear that most reallocation occurs within production chains rather than between large sectoral blocks. Across all five factors, the crisis episodes of 2008, 2011, and especially 2020 coincide with visible realignments, but the persistence and direction of these adjustments differ across factors.
+
+\textbf{Factor 1 — Investment-Linked Production Chain}
+
+At the Level-3 disaggregation, the most unstable industries under Factor 1 cluster around Building materials (flat glass, prefabricated elements, metal doors/windows), Packaging and intermediate inputs (plastic and metal packaging) and Refrigeration and ventilation equipment.
+
+The sharp co-movement around 2008 and 2011 suggests synchronized compression during crisis periods. A noticeable expansion phase appears in the mid-2010s, particularly among construction-related segments.
+
+This indicates that Factor 1 operates through internal reallocation along the construction–equipment–intermediate input chain. Compared to Level-1 results, the adjustment is more clearly located within production stages rather than across broad manufacturing groups.
+
+\textbf{Factor 2 — Cost-Sensitive and Supply-Exposed Segments}
+
+The high-volatility industries under Factor 2 are more heterogeneous, such as Textile-related segments Wood-based panels, Glass processing, Containers. The post-2011 period shows visible dispersion, and 2020 triggers a broad realignment across nearly all highlighted industries.
+
+This is consistent with the pattern that a supply-side or cost-sensitive adjustment mechanism that reallocates exposure horizontally across segments. Unlike Factor 1, the structure here is not centered on one production chain but reflects dispersed exposure shifts.
+
+\textbf{Factor 3 — Gradual Structural Demand Rotation}
+Factor 3 exhibits more persistent directional changes that some textile-related segments display long-run decline, e.g. Refrigeration and ventilation equipment gradually increase and Packaging and glass segments reverse around 2020.
+
+The adjustments are smoother and trend-like rather than crisis-spike driven. This suggests that Factor 3 captures slower structural demand substitution across detailed manufacturing segments. At Level-3, this long-run rotation becomes more visible than at the aggregate Level-1.
+
+\textbf{Factor 4 — Trade and Global Industrial Exposure}
+
+Factor 4 shows pronounced movements in Furniture, Plastic packaging, Refrigeration equipment and Wood-based panels. There is a visible expansion phase between 2012–2016 and a sharp reordering around 2020.
+
+This indicates that exposure to external demand and global supply-chain restructuring becomes clearer at finer industry resolution. The 2020 break is particularly sharp at Level-3.
+
+\textbf{Factor 5 — Narrow, Sector-Specific Component}
+
+Factor 5 is the most concentrated. A small number of industries (Containers, Technical glass, Passenger cars, Pre-press/media) dominate the factor dynamics.
+
+This implies that Factor 5 reflects a highly specialized structural component rather than a broad cyclical force and cross-sectional dispersion dominates temporal co-movement.
+
+### Instability in Factor Exposure
+
+```{r, include=FALSE}
+get_top5_industries_by_factor <- function(Lambda_g_tv, top_k = 5) {
+  gs <- names(Lambda_g_tv)
+  r  <- ncol(Lambda_g_tv[[1]])
+
+  res <- do.call(rbind, lapply(1:r, function(j) {
+
+    vol_df <- data.frame(
+      industry_code = gs,
+      industry_name = sapply(gs, get_industry_name_en),
+      volatility = sapply(gs, function(g) {
+        L <- Lambda_g_tv[[g]][, j]
+        sd(diff(L), na.rm = TRUE)
+      }),
+      stringsAsFactors = FALSE
+    )
+
+    vol_df |>
+      dplyr::arrange(dplyr::desc(volatility)) |>
+      dplyr::slice_head(n = top_k) |>
+      dplyr::mutate(
+        factor = paste0("Factor ", j),
+        rank = dplyr::row_number()
+      ) |>
+      dplyr::select(factor, rank, industry_code, industry_name, volatility)
+
+  }))
+  
+  rownames(res) <- NULL
+  res
+}
+```
+
+This measure captures temporal instability in factor exposure and captures industries whose relationship with a given factor is subject to pronounced structural adjustment.
+
+
+```{r}
+top5_by_factor <- get_top5_industries_by_factor(Lambda_g_tv, top_k = 5)
+
+print(top5_by_factor)
+```
+
+The dominance of Containers, Technical glass, Passenger cars, and Pre-press/media indicates that this factor is driven by a small number of structurally central industries rather than by broad-based sectoral movements. These industries are closely linked to durable-goods production, logistics, and intermediate supply chains, suggesting that the factor captures adjustments in transport intensity, packaging demand, and export-oriented manufacturing activity. The loading paths point to persistent reallocation rather than purely temporary spikes, consistent with medium-term structural shifts.
+
+This concentration clarifies the economic mechanism behind the factor. What appears as a common component at a more aggregated level is, at finer resolution, largely transmitted through specific production nodes. The granular evidence therefore strengthens the interpretation that factor dynamics are anchored in structurally pivotal industries rather than evenly distributed across manufacturing.
