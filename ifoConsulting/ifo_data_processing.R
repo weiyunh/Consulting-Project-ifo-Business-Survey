@@ -109,37 +109,243 @@ get_level <- function(code) {
   return(max(1L, len - 1L))
 }
 
-# English Name mapping functions for level1
-get_industry_name_en <- function(code) {
-  industry_names <- c(
-    "C0000000" = "Manufacturing Total",
-    "C1000000" = "Food Products",
-    "C1100000" = "Beverages",
-    "C1300000" = "Textiles",
-    "C1400000" = "Wearing Apparel",
-    "C1500000" = "Leather Products",
-    "C1600000" = "Wood Products",
-    "C1700000" = "Paper Products",
-    "C1800000" = "Printing",
-    "C1900000" = "Coke and petroleum refining",
-    "C2000000" = "Chemicals",
-    "C2100000" = "Pharmaceuticals",
-    "C2200000" = "Rubber and Plastics",
-    "C2300000" = "Glass, ceramics, and stone processing",
-    "C2400000" = "Basic Metals",
-    "C2500000" = "Fabricated Metal Products",
-    "C2600000" = "Computer and Electronics",
-    "C2700000" = "Electrical Equipment",
-    "C2800000" = "Machinery",
-    "C2900000" = "Motor Vehicles",
-    "C3000000" = "Other Transport Equipment",
-    "C3100000" = "Furniture",
-    "C3200000" = "Other Manufacturing"
-  )
-  name <- industry_names[code]
-  if (is.na(name)) return(code)
-  return(as.character(name))
+extract_industry_code <- function(var_name) {
+  strsplit(var_name, "_")[[1]][1]
 }
+
+extract_question_code <- function(var_name) {
+  strsplit(var_name, "_")[[1]][2]
+}
+
+# English Name mapping functions
+get_industry_name_en <- function(code) {
+  
+  industry_names_en <- c(
+    
+    "C0000000" = "Manufacturing",
+    "CONG0000" = "Manufacturing (excluding food industry)",
+    
+    "C00000A0" = "Intermediate Goods",
+    "C00000B0" = "Capital Goods",
+    "C00000C0" = "Consumer Goods",
+    "C0000CD0" = "Durable Consumer Goods",
+    "C0000CN0" = "Non-Durable Consumer Goods",
+    "CONG00C0" = "Consumer Goods (excluding food industry)",
+    
+    # Plastics
+    "C2220000" = "Manufacture of Plastic Products",
+    "C2221000" = "Manufacture of Plastic Plates, Sheets, Tubes and Profiles",
+    "C2222000" = "Manufacture of Plastic Packaging",
+    "C2223000" = "Manufacture of Plastic Construction Materials",
+    "C2229000" = "Other Plastic Products",
+    
+    # Non-metallic minerals
+    "C2300000" = "Manufacture of Other Non-Metallic Mineral Products",
+    "C2310000" = "Manufacture of Glass and Glass Products",
+    "C2312000" = "Shaping and Processing of Flat Glass",
+    "C2313000" = "Manufacture of Hollow Glass",
+    "C2319000" = "Manufacture of Technical Glass",
+    "C2330000" = "Manufacture of Ceramic Building Materials",
+    "C2340000" = "Manufacture of Other Ceramic Products",
+    "C2341000" = "Manufacture of Ceramic Household Articles",
+    "C2350000" = "Manufacture of Cement, Lime and Plaster",
+    "C2351000" = "Manufacture of Cement",
+    "C2360000" = "Manufacture of Articles of Concrete, Cement and Plaster",
+    "C2361000" = "Manufacture of Concrete Products",
+    "C2370000" = "Cutting and Shaping of Stone",
+    "C2390000" = "Other Non-Metallic Mineral Products n.e.c.",
+    "C2391000" = "Manufacture of Abrasive Products",
+    
+    # Metals
+    "C2400000" = "Basic Metals",
+    "C2420000" = "Manufacture of Steel Tubes",
+    "C2440000" = "Production and Processing of Non-Ferrous Metals",
+    "C2450000" = "Foundries",
+    "C2450010" = "Iron, Steel and Malleable Cast Iron Foundries",
+    "C2450020" = "Non-Ferrous Metal Foundries",
+    
+    "C2500000" = "Fabricated Metal Products",
+    "C2510000" = "Structural Metal Products",
+    "C2511000" = "Manufacture of Metal Structures",
+    "C2512000" = "Manufacture of Metal Doors and Windows",
+    "C2520000" = "Manufacture of Metal Tanks and Radiators",
+    "C2521000" = "Manufacture of Central Heating Boilers and Radiators",
+    "C2521120" = "Manufacture of Central Heating Boilers",
+    "C2529000" = "Manufacture of Containers",
+    "C2550000" = "Forging, Pressing, Stamping and Roll-Forming of Metal",
+    "C2560000" = "Surface Treatment and Mechanical Engineering n.e.c.",
+    "C2562000" = "Mechanical Engineering n.e.c.",
+    "C2570000" = "Manufacture of Cutlery, Tools and Locks",
+    "C2571000" = "Manufacture of Cutlery",
+    "C2572000" = "Manufacture of Locks and Fittings",
+    "C2573000" = "Manufacture of Tools",
+    "C2573010" = "Manufacture of Tools (excluding precision tools)",
+    "C2573020" = "Manufacture of Precision Tools",
+    "C2590000" = "Other Fabricated Metal Products",
+    "C2592000" = "Manufacture of Metal Packaging and Closures",
+    "C2594000" = "Manufacture of Fasteners",
+    "C2600000" = "Computer, Electronic and Optical Products",
+    "C2610000" = "Manufacture of Electronic Components",
+    "C2620000" = "Manufacture of Computers and Peripheral Equipment",
+    "C2630000" = "Manufacture of Communication Equipment",
+    "C2651000" = "Manufacture of Measuring and Navigation Instruments",
+    "C2651100" = "Manufacture of Electrical Measuring Instruments",
+    "C2651200" = "Manufacture of Optical Measuring Instruments",
+    "C2670000" = "Manufacture of Optical and Photographic Equipment",
+    "C2670010" = "Manufacture of Optical Instruments and Lasers",
+    
+    # Electrical equipment
+    "C2700000" = "Electrical Equipment",
+    "C2710000" = "Electric Motors, Generators and Transformers",
+    "C2711000" = "Manufacture of Electric Motors and Generators",
+    "C2712000" = "Electricity Distribution and Control Equipment",
+    "C2730000" = "Manufacture of Wiring and Wiring Devices",
+    "C2732000" = "Manufacture of Insulated Wires and Cables",
+    "C2733000" = "Manufacture of Wiring Devices",
+    "C2740000" = "Manufacture of Electric Lighting Equipment",
+    "C2750000" = "Manufacture of Domestic Appliances",
+    
+    # Machinery
+    "C2800000" = "Machinery and Equipment",
+    "C2810000" = "General Purpose Machinery",
+    "C2812000" = "Manufacture of Fluid Power Equipment",
+    "C2812110" = "Manufacture of Hydraulic Equipment",
+    "C2812210" = "Manufacture of Pneumatic Control Equipment",
+    "C2813010" = "Manufacture of Pumps",
+    "C2814000" = "Manufacture of Valves n.e.c.",
+    "C2815000" = "Manufacture of Bearings, Gears and Drive Elements",
+    "C2815100" = "Manufacture of Bearings",
+    "C2815200" = "Manufacture of Gears and Drive Elements",
+    "C2820000" = "Special Purpose Machinery",
+    "C2822000" = "Manufacture of Lifting and Handling Equipment",
+    "C2825000" = "Manufacture of Refrigeration and Ventilation Equipment",
+    "C2829000" = "Other Special Purpose Machinery n.e.c.",
+    "C2830000" = "Agricultural and Forestry Machinery",
+    "C2840000" = "Machine Tools",
+    "C2841000" = "Machine Tools for Metal Working",
+    "C2849200" = "Machine Tools for Hard Materials",
+    "C2890000" = "Machinery for Specific Industries",
+    "C2891000" = "Metallurgical Machinery",
+    "C2892000" = "Mining and Construction Machinery",
+    "C2892200" = "Construction Machinery",
+    "C2893000" = "Food Processing Machinery",
+    "C2894000" = "Textile Machinery",
+    "C2896000" = "Rubber and Plastics Machinery",
+    "C2899000" = "Other Industry-Specific Machinery",
+    
+    # Automotive
+    "C2900000" = "Motor Vehicles",
+    "C2910000" = "Motor Vehicles and Engines",
+    "C2911000" = "Commercial Vehicles",
+    "C2912000" = "Passenger Cars",
+    "C2920000" = "Bodies and Trailers",
+    "C2930000" = "Motor Vehicle Parts and Accessories",
+    
+    # Other transport
+    "C3000000" = "Other Transport Equipment",
+    
+    # Furniture
+    "C3100000" = "Furniture",
+    "C3101000" = "Office and Shop Furniture",
+    "C3109000" = "Other Furniture",
+    "C3109040" = "Upholstered Furniture",
+    
+    # Other manufacturing
+    "C3200000" = "Other Manufacturing",
+    "C3250000" = "Medical and Dental Instruments",
+    "C3250200" = "Medical Mechanical Products",
+    "C3291000" = "Brooms and Brushes",
+    
+    # Food
+    "C00FOBE0" = "Food, Beverage and Tobacco",
+    "C1000000" = "Food Products",
+    "C1010000" = "Meat Processing",
+    "C1020000" = "Fish Processing",
+    "C1030000" = "Fruit and Vegetable Processing",
+    "C1050000" = "Dairy Products",
+    "C1060000" = "Grain Milling and Starch Products",
+    "C1070000" = "Bakery and Pasta Products",
+    "C1071000" = "Bakery Products (excluding long-life bakery products)",
+    "C1080000" = "Other Food Products",
+    "C1082000" = "Sugar and Confectionery Products",
+    "C1090000" = "Animal Feed",
+    "C1100000" = "Beverages",
+    "C1101000" = "Spirits",
+    "C1105000" = "Beer",
+    "C1107000" = "Soft Drinks and Mineral Water",
+    
+    # Textiles & apparel
+    "C1300000" = "Textiles",
+    "C1320000" = "Weaving",
+    "C1321000" = "Cotton Weaving",
+    "C1330000" = "Finishing of Textiles",
+    "C1390000" = "Other Textiles",
+    "C1392000" = "Made-up Textile Articles",
+    "C1400000" = "Wearing Apparel",
+    "C1410000" = "Wearing Apparel (excluding fur)",
+    "C1413000" = "Outerwear",
+    "C1414000" = "Underwear",
+    "C1414100" = "Woven Underwear",
+    "C1431000" = "Hosiery",
+    
+    # Leather
+    "C1500000" = "Leather and Footwear",
+    "C1510000" = "Leather Goods",
+    "C1520000" = "Footwear",
+    
+    # Wood
+    "C1600000" = "Wood Products (excluding furniture)",
+    "C1610000" = "Sawmilling and Planing of Wood",
+    "C1620000" = "Other Wood Products",
+    "C1621000" = "Veneer and Wood-Based Panels",
+    "C1623000" = "Prefabricated Building Elements",
+    "C1624000" = "Wood Packaging",
+    
+    # Paper
+    "C1700000" = "Paper Products",
+    "C1710000" = "Pulp, Paper and Paperboard",
+    "C1712000" = "Paper and Paperboard",
+    "C1712100" = "Paper",
+    "C1712200" = "Paperboard",
+    "C1720000" = "Paper and Paperboard Products",
+    "C1721000" = "Corrugated Paper and Packaging",
+    "C1723000" = "Stationery Products",
+    
+    # Printing
+    "C1800000" = "Printing",
+    "C1810000" = "Printing Services",
+    "C1811000" = "Newspaper Printing",
+    "C1812000" = "Printing n.e.c.",
+    "C1813000" = "Pre-Press and Media Services",
+    
+    # Petroleum
+    "C1900000" = "Coke and Refined Petroleum Products",
+    
+    # Chemicals
+    "C2000000" = "Chemicals",
+    "C2010000" = "Basic Chemicals",
+    "C2012000" = "Dyes and Pigments",
+    "C2014000" = "Other Organic Basic Chemicals",
+    "C2016000" = "Plastics in Primary Forms",
+    "C2030000" = "Paints, Varnishes and Coatings",
+    "C2040000" = "Cleaning and Personal Care Products",
+    "C2050000" = "Other Chemical Products",
+    
+    # Pharma
+    "C2100000" = "Pharmaceuticals",
+    
+    # Rubber
+    "C2200000" = "Rubber and Plastics",
+    "C2210000" = "Rubber Products",
+    "C2219000" = "Other Rubber Products"
+    
+  )
+  
+  nm <- industry_names_en[code]
+  if (is.na(nm)) return(code)
+  return(as.character(nm))
+}
+
 
 get_industry_name <- function(code) {
   industry_names <- c(
