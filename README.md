@@ -18,14 +18,14 @@ The scripts are numbered to reflect the logical flow of the research:
     * `descriptive_analysis.Rmd` & `missing_analysis.Rmd`: Data quality and statistical summaries.
 * **Factor Modeling (DFM)**:
     * `01_Static_DFM_B_nd.Rmd` & `02_Dynamic_DFM.Rmd`: Extraction of static and dynamic factors.
-* **Advanced Econometrics**:
     * `03_Time-Varying_Factor_Loadings.Rmd`: Analyzing evolving relationships over time.
-    * `0401_Incremental_Predictive_Power.Rmd`: Evaluating **leading indicators**.
-    * `05_MS_DFM_OOS.Rmd`: **Regime-switching analysis** (Markov-Switching DFM).
-    * `06_FAVAR_Forecasting.Rmd`: **Factor-Augmented VAR** for macroeconomic forecasting.
 * **Structural & Network Analysis**:
     * `Network.Rmd`: Investigating variable connectivity.
     * `DTW.Rmd`: Dynamic Time Warping for time-series similarity.
+* **Advanced Econometrics**:
+    * `0401_Incremental_Predictive_Power.Rmd`: Evaluating **leading indicators**.
+    * `05_MS_DFM_OOS.Rmd`: **Regime-switching analysis** (Markov-Switching DFM).
+    * `06_FAVAR_Forecasting.Rmd`: **Factor-Augmented VAR** for macroeconomic forecasting.
 
 ### 3. Stability & Robustness Checks
 All files containing the keyword **`supplement`** (e.g., `01_supplement_static_DFM.Rmd`, `0301_supplement_TVFL.Rmd`) are dedicated to **stability checks**. These scripts validate the core results against different specifications to ensure robustness.
